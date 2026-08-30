@@ -12,8 +12,9 @@ Recommended reading order:
 8. [HTTP API](api.md) — CLI/automation/Agent wire contract.
 9. [Rust Implementation Design](implementation-design.md) — workspace and dependency boundaries.
 10. [Testing Strategy](testing.md) — correctness and fault-injection plan.
-11. [Development Roadmap](roadmap.md) — implementation milestones.
-12. [Code Review Guide](code-review.md) — invariants to enforce during review.
-13. [Architecture Decisions](decisions.md) — accepted decisions and remaining questions.
+11. [M1 Implementation Plan](m1-implementation-plan.md) — exact first development slice and acceptance scenarios.
+12. [Development Roadmap](roadmap.md) — implementation milestones.
+13. [Code Review Guide](code-review.md) — invariants to enforce during review.
+14. [Architecture Decisions](decisions.md) — accepted decisions and remaining questions.
 
 The documentation is intentionally more detailed than the initial codebase. LMT is a long-lived infrastructure project, so behavior should be designed and testable before implementation complexity accumulates.
