@@ -23,3 +23,4 @@ The documentation is intentionally more detailed than the initial codebase. LMT 
 ## Implementation reviews
 
 - [M1 Code Review — 2026-08-30](reviews/m1-review-2026-08-30.md) — review of implementation commit `409ea99502dcc56f0abdbec110cd9529629a4498`, including release blockers and required hardening before M2.
+- [M1 Code Review Round 2 — 2026-08-30](reviews/m1-review-round2-2026-08-30.md) — acceptance review of hardening commit `e2c27dbdc573dc374c94902255265adc81b2ae10`; M1 accepted and remaining non-blocking debt recorded.

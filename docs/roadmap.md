@@ -6,7 +6,7 @@ The design phase described in the other documents is considered M0.
 
 ## M0 - Architecture and contracts
 
-Status: design-complete, subject to review.
+Status: **complete**.
 
 Deliverables:
 
@@ -24,6 +24,8 @@ Deliverables:
 No production implementation is required in M0.
 
 ## M1 - Minimal vertical slice
+
+Status: **accepted** at implementation commit `e2c27dbdc573dc374c94902255265adc81b2ae10` after the second M1 code review.
 
 Goal:
 

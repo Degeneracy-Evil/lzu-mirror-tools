@@ -1,5 +1,11 @@
 # M1 Implementation Plan
 
+**Status: completed and accepted.**
+
+Accepted implementation baseline: `e2c27dbdc573dc374c94902255265adc81b2ae10`.
+
+Acceptance review: [M1 Code Review Round 2](reviews/m1-review-round2-2026-08-30.md).
+
 M1 is the first implementation milestone.
 
 Its purpose is not to implement a complete mirror platform. It exists to prove the LMT architecture through one reliable end-to-end vertical slice.

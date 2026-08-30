@@ -6,9 +6,9 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1 implementation candidate exists and is under hardening review.**
+**Current phase: M1 accepted; M2 design refinement is next.**
 
-The architecture/design contracts live under [`docs/`](docs/README.md). The first M1 implementation has landed, but M1 is not considered accepted until the release-blocking findings in [the 2026-08-30 M1 review](docs/reviews/m1-review-2026-08-30.md) are resolved and the documented fault-recovery acceptance scenarios pass.
+The M1 vertical slice and hardening pass are accepted at implementation commit `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [second M1 review](docs/reviews/m1-review-round2-2026-08-30.md) for the acceptance record and remaining non-blocking engineering debt.
 
 ## What LMT does
 
