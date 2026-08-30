@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,7 +14,7 @@ use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
-    sync::{mpsc, watch},
+    sync::{Mutex, mpsc, watch},
 };
 
 use crate::{
@@ -21,7 +22,12 @@ use crate::{
     spool::{SpoolRecord, write},
 };
 
-pub async fn execute(path: &Path, record: &mut SpoolRecord, mut shutdown: watch::Receiver<bool>) {
+pub async fn execute(
+    path: &Path,
+    record: &mut SpoolRecord,
+    mut shutdown: watch::Receiver<bool>,
+    spool_lock: Arc<Mutex<()>>,
+) {
     let mut command = Command::new(&record.spec.program);
     command
         .args(&record.spec.args)
@@ -41,6 +47,7 @@ pub async fn execute(path: &Path, record: &mut SpoolRecord, mut shutdown: watch:
                 Some(error.to_string()),
                 now(),
             );
+            let _guard = spool_lock.lock().await;
             let _ = write(path, record).await;
             return;
         }
@@ -56,7 +63,10 @@ pub async fn execute(path: &Path, record: &mut SpoolRecord, mut shutdown: watch:
     record.state = AttemptState::Running;
     record.sequence += 1;
     record.started_at = Some(now());
-    let _ = write(path, record).await;
+    {
+        let _guard = spool_lock.lock().await;
+        let _ = write(path, record).await;
+    }
     let timeout = tokio::time::sleep(Duration::from_secs(record.spec.timeout_seconds));
     tokio::pin!(timeout);
     let outcome = tokio::select! {
@@ -98,7 +108,10 @@ pub async fn execute(path: &Path, record: &mut SpoolRecord, mut shutdown: watch:
             now(),
         ),
     }
-    let _ = write(path, record).await;
+    {
+        let _guard = spool_lock.lock().await;
+        let _ = write(path, record).await;
+    }
 }
 
 async fn terminate_group(group: Option<Pid>) {

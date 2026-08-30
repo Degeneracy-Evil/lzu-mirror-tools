@@ -49,9 +49,15 @@ impl Agent {
 
     pub async fn run(self) -> anyhow::Result<()> {
         self.recover().await;
+        let reconciler = self.clone();
+        let reconciliation = tokio::spawn(async move {
+            while !*reconciler.shutdown.borrow() {
+                reconciler.reconcile_all().await;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
         let mut sequence = 0;
         while !*self.shutdown.borrow() {
-            self.reconcile_all().await;
             sequence += 1;
             let request = PollRequest {
                 protocol_version: "v1alpha1".into(),
@@ -92,11 +98,12 @@ impl Agent {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        reconciliation.abort();
         Ok(())
     }
 
     async fn accept(&self, run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec) {
-        let _acceptance = self.acceptance.lock().await;
+        let acceptance = self.acceptance.lock().await;
         let key = format!("{run_id}-{attempt}");
         let path = state_path(&self.config.storage.spool_dir, &run_id, attempt);
         if let Ok(mut existing) = read(&path).await {
@@ -105,6 +112,7 @@ impl Agent {
                     "protocol integrity error: conflicting StartAttempt preserved original ownership");
                 return;
             }
+            drop(acceptance);
             let _ = self.reconcile(&path, &mut existing).await;
             return;
         }
@@ -122,6 +130,7 @@ impl Agent {
                 now(),
             );
             if write(&path, &record).await.is_ok() {
+                drop(acceptance);
                 let _ = self.reconcile(&path, &mut record).await;
             }
             return;
@@ -136,9 +145,14 @@ impl Agent {
         let agent = self.clone();
         tokio::spawn(async move {
             let mut record = record;
-            let _ = agent.reconcile(&path, &mut record).await;
-            executor::execute(&path, &mut record, agent.shutdown.clone()).await;
-            let _ = agent.reconcile(&path, &mut record).await;
+            if let Err(error) = agent.reconcile(&path, &mut record).await {
+                tracing::warn!(%error, "accepted reconciliation failed");
+            }
+            executor::execute(&path, &mut record, agent.shutdown.clone(), agent.acceptance.clone()).await;
+            tracing::info!(run_id=%record.run_id, sequence=record.sequence, "execution reached terminal reconciliation");
+            if let Err(error) = agent.reconcile(&path, &mut record).await {
+                tracing::warn!(%error, "terminal reconciliation failed");
+            }
             agent.active.lock().await.remove(&key);
         });
     }
@@ -179,7 +193,9 @@ impl Agent {
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         {
             if let Ok(mut record) = read(&path).await {
-                let _ = self.reconcile(&path, &mut record).await;
+                if let Err(error) = self.reconcile(&path, &mut record).await {
+                    tracing::debug!(%error, "background reconciliation deferred");
+                }
             }
         }
     }
@@ -214,8 +230,11 @@ impl Agent {
                 .send()
                 .await?;
             if response.status().is_success() {
-                record.acknowledged_sequence = event_sequence;
-                write(path, record).await?;
+                let _guard = self.acceptance.lock().await;
+                let mut latest = read(path).await?;
+                latest.acknowledged_sequence = latest.acknowledged_sequence.max(event_sequence);
+                write(path, &latest).await?;
+                *record = latest;
             }
         }
         let bytes = match fs::read(log_path(path)).await {
@@ -243,16 +262,18 @@ impl Agent {
                 .send()
                 .await?;
             if response.status().is_success() {
-                record.log_offset = response
+                let acknowledged_offset = response
                     .headers()
                     .get("x-lmt-log-next-offset")
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(record.log_offset);
-                if final_chunk {
-                    record.log_complete_acknowledged = true;
-                }
-                write(path, record).await?;
+                let _guard = self.acceptance.lock().await;
+                let mut latest = read(path).await?;
+                latest.log_offset = latest.log_offset.max(acknowledged_offset);
+                latest.log_complete_acknowledged |= final_chunk;
+                write(path, &latest).await?;
+                *record = latest;
             }
         }
         if record.ready_for_cleanup() {
@@ -420,7 +441,7 @@ mod tests {
             now(),
         );
         write(&state, &record).await.expect("write");
-        executor::execute(&state, &mut record, receiver).await;
+        executor::execute(&state, &mut record, receiver, Arc::new(Mutex::new(()))).await;
         assert_eq!(record.state, AttemptState::TimedOut);
         let log = fs::read_to_string(log_path(&state)).await.expect("log");
         assert!(log.contains("[stdout] out"));
