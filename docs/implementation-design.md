@@ -338,6 +338,12 @@ This format should be documented before log transport implementation.
 
 Full-text indexing is not a responsibility of SQLite. Optional Loki collection can provide cross-Run text search.
 
+For M1, the combined stream is UTF-8-oriented bytes framed by the Agent as
+`[stdout] ` or `[stderr] ` followed by the captured bytes. The framing prefix is
+part of the uploaded byte stream and therefore participates in offset-based
+idempotency. M1 preserves stream identity; finer-grained cross-stream ordering
+may be introduced without changing the offset protocol.
+
 ## 12. Configuration compilation
 
 Configuration handling has three stages:

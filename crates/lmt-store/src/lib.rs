@@ -554,6 +554,15 @@ impl Store {
         Ok(event.event_sequence)
     }
 
+    pub fn attempt_belongs_to_node(&self, run_id: &str, attempt_no: u32, node: &str) -> Result<bool, StoreError> {
+        Ok(self.connection()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempts a JOIN runs r ON r.id=a.run_id
+             WHERE a.run_id=?1 AND a.attempt_no=?2 AND r.owner_node=?3)",
+            params![run_id, attempt_no, node],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn get_run(&self, id: &str) -> Result<Option<RunRecord>, StoreError> {
         Ok(self.connection()?.query_row(
             "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,finished_at_ms,

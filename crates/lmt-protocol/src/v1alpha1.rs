@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use lmt_core::{AttemptEvent, AttemptState, BundleFile, ProcessRunSpec, RunState};
+use lmt_core::{AttemptState, BundleFile, FailureKind, ProcessRunSpec, RunState};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -93,9 +93,9 @@ pub struct RunView {
     pub owner_node: String,
     pub trigger: String,
     pub state: RunState,
-    pub created_at_ms: i64,
-    pub started_at_ms: Option<i64>,
-    pub finished_at_ms: Option<i64>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub final_exit_code: Option<i32>,
     pub failure_kind: Option<String>,
     pub failure_message: Option<String>,
@@ -108,10 +108,10 @@ pub struct AttemptView {
     pub attempt_no: u32,
     pub state: AttemptState,
     pub spec_hash: String,
-    pub created_at_ms: i64,
-    pub accepted_at_ms: Option<i64>,
-    pub started_at_ms: Option<i64>,
-    pub finished_at_ms: Option<i64>,
+    pub created_at: String,
+    pub accepted_at: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
     pub exit_code: Option<i32>,
     pub failure_kind: Option<String>,
     pub failure_message: Option<String>,
@@ -142,7 +142,7 @@ pub struct NodeView {
     pub name: String,
     pub agent_version: Option<String>,
     pub agent_instance_id: Option<String>,
-    pub last_seen_at_ms: Option<i64>,
+    pub last_seen_at: Option<String>,
     pub active_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
     pub online: bool,
@@ -199,8 +199,15 @@ pub struct PollResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EventRequest {
-    #[serde(flatten)]
-    pub event: AttemptEvent,
+    pub event_sequence: u64,
+    pub state: AttemptState,
+    pub agent_instance_id: String,
+    pub accepted_at: Option<String>,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub exit_code: Option<i32>,
+    pub failure_kind: Option<FailureKind>,
+    pub failure_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
