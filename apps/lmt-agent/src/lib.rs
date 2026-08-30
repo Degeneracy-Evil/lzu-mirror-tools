@@ -12,6 +12,7 @@ use reqwest::{Client, StatusCode};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs,
+    io::{AsyncReadExt, AsyncSeekExt},
     sync::{Mutex, watch},
 };
 
@@ -237,18 +238,25 @@ impl Agent {
                 *record = latest;
             }
         }
-        let bytes = match fs::read(log_path(path)).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+        let local_log = log_path(path);
+        let stored_bytes = match fs::metadata(&local_log).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error.into()),
         };
-        let offset = usize::try_from(record.log_offset)
-            .unwrap_or(usize::MAX)
-            .min(bytes.len());
-        let has_bytes = offset < bytes.len();
+        if record.log_offset > stored_bytes {
+            bail!("acknowledged log offset exceeds local spool length");
+        }
+        let has_bytes = record.log_offset < stored_bytes;
         if has_bytes || (record.state.is_terminal() && !record.log_complete_acknowledged) {
-            let end = (offset + 65_536).min(bytes.len());
-            let final_chunk = record.state.is_terminal() && end == bytes.len();
+            let remaining = stored_bytes.saturating_sub(record.log_offset).min(65_536);
+            let mut bytes = vec![0; usize::try_from(remaining).unwrap_or(65_536)];
+            if !bytes.is_empty() {
+                let mut file = fs::File::open(&local_log).await?;
+                file.seek(std::io::SeekFrom::Start(record.log_offset)).await?;
+                file.read_exact(&mut bytes).await?;
+            }
+            let final_chunk = record.state.is_terminal() && record.log_offset + remaining == stored_bytes;
             let response = self
                 .client
                 .put(format!(
@@ -258,7 +266,7 @@ impl Agent {
                 .bearer_auth(self.token.as_ref())
                 .header("x-lmt-log-offset", record.log_offset)
                 .header("x-lmt-log-complete", final_chunk.to_string())
-                .body(bytes[offset..end].to_vec())
+                .body(bytes)
                 .send()
                 .await?;
             if response.status().is_success() {

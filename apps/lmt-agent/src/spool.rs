@@ -107,5 +107,9 @@ pub async fn retire(path: &Path) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     fs::remove_file(retired).await?;
+    if let Some(parent) = path.parent() {
+        let parent = parent.to_owned();
+        tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
+    }
     Ok(())
 }

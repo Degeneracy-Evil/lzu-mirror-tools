@@ -345,8 +345,9 @@ Full-text indexing is not a responsibility of SQLite. Optional Loki collection c
 For M1, the combined stream is UTF-8-oriented bytes framed by the Agent as
 `[stdout] ` or `[stderr] ` followed by the captured bytes. The framing prefix is
 part of the uploaded byte stream and therefore participates in offset-based
-idempotency. M1 preserves stream identity; finer-grained cross-stream ordering
-may be introduced without changing the offset protocol.
+idempotency. A bounded channel serializes chunks in the order the Agent observes
+them from the two pipes; that observed order is preserved in the spool and in
+central storage.
 
 ## 12. Configuration compilation
 

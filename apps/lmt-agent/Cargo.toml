@@ -24,6 +24,7 @@ ulid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+lmt-server = { path = "../lmt-server" }
 tempfile.workspace = true
 
 [lints]
