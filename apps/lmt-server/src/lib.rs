@@ -633,3 +633,78 @@ impl IntoResponse for Failure {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lmt_core::{BundleFile, RunState};
+
+    #[tokio::test]
+    async fn success_event_and_duplicate_log_survive_reopen() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("lmt.db");
+        let store = Store::open(&database).expect("store");
+        store.upsert_credential("node-a", "secret").expect("credential");
+        let bundle = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: "[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='command'\nprogram='/bin/true'\n".into(),
+            }],
+        })
+        .expect("bundle");
+        store.apply(&bundle, 0, "test").expect("apply");
+        let run = store.create_manual_run("demo", "request").expect("run");
+        store
+            .poll_action("node-a", "/tmp/mirrors")
+            .expect("poll")
+            .expect("action");
+        let state = AppState::new(
+            store.clone(),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        assert_eq!(
+            append_log(&state, &run.id, 1, 0, b"[stdout] hello\n", false)
+                .await
+                .expect("append"),
+            15
+        );
+        assert_eq!(
+            append_log(&state, &run.id, 1, 0, b"[stdout] hello\n", true)
+                .await
+                .expect("retry"),
+            15
+        );
+        store
+            .apply_event(
+                &run.id,
+                1,
+                &AttemptEvent {
+                    event_sequence: 3,
+                    state: lmt_core::AttemptState::Succeeded,
+                    agent_instance_id: "instance".into(),
+                    accepted_at_ms: Some(1),
+                    started_at_ms: Some(2),
+                    finished_at_ms: Some(3),
+                    exit_code: Some(0),
+                    failure_kind: None,
+                    failure_message: None,
+                },
+            )
+            .expect("event");
+        drop(state);
+        drop(store);
+        let reopened = Store::open(database).expect("reopen");
+        assert_eq!(
+            reopened.get_run(&run.id).expect("query").expect("run").state,
+            RunState::Succeeded
+        );
+        assert_eq!(
+            fs::read(directory.path().join("logs").join(&run.id).join("1.log"))
+                .await
+                .expect("log"),
+            b"[stdout] hello\n"
+        );
+    }
+}

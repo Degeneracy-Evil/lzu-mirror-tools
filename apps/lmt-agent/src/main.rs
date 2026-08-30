@@ -430,3 +430,87 @@ async fn signal() {
     };
     tokio::select! { () = c => {}, () = t => {} }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(directory: &Path) -> Agent {
+        let (_sender, receiver) = watch::channel(false);
+        Agent {
+            config: Config {
+                node: Node { name: "node-a".into() },
+                server: Server {
+                    url: "http://127.0.0.1:1".into(),
+                    token_file: directory.join("token"),
+                },
+                storage: Storage {
+                    mirror_root: directory.join("mirrors"),
+                    spool_dir: directory.join("spool"),
+                },
+                execution: Execution { max_concurrent_runs: 1 },
+                runner: Runner {
+                    process: Policy { enabled: true },
+                },
+            },
+            token: "token".into(),
+            instance: "instance".into(),
+            client: Client::new(),
+            active: Arc::new(Mutex::new(HashSet::new())),
+            shutdown: receiver,
+        }
+    }
+
+    fn spec(program: &str, root: &Path) -> ProcessRunSpec {
+        ProcessRunSpec {
+            runner: "process".into(),
+            program: program.into(),
+            args: vec![],
+            cwd: None,
+            timeout_seconds: 5,
+            mirror_root: root.to_string_lossy().into_owned(),
+            target_dir: root.join("demo").to_string_lossy().into_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_success_failure_and_durable_spool() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let agent = agent(directory.path());
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        for (program, expected) in [
+            ("/bin/true", AttemptState::Succeeded),
+            ("/bin/false", AttemptState::Failed),
+        ] {
+            let path = agent
+                .config
+                .storage
+                .spool_dir
+                .join(format!("{}.json", program.replace('/', "_")));
+            let mut record = spool(
+                "01K00000000000000000000000".into(),
+                1,
+                "sha256:test".into(),
+                spec(program, &agent.config.storage.mirror_root),
+            );
+            record.state = AttemptState::Accepted;
+            record.sequence = 1;
+            record.accepted_at = Some(now());
+            write(&path, &record).await.expect("accepted durable");
+            agent.execute(&path, &mut record).await;
+            assert_eq!(record.state, expected);
+            assert_eq!(read(&path).await.expect("reopen").state, expected);
+        }
+    }
+
+    #[test]
+    fn local_policy_rejects_paths_outside_root() {
+        let root = Path::new("/srv/mirrors");
+        let mut value = spec("/bin/true", root);
+        assert!(safe(root, &value));
+        value.target_dir = "/tmp/outside".into();
+        assert!(!safe(root, &value));
+    }
+}
