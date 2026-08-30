@@ -325,13 +325,14 @@ The server-side Node record is **observed state**, such as:
 
 - name;
 - agent version;
+- agent instance/epoch;
 - online/offline state;
 - last seen time;
 - currently running attempts;
 - mirror-root capacity/free bytes;
 - supported runner capabilities.
 
-The server should not attempt to duplicate every local configuration option into its database.
+All queryable Node state is stored centrally by `lmt-server`. The server should not attempt to duplicate every local configuration option into its database.
 
 ## 10. Run
 

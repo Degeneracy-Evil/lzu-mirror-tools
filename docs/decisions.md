@@ -45,13 +45,15 @@ The initial architecture contains one authoritative `lmt-server` and any number 
 
 Multi-controller HA is outside v1.
 
-### D005 - SQLite by default
+### D005 - One central SQLite database on the main server
 
 Status: accepted.
 
-The server uses a local SQLite database. Agents do not directly access it.
+The authoritative/queryable database exists only on the main machine running `lmt-server`.
 
-Each agent may also use its own independent local SQLite journal.
+All Mirror, Node, Run, Attempt, and history records are stored there in separate tables.
+
+Agents do not run local databases. They may keep small file-based durable spools for execution crash recovery and retransmission.
 
 SQLite files are never shared through NFS or another network filesystem.
 
@@ -131,18 +133,35 @@ If a previously managed Mirror file is removed, the next successful apply remove
 
 Configuration pruning never implicitly deletes mirror data from disk; destructive data removal is a separate explicit operation.
 
+### D014 - Daemons automatically restart through systemd
+
+Status: accepted.
+
+Official Linux service units for `lmt-server` and `lmt-agent` use automatic restart-on-failure, with rate limiting/backoff and optional watchdog support.
+
+An agent restart must be idempotent. v0.1 terminates/safely interrupts its supervised child executions, then lets the server retry with a new attempt number if policy allows.
+
+### D015 - Run logs are centralized but not stored as SQLite blobs
+
+Status: accepted.
+
+Agents upload stdout/stderr incrementally to the main server using an idempotent chunk/offset protocol.
+
+The server stores log bytes in a central filesystem log store and keeps only indexes/metadata in SQLite.
+
+Daemon logs remain normal structured observability logs suitable for journald/Loki.
+
 ## Current open questions
 
 The following points should be resolved before or during the first implementation milestone:
 
 1. Exact TOML schema and validation rules.
 2. Whether v0.1 ships only the process runner or also an OCI container runner.
-3. Exact run-log retention model and how `lmt run logs` should work without making SQLite a log database.
-4. Scheduler behavior when multiple periodic triggers occur while one mirror is already running or its node is offline.
-5. Whether rsync statistics should be parsed into structured Run metrics in the first milestone.
-6. Agent enrollment/token provisioning UX.
-7. Database migration/versioning strategy.
-8. Stable API versioning rules before the first public release.
+3. Exact Run log retention/rotation/compression policy.
+4. Whether rsync statistics should be parsed into structured Run metrics in the first milestone.
+5. Agent enrollment/token provisioning UX.
+6. Database migration/versioning strategy.
+7. Stable API versioning rules before the first public release.
 
 ## Development principle
 

@@ -117,6 +117,8 @@ It owns local execution concerns:
 
 The agent understands execution, not repository semantics. It should not contain Debian/PyPI/Fedora-specific logic.
 
+The packaged Linux service is expected to run under systemd with automatic restart-on-failure and watchdog support. A daemon crash should normally self-heal without operator intervention.
+
 ### 3.3 `lmt`
 
 The CLI is the primary operator interface.
@@ -196,17 +198,21 @@ A successful apply reconciles the managed server configuration to the authoritat
 
 ## 6. Database model
 
-The default v1 deployment uses SQLite.
-
-This is compatible with a multi-node deployment because agents never open the server database. Only `lmt-server` accesses its local SQLite file.
+The default v1 deployment uses one authoritative SQLite database on the main machine running `lmt-server`.
 
 ```text
 agent-a ----\
-agent-b -----+--> HTTP --> lmt-server --> local SQLite
+agent-b -----+--> HTTP --> lmt-server --> /var/lib/lmt/lmt.db
 agent-c ----/
 ```
 
-Agents may also use their own local SQLite journal. No SQLite database file is shared over NFS or another network filesystem.
+All queryable control-plane and historical state is centralized there and separated by tables, including Mirrors, generations, Nodes, Runs, and Attempts.
+
+Agents do **not** maintain independent databases. They may keep a small local durable spool made of ordinary files for crash recovery and retransmission, but this spool is not authoritative state and is not intended for operator queries.
+
+Run stdout/stderr is also centralized, but not stored as large database blobs. Agents upload log chunks to the server, which stores them under a central log directory (for example `/var/lib/lmt/logs/`). SQLite stores only log metadata/index information.
+
+No SQLite database file is shared over NFS or another network filesystem.
 
 PostgreSQL support may be added later if real deployments require multiple active controllers. It is not a v1 requirement.
 
@@ -255,7 +261,8 @@ A running attempt is always based on an immutable RunSpec. Updating a mirror con
 LMT exposes standard integration points:
 
 - `/metrics` for Prometheus;
-- structured logs for journald/log collectors;
+- structured daemon logs for journald/log collectors;
+- centrally retrievable Run stdout/stderr through the LMT API/CLI;
 - read-only status API for status pages;
 - JSON HTTP APIs for automation;
 - stable command exit codes and machine-readable CLI output.

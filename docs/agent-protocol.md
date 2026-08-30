@@ -186,42 +186,55 @@ The agent never invents attempt numbers and never retries by itself.
 
 The server owns retry policy.
 
-## 7. Agent local journal
+## 7. Agent durable spool
 
-Each agent keeps a small local durable database, expected to be SQLite:
+Agents do not run a local database.
+
+Instead, each agent keeps a deliberately small durable spool of ordinary files, for example:
 
 ```text
-/var/lib/lmt/agent.db
+/var/lib/lmt-agent/spool/
+└── <run-id>/
+    └── <attempt>/
+        ├── state.json
+        ├── result.json
+        └── log.offset
 ```
 
-It records enough information to make command execution idempotent and to recover after an agent restart:
+The spool exists only to make execution/retransmission safe across an agent restart. It may record:
 
 - execution key;
 - RunSpec hash;
 - accepted timestamp;
 - process identity;
-- current state;
+- current local state;
 - terminal result;
-- last event sequence;
+- last uploaded log offset;
 - whether the terminal result has been acknowledged by the server.
 
-This database is local to one agent and is never shared.
+Writes that change execution ownership must use an atomic durable pattern (temporary file, fsync, rename, and directory fsync where required).
 
-## 8. Agent crash semantics
+The spool is **not** authoritative/queryable deployment state. All Mirrors, Nodes, Runs, Attempts, and historical indexes live in the central server database.
 
-v0.1 prioritizes safety over preserving a running native process after the agent itself dies.
+## 8. Agent crash and automatic restart semantics
 
-The packaged service must ensure child execution is tied to the agent service/process group. On an unexpected agent termination, its active child executions should also be terminated rather than becoming unmanaged writers.
+The agent is a long-running system daemon and should recover automatically from ordinary process failures.
 
-After restart, the agent inspects its local journal.
+The official systemd unit should use restart-on-failure with a short backoff and may use the systemd watchdog. Operators should not normally need to manually restart a crashed agent.
 
-An attempt that was durably marked running but no longer has a valid supervised process becomes `interrupted` and is reported to the server.
+v0.1 prioritizes safety over preserving an execution across an agent-daemon crash. Attempt subprocesses must be supervised as part of the agent service/process group so that an agent unit failure/restart cannot leave an unmanaged writer behind.
 
-The server then applies normal retry policy.
+After systemd restarts the agent, it scans the durable spool:
 
-This is intentionally simpler and safer than attempting to reconnect to arbitrary orphan processes.
+- a terminal `result.json` that was not acknowledged is retransmitted;
+- an accepted/running attempt without a terminal result is reported as `interrupted`;
+- the server decides whether to create a new attempt according to the Run retry policy.
 
-A future execution shim/systemd runner may provide stronger crash-survival semantics without changing the network protocol.
+Retries use a new attempt number. This preserves idempotence and prevents concurrent duplicate writers.
+
+A full node reboot follows the same logical recovery path.
+
+A future execution shim or independent systemd transient-runner model may preserve running work across an agent restart, but that complexity is not required for v0.1.
 
 ## 9. Server crash semantics
 
@@ -230,10 +243,11 @@ The server must commit a Run/Attempt to SQLite before dispatching it.
 If the server crashes:
 
 1. agents continue or finish currently owned executions;
-2. agents keep terminal reports in the local journal until acknowledged;
-3. after server restart, agents reconnect by polling;
-4. agents resend observed state and unacknowledged terminal reports;
-5. the server reconstructs current state from its durable database plus agent reports.
+2. agents keep terminal reports in the local durable spool until acknowledged;
+3. systemd should automatically restart the server after an ordinary process failure;
+4. after server restart, agents reconnect by polling;
+5. agents resend observed state and unacknowledged terminal reports;
+6. the server reconstructs current state from its durable database plus agent reports.
 
 No agent execution depends on an in-memory server session.
 
@@ -315,3 +329,30 @@ The controller is not allowed to bypass local safety policy.
 8. Retry policy belongs to the server.
 9. Local policy belongs to the agent.
 10. Protocol correctness does not depend on a persistent TCP session.
+
+
+## 15. Run log transport
+
+Run stdout/stderr must be centrally retrievable even when an operator is not logged into the execution node.
+
+The agent therefore captures output locally and uploads it incrementally to the server.
+
+A conceptual endpoint is:
+
+```text
+POST /api/v1/agent/attempts/{run_id}/{attempt}/logs
+```
+
+Log upload uses byte offsets or chunk sequence numbers so retransmission is idempotent. The server acknowledges the highest durably stored offset.
+
+The server stores the log bytes in its central log directory rather than inside SQLite. The database stores only metadata such as:
+
+- run/attempt key;
+- log path or object key;
+- stored byte count;
+- completion state;
+- optional checksum.
+
+The local agent copy is a temporary spool and may be removed after the server has acknowledged both the terminal result and all log bytes.
+
+This built-in central Run log path is distinct from daemon observability logs. `tracing` output from `lmt-server` and `lmt-agent` still goes to journald and may optionally be collected by Loki.
