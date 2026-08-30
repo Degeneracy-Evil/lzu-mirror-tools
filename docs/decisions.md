@@ -151,6 +151,36 @@ The server stores log bytes in a central filesystem log store and keeps only ind
 
 Daemon logs remain normal structured observability logs suitable for journald/Loki.
 
+### D016 - Public Run state is small; protocol detail belongs to Attempt
+
+Status: accepted.
+
+The public Run state is `Pending / Running / Succeeded / Failed / Cancelled / TimedOut`.
+
+Attempts use the more precise internal states `Queued / Accepted / Running / Succeeded / Failed / TimedOut / Cancelled / Interrupted / Rejected`.
+
+This prevents network/execution protocol details from becoming permanent operator-facing API complexity.
+
+### D017 - Pre-stable HTTP API uses `/api/v1alpha1`
+
+Status: accepted.
+
+The CLI and Agents use the same versioned HTTP API family. LMT will not claim a stable `/api/v1` compatibility contract before the first stable project release.
+
+### D018 - Configuration apply uses optimistic revision checking
+
+Status: accepted.
+
+`config plan` returns a deployment-wide base revision. `config apply` carries that revision and fails with a conflict if another apply occurred in the meantime.
+
+The server recomputes and commits the authoritative bundle atomically.
+
+### D019 - Manual mutating requests carry client request IDs
+
+Status: accepted.
+
+Operations such as manual Run creation use a client-generated request ID so retrying an HTTP POST after a lost response does not duplicate operator intent.
+
 ## Current open questions
 
 The following points should be resolved before or during the first implementation milestone:
