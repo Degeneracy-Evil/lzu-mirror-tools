@@ -11,10 +11,13 @@ use lmt_protocol::v1alpha1::*;
 use lmt_store::{AttemptRecord, ChangeKind, ConfigPlan, RunRecord, Store, StoreError};
 use serde::Deserialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -23,6 +26,8 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::{Mutex, Notify},
 };
+
+mod services;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,8 +57,17 @@ pub struct AppState {
     operator_token: Arc<str>,
     offline_after: Duration,
     notify: Arc<Notify>,
-    log_lock: Arc<Mutex<()>>,
+    log_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    metrics: Arc<AppMetrics>,
     poll_wait: Duration,
+}
+
+#[derive(Default)]
+struct AppMetrics {
+    polls: AtomicU64,
+    events: AtomicU64,
+    uploaded_bytes: AtomicU64,
+    log_failures: AtomicU64,
 }
 impl AppState {
     pub fn new(store: Store, log_dir: PathBuf, token: String, offline_after: Duration) -> Self {
@@ -63,7 +77,8 @@ impl AppState {
             operator_token: token.into(),
             offline_after,
             notify: Arc::new(Notify::new()),
-            log_lock: Arc::new(Mutex::new(())),
+            log_locks: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(AppMetrics::default()),
             poll_wait: Duration::from_secs(20),
         }
     }
@@ -91,10 +106,7 @@ pub fn build_router(s: AppState) -> Router {
             get(|| async { Json(HealthResponse { status: "live".into() }) }),
         )
         .route("/health/ready", get(ready))
-        .route(
-            "/metrics",
-            get(|| async { ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], "lmt_up 1\n") }),
-        )
+        .route("/metrics", get(metrics))
         .route("/api/v1alpha1/config/validate", post(validate))
         .route("/api/v1alpha1/config/plan", post(plan))
         .route("/api/v1alpha1/config/apply", post(apply))
@@ -115,6 +127,28 @@ pub fn build_router(s: AppState) -> Router {
 async fn ready(State(s): State<AppState>) -> Result<Json<HealthResponse>, Failure> {
     s.store.current_revision()?;
     Ok(Json(HealthResponse { status: "ready".into() }))
+}
+
+async fn metrics(State(state): State<AppState>) -> Result<Response, Failure> {
+    let runs = state.store.list_runs()?;
+    let pending = runs
+        .iter()
+        .filter(|run| run.state == lmt_core::RunState::Pending)
+        .count();
+    let running = runs
+        .iter()
+        .filter(|run| run.state == lmt_core::RunState::Running)
+        .count();
+    let body = format!(
+        "lmt_up 1\nlmt_runs_pending {}\nlmt_runs_running {}\nlmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_total {}\nlmt_log_upload_failures_total {}\n",
+        pending,
+        running,
+        state.metrics.polls.load(Ordering::Relaxed),
+        state.metrics.events.load(Ordering::Relaxed),
+        state.metrics.uploaded_bytes.load(Ordering::Relaxed),
+        state.metrics.log_failures.load(Ordering::Relaxed)
+    );
+    Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
 }
 async fn validate(
     State(s): State<AppState>,
@@ -282,11 +316,12 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
         r.capacity.mirror_root_free_bytes,
         &r.mirror_root,
     )?;
-    if let Some(a) = s.store.poll_action(&node, &r.mirror_root)? {
+    s.metrics.polls.fetch_add(1, Ordering::Relaxed);
+    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root)? {
         return Ok(action(a).into_response());
     }
     let _ = tokio::time::timeout(s.poll_wait, s.notify.notified()).await;
-    if let Some(a) = s.store.poll_action(&node, &r.mirror_root)? {
+    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root)? {
         return Ok(action(a).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -324,6 +359,7 @@ async fn event(
             failure_message: r.failure_message,
         },
     )?;
+    s.metrics.events.fetch_add(1, Ordering::Relaxed);
     Ok(Json(EventResponse {
         accepted_event_sequence: accepted,
     }))
@@ -345,7 +381,16 @@ async fn upload_log(
     }
     let offset = header_u64(&h, "x-lmt-log-offset")?;
     let complete = h.get("x-lmt-log-complete").and_then(|v| v.to_str().ok()) == Some("true");
-    let next = append_log(&s, &id, no, offset, &body, complete).await?;
+    let next = match append_log(&s, &id, no, offset, &body, complete).await {
+        Ok(next) => next,
+        Err(error) => {
+            s.metrics.log_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+    };
+    s.metrics
+        .uploaded_bytes
+        .fetch_add(u64::try_from(body.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         "x-lmt-log-next-offset",
@@ -404,7 +449,12 @@ async fn append_log(s: &AppState, id: &str, no: u32, offset: u64, body: &[u8], c
     let id = RunId::from_str(id)
         .map_err(|_| Failure::bad("invalid_run_id", "invalid run id"))?
         .to_string();
-    let _guard = s.log_lock.lock().await;
+    let key = format!("{id}-{no}");
+    let lock = {
+        let mut locks = s.log_locks.lock().await;
+        locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    };
+    let _guard = lock.lock().await;
     let path = log_path(&s.log_dir, &id, no);
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).await.map_err(Failure::io)?;
@@ -654,8 +704,7 @@ mod tests {
         .expect("bundle");
         store.apply(&bundle, 0, "test").expect("apply");
         let run = store.create_manual_run("demo", "request").expect("run");
-        store
-            .poll_action("node-a", "/tmp/mirrors")
+        services::next_action(&store, "node-a", "/tmp/mirrors")
             .expect("poll")
             .expect("action");
         let state = AppState::new(

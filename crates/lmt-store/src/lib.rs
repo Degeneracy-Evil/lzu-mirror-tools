@@ -7,8 +7,7 @@ use std::{
 };
 
 use lmt_core::{
-    AttemptEvent, AttemptNo, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, MirrorName, NodeName,
-    ProcessRunSpec, RunId, RunSpecContext, RunState, compile_process_run_spec, project_attempt_event,
+    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, ProcessRunSpec, RunId, RunState, project_attempt_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -128,6 +127,13 @@ pub struct PollAction {
     pub attempt_no: u32,
     pub spec_hash: String,
     pub spec: ProcessRunSpec,
+}
+
+pub struct DispatchSource {
+    pub run_id: String,
+    pub mirror_name: String,
+    pub mirror_generation: u64,
+    pub config_toml: String,
 }
 
 impl Store {
@@ -396,7 +402,11 @@ impl Store {
         self.get_run(&run_id)?.ok_or(StoreError::AttemptNotFound)
     }
 
-    pub fn poll_action(&self, node: &str, mirror_root: &str) -> Result<Option<PollAction>, StoreError> {
+    pub fn poll_action(
+        &self,
+        node: &str,
+        compile: impl FnOnce(&DispatchSource) -> Result<(ProcessRunSpec, String), StoreError>,
+    ) -> Result<Option<PollAction>, StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let pending: Option<(String, String, u64)> = transaction
@@ -449,26 +459,14 @@ impl Store {
             params![mirror_name, generation],
             |row| row.get(0),
         )?;
-        let document: MirrorDocument =
-            toml::from_str(&config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-        let mirror_id = MirrorName::new(&mirror_name).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-        let node_id = NodeName::new(node).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-        let parsed_run_id = run_id
-            .parse::<RunId>()
-            .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-        let attempt_id = AttemptNo::new(1).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-        let spec = compile_process_run_spec(
-            &document,
-            &RunSpecContext {
-                mirror_name: &mirror_id,
-                run_id: parsed_run_id,
-                attempt_no: attempt_id,
-                node_name: &node_id,
-                mirror_root: Path::new(mirror_root),
-            },
-        );
+        let source = DispatchSource {
+            run_id: run_id.clone(),
+            mirror_name,
+            mirror_generation: generation,
+            config_toml,
+        };
+        let (spec, spec_hash) = compile(&source)?;
         let spec_json = serde_json::to_string(&spec)?;
-        let spec_hash = format!("sha256:{}", hex::encode(Sha256::digest(spec_json.as_bytes())));
         let now = now_ms();
         transaction.execute(
             "INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,last_event_sequence,dispatch_count,last_dispatch_at_ms)
@@ -859,6 +857,26 @@ mod tests {
         .expect("valid")
     }
 
+    fn poll(store: &Store) -> PollAction {
+        store
+            .poll_action("node-a", |_| {
+                Ok((
+                    ProcessRunSpec {
+                        runner: "process".into(),
+                        program: "/bin/true".into(),
+                        args: vec![],
+                        cwd: None,
+                        timeout_seconds: 30,
+                        mirror_root: "/tmp/mirrors".into(),
+                        target_dir: "/tmp/mirrors/demo".into(),
+                    },
+                    "sha256:test".into(),
+                ))
+            })
+            .expect("poll")
+            .expect("action")
+    }
+
     #[test]
     fn migrations_and_restart_preserve_state() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -905,10 +923,7 @@ mod tests {
         let store = Store::open_in_memory().expect("open");
         store.apply(&bundle("/bin/true"), 0, "test").expect("apply");
         let run = store.create_manual_run("demo", "request").expect("run");
-        store
-            .poll_action("node-a", "/tmp/mirrors")
-            .expect("poll")
-            .expect("action");
+        poll(&store);
         let terminal = AttemptEvent {
             event_sequence: 3,
             state: AttemptState::Succeeded,
@@ -949,19 +964,13 @@ mod tests {
         let store = Store::open_in_memory().expect("open");
         store.apply(&bundle("/bin/true"), 0, "test").expect("apply");
         let dispatched = store.create_manual_run("demo", "request-2").expect("run");
-        let first = store
-            .poll_action("node-a", "/tmp/mirrors")
-            .expect("poll")
-            .expect("action");
+        let first = poll(&store);
         store.apply(&empty, 1, "remove").expect("remove");
         assert_eq!(
             store.get_run(&dispatched.id).expect("get").expect("run").state,
             RunState::Pending
         );
-        let redelivered = store
-            .poll_action("node-a", "/tmp/mirrors")
-            .expect("poll")
-            .expect("redelivery");
+        let redelivered = poll(&store);
         assert_eq!(redelivered.run_id, first.run_id);
         assert_eq!(redelivered.spec_hash, first.spec_hash);
     }
