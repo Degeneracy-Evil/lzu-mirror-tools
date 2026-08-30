@@ -6,9 +6,10 @@ mod state;
 
 pub use config::{
     BundleFile, CanonicalBundle, CommandSync, ConfigBundle, ConfigError, MirrorConfig, MirrorDocument, ProcessRunner,
-    RunPolicy, canonicalize_bundle,
+    RunPolicy, RunSpecContext, canonicalize_bundle, compile_process_run_spec,
 };
 pub use ids::{AgentInstanceId, AttemptNo, MirrorName, NodeName, RequestId, RunId};
 pub use state::{
-    AttemptEvent, AttemptState, FailureKind, ProcessRunSpec, RunState, TransitionError, validate_attempt_transition,
+    AttemptEvent, AttemptProjection, AttemptState, FailureKind, ProcessRunSpec, RunState, TransitionError,
+    project_attempt_event, validate_attempt_transition,
 };

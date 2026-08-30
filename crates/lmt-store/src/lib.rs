@@ -7,7 +7,8 @@ use std::{
 };
 
 use lmt_core::{
-    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, ProcessRunSpec, RunId, RunState,
+    AttemptEvent, AttemptNo, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, MirrorName, NodeName,
+    ProcessRunSpec, RunId, RunSpecContext, RunState, compile_process_run_spec, project_attempt_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -198,6 +199,7 @@ impl Store {
                         "UPDATE mirrors SET managed=0, removed_at_ms=?2 WHERE name=?1",
                         params![change.mirror, now],
                     )?;
+                    cancel_undispatched_pending(&transaction, &change.mirror, now)?;
                 }
                 ChangeKind::Create | ChangeKind::Update | ChangeKind::Move => {
                     let mirror = &bundle.mirrors[&lmt_core::MirrorName::new(&change.mirror)
@@ -210,6 +212,9 @@ impl Store {
                            owner_node=excluded.owner_node, current_generation=excluded.current_generation, removed_at_ms=NULL",
                         params![change.mirror, mirror.document.mirror.enabled, mirror.owner_node.as_str(), generation],
                     )?;
+                    if !mirror.document.mirror.enabled {
+                        cancel_undispatched_pending(&transaction, &change.mirror, now)?;
+                    }
                     transaction.execute(
                         "INSERT INTO mirror_generations(mirror_name,generation,config_revision,owner_node,config_hash,config_toml,created_at_ms)
                          VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -396,7 +401,10 @@ impl Store {
         let transaction = connection.transaction()?;
         let pending: Option<(String, String, u64)> = transaction
             .query_row(
-                "SELECT id,mirror_name,mirror_generation FROM runs WHERE owner_node=?1 AND state='pending' ORDER BY created_at_ms LIMIT 1",
+                "SELECT r.id,r.mirror_name,r.mirror_generation FROM runs r JOIN mirrors m ON m.name=r.mirror_name
+                 WHERE r.owner_node=?1 AND r.state='pending' AND ((m.managed=1 AND m.enabled=1) OR EXISTS(
+                   SELECT 1 FROM attempts a WHERE a.run_id=r.id AND a.dispatch_count>0))
+                 ORDER BY r.created_at_ms LIMIT 1",
                 [node],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -443,26 +451,22 @@ impl Store {
         )?;
         let document: MirrorDocument =
             toml::from_str(&config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-        let target_dir = Path::new(mirror_root).join(&document.mirror.target);
-        let target_dir = target_dir.to_string_lossy().into_owned();
-        let resolve = |value: &str| {
-            value
-                .replace("{mirror_name}", &mirror_name)
-                .replace("{run_id}", &run_id)
-                .replace("{attempt}", "1")
-                .replace("{node_name}", node)
-                .replace("{mirror_root}", mirror_root)
-                .replace("{target_dir}", &target_dir)
-        };
-        let spec = ProcessRunSpec {
-            runner: "process".into(),
-            program: resolve(&document.sync.program),
-            args: document.sync.args.iter().map(|value| resolve(value)).collect(),
-            cwd: document.sync.cwd.as_deref().map(resolve),
-            timeout_seconds: document.run.timeout_seconds,
-            mirror_root: mirror_root.into(),
-            target_dir,
-        };
+        let mirror_id = MirrorName::new(&mirror_name).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+        let node_id = NodeName::new(node).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+        let parsed_run_id = run_id
+            .parse::<RunId>()
+            .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+        let attempt_id = AttemptNo::new(1).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+        let spec = compile_process_run_spec(
+            &document,
+            &RunSpecContext {
+                mirror_name: &mirror_id,
+                run_id: parsed_run_id,
+                attempt_no: attempt_id,
+                node_name: &node_id,
+                mirror_root: Path::new(mirror_root),
+            },
+        );
         let spec_json = serde_json::to_string(&spec)?;
         let spec_hash = format!("sha256:{}", hex::encode(Sha256::digest(spec_json.as_bytes())));
         let now = now_ms();
@@ -498,13 +502,10 @@ impl Store {
             transaction.commit()?;
             return Ok(sequence);
         }
-        let terminal_snapshot_skip = state == AttemptState::Queued && event.state.is_terminal();
-        if !state.allows(event.state) && !terminal_snapshot_skip {
-            return Err(StoreError::IllegalTransition {
-                from: state,
-                to: event.state,
-            });
-        }
+        let projection = project_attempt_event(state, event).map_err(|error| StoreError::IllegalTransition {
+            from: error.from,
+            to: error.to,
+        })?;
         transaction.execute(
             "UPDATE attempts SET state=?3,last_event_sequence=?4,agent_instance_id=?5,
              accepted_at_ms=COALESCE(accepted_at_ms,?6),started_at_ms=COALESCE(started_at_ms,?7),
@@ -524,26 +525,21 @@ impl Store {
                 event.failure_message,
             ],
         )?;
-        if matches!(event.state, AttemptState::Accepted | AttemptState::Running) {
+        if projection.run_state == Some(RunState::Running) {
             transaction.execute(
                 "UPDATE runs SET state='running',started_at_ms=COALESCE(started_at_ms,?2) WHERE id=?1 AND state='pending'",
-                params![run_id, event.accepted_at_ms.or(event.started_at_ms).unwrap_or_else(now_ms)],
+                params![run_id, projection.run_started_at_ms.unwrap_or_else(now_ms)],
             )?;
-        } else if event.state.is_terminal() {
-            let run_state = match event.state {
-                AttemptState::Succeeded => RunState::Succeeded,
-                AttemptState::TimedOut => RunState::TimedOut,
-                AttemptState::Cancelled => RunState::Cancelled,
-                AttemptState::Failed | AttemptState::Interrupted | AttemptState::Rejected => RunState::Failed,
-                AttemptState::Queued | AttemptState::Accepted | AttemptState::Running => unreachable!(),
-            };
+        } else if let Some(run_state) = projection.run_state {
             transaction.execute(
-                "UPDATE runs SET state=?2,finished_at_ms=?3,final_exit_code=?4,failure_kind=?5,failure_message=?6
+                "UPDATE runs SET state=?2,started_at_ms=COALESCE(started_at_ms,?3),finished_at_ms=?4,
+                 final_exit_code=?5,failure_kind=?6,failure_message=?7
                  WHERE id=?1 AND state IN ('pending','running')",
                 params![
                     run_id,
                     run_state_str(run_state),
-                    event.finished_at_ms.unwrap_or_else(now_ms),
+                    projection.run_started_at_ms,
+                    projection.run_finished_at_ms.unwrap_or_else(now_ms),
                     event.exit_code,
                     event.failure_kind.map(failure_kind_str),
                     event.failure_message,
@@ -714,6 +710,23 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
         bundle_hash: bundle.bundle_hash.clone(),
         changes,
     })
+}
+
+fn cancel_undispatched_pending(transaction: &Transaction<'_>, mirror: &str, now: i64) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE attempts SET state='cancelled',finished_at_ms=?2
+         WHERE run_id IN (SELECT id FROM runs WHERE mirror_name=?1 AND state='pending')
+           AND dispatch_count=0 AND state='queued'",
+        params![mirror, now],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET state='cancelled',finished_at_ms=?2,failure_kind='configuration_removed',
+         failure_message='configuration disabled or removed before dispatch'
+         WHERE mirror_name=?1 AND state='pending' AND NOT EXISTS(
+           SELECT 1 FROM attempts WHERE attempts.run_id=runs.id AND dispatch_count>0)",
+        params![mirror, now],
+    )?;
+    Ok(())
 }
 
 fn find_run_by_request(transaction: &Transaction<'_>, request_id: &str) -> Result<Option<RunRecord>, StoreError> {
@@ -918,5 +931,38 @@ mod tests {
             store.get_run(&run.id).expect("get").expect("run").state,
             RunState::Succeeded
         );
+    }
+
+    #[test]
+    fn removal_cancels_only_never_dispatched_pending_work() {
+        let empty = canonicalize_bundle(&ConfigBundle { files: vec![] }).expect("empty bundle");
+
+        let store = Store::open_in_memory().expect("open");
+        store.apply(&bundle("/bin/true"), 0, "test").expect("apply");
+        let undispatched = store.create_manual_run("demo", "request-1").expect("run");
+        store.apply(&empty, 1, "remove").expect("remove");
+        assert_eq!(
+            store.get_run(&undispatched.id).expect("get").expect("run").state,
+            RunState::Cancelled
+        );
+
+        let store = Store::open_in_memory().expect("open");
+        store.apply(&bundle("/bin/true"), 0, "test").expect("apply");
+        let dispatched = store.create_manual_run("demo", "request-2").expect("run");
+        let first = store
+            .poll_action("node-a", "/tmp/mirrors")
+            .expect("poll")
+            .expect("action");
+        store.apply(&empty, 1, "remove").expect("remove");
+        assert_eq!(
+            store.get_run(&dispatched.id).expect("get").expect("run").state,
+            RunState::Pending
+        );
+        let redelivered = store
+            .poll_action("node-a", "/tmp/mirrors")
+            .expect("poll")
+            .expect("redelivery");
+        assert_eq!(redelivered.run_id, first.run_id);
+        assert_eq!(redelivered.spec_hash, first.spec_hash);
     }
 }

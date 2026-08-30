@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{MirrorName, NodeName};
+use crate::{AttemptNo, MirrorName, NodeName, ProcessRunSpec, RunId};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +148,42 @@ pub enum ConfigError {
     UnsupportedPlaceholder(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct RunSpecContext<'a> {
+    pub mirror_name: &'a MirrorName,
+    pub run_id: RunId,
+    pub attempt_no: AttemptNo,
+    pub node_name: &'a NodeName,
+    pub mirror_root: &'a Path,
+}
+
+pub fn compile_process_run_spec(document: &MirrorDocument, context: &RunSpecContext<'_>) -> ProcessRunSpec {
+    let mirror_root = context.mirror_root.to_string_lossy();
+    let target_dir = context
+        .mirror_root
+        .join(&document.mirror.target)
+        .to_string_lossy()
+        .into_owned();
+    let resolve = |value: &str| {
+        value
+            .replace("{mirror_name}", context.mirror_name.as_str())
+            .replace("{run_id}", &context.run_id.to_string())
+            .replace("{attempt}", &context.attempt_no.get().to_string())
+            .replace("{node_name}", context.node_name.as_str())
+            .replace("{mirror_root}", &mirror_root)
+            .replace("{target_dir}", &target_dir)
+    };
+    ProcessRunSpec {
+        runner: "process".into(),
+        program: resolve(&document.sync.program),
+        args: document.sync.args.iter().map(|value| resolve(value)).collect(),
+        cwd: document.sync.cwd.as_deref().map(resolve),
+        timeout_seconds: document.run.timeout_seconds,
+        mirror_root: mirror_root.into_owned(),
+        target_dir,
+    }
+}
+
 pub fn canonicalize_bundle(bundle: &ConfigBundle) -> Result<CanonicalBundle, Vec<ConfigError>> {
     let mut errors = Vec::new();
     let mut mirrors = BTreeMap::new();
@@ -226,7 +262,8 @@ fn canonicalize_file(file: &BundleFile) -> Result<(MirrorName, CanonicalMirror),
 
 fn validate_document(document: &MirrorDocument) -> Result<(), ConfigError> {
     let target = Path::new(&document.mirror.target);
-    if target.is_absolute()
+    if document.mirror.target.is_empty()
+        || target.is_absolute()
         || target
             .components()
             .any(|component| !matches!(component, std::path::Component::Normal(_)))
@@ -242,7 +279,10 @@ fn validate_document(document: &MirrorDocument) -> Result<(), ConfigError> {
     if document.run.max_attempts != 1 {
         return Err(ConfigError::UnsupportedRetries);
     }
-    for value in document.sync.args.iter().chain(document.sync.cwd.iter()) {
+    for value in std::iter::once(&document.sync.program)
+        .chain(document.sync.args.iter())
+        .chain(document.sync.cwd.iter())
+    {
         validate_placeholders(value)?;
     }
     Ok(())
@@ -250,7 +290,10 @@ fn validate_document(document: &MirrorDocument) -> Result<(), ConfigError> {
 
 fn validate_placeholders(value: &str) -> Result<(), ConfigError> {
     let mut rest = value;
-    while let Some(open) = rest.find('{') {
+    while let Some(open) = rest.find(['{', '}']) {
+        if rest.as_bytes()[open] == b'}' {
+            return Err(ConfigError::UnsupportedPlaceholder(rest[open..].to_owned()));
+        }
         let after = &rest[open + 1..];
         let Some(close) = after.find('}') else {
             return Err(ConfigError::UnsupportedPlaceholder(after.to_owned()));
@@ -300,5 +343,16 @@ mod tests {
         ))
         .expect_err("unsafe");
         assert!(matches!(errors[0], ConfigError::UnsafeTarget(_)));
+    }
+
+    #[test]
+    fn empty_target_and_malformed_placeholders_are_rejected() {
+        for contents in [
+            "[mirror]\nname='example'\ntarget=''\n[sync]\ntype='command'\nprogram='/bin/true'\n",
+            "[mirror]\nname='example'\ntarget='example'\n[sync]\ntype='command'\nprogram='/bin/{unknown}'\n",
+            "[mirror]\nname='example'\ntarget='example'\n[sync]\ntype='command'\nprogram='/bin/true}'\n",
+        ] {
+            assert!(canonicalize_bundle(&bundle(contents)).is_err());
+        }
     }
 }

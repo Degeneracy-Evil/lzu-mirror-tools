@@ -104,6 +104,45 @@ pub struct TransitionError {
     pub to: AttemptState,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AttemptProjection {
+    pub run_state: Option<RunState>,
+    pub run_started_at_ms: Option<i64>,
+    pub run_finished_at_ms: Option<i64>,
+}
+
+pub fn project_attempt_event(
+    current: AttemptState,
+    event: &AttemptEvent,
+) -> Result<AttemptProjection, TransitionError> {
+    let terminal_snapshot_skip = current == AttemptState::Queued && event.state.is_terminal();
+    if !current.allows(event.state) && !terminal_snapshot_skip {
+        return Err(TransitionError {
+            from: current,
+            to: event.state,
+        });
+    }
+    if matches!(event.state, AttemptState::Accepted | AttemptState::Running) {
+        return Ok(AttemptProjection {
+            run_state: Some(RunState::Running),
+            run_started_at_ms: event.accepted_at_ms.or(event.started_at_ms),
+            run_finished_at_ms: None,
+        });
+    }
+    let run_state = match event.state {
+        AttemptState::Succeeded => Some(RunState::Succeeded),
+        AttemptState::TimedOut => Some(RunState::TimedOut),
+        AttemptState::Cancelled => Some(RunState::Cancelled),
+        AttemptState::Failed | AttemptState::Interrupted | AttemptState::Rejected => Some(RunState::Failed),
+        AttemptState::Queued | AttemptState::Accepted | AttemptState::Running => None,
+    };
+    Ok(AttemptProjection {
+        run_state,
+        run_started_at_ms: event.started_at_ms.or(event.accepted_at_ms),
+        run_finished_at_ms: event.finished_at_ms,
+    })
+}
+
 pub fn validate_attempt_transition(from: AttemptState, to: AttemptState) -> Result<(), TransitionError> {
     if from.allows(to) {
         Ok(())
