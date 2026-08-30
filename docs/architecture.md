@@ -165,26 +165,34 @@ If LMT, Prometheus, or the configuration database is unavailable, already-publis
 
 ## 5. Source of truth
 
-Mirror definitions are stored as TOML files.
+Mirror definitions are stored as node-scoped TOML files.
 
 ```text
-TOML files
-    |
-    | lmt config apply
-    v
-applied configuration in lmt-server
-    |
-    v
+config/
+└── nodes/
+    ├── mirror01/mirrors/*.toml
+    └── mirror02/mirrors/*.toml
+             |
+             | lmt config apply
+             v
+authoritative applied configuration in lmt-server
+             |
+             v
 SQLite + runtime state
 ```
+
+The directory namespace defines which node owns each Mirror. Mirror TOML files do not contain a redundant placement field.
 
 Git is recommended for versioning those TOML files, but LMT does not know about Git and never performs `git pull`.
 
 This deliberately separates:
 
 - **configuration history**: Git;
+- **desired configuration set**: TOML files;
 - **currently applied configuration**: LMT server;
 - **runtime/history state**: LMT database.
+
+A successful apply reconciles the managed server configuration to the authoritative TOML tree, including pruning Mirrors whose files were removed. Pruning management state never implicitly deletes mirror data from disk.
 
 ## 6. Database model
 
@@ -202,18 +210,23 @@ Agents may also use their own local SQLite journal. No SQLite database file is s
 
 PostgreSQL support may be added later if real deployments require multiple active controllers. It is not a v1 requirement.
 
-## 7. Scheduling and placement
+## 7. Scheduling and node ownership
 
 LMT v1 intentionally separates multi-node support from dynamic cluster scheduling.
 
-Mirror placement is explicit:
+Each agent represents one node, and each Mirror belongs to exactly one node-scoped configuration namespace. The server derives ownership from that namespace and dispatches Runs to that node only.
 
-```toml
-[placement]
-node = "mirror02"
+```text
+config/nodes/mirror01/mirrors/ubuntu.toml
+        |
+        +--> server records owner_node = mirror01
+        |
+        +--> Runs go only to the mirror01 agent
 ```
 
 This is desirable for mirror infrastructure because data placement is stable and operators generally want to know where a large repository physically resides.
+
+Moving a configuration file to another node namespace is the explicit way to request a node reassignment. LMT does not perform automatic storage migration or automatic failover.
 
 Automatic scoring, storage-aware placement, and cross-node migration are future features only if real deployments require them.
 

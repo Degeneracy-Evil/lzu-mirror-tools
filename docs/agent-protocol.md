@@ -87,7 +87,6 @@ Example:
         "runner": "process",
         "program": "rsync",
         "args": ["..."],
-        "env": {},
         "cwd": "/srv/mirrors/ubuntu",
         "timeout_seconds": 21600
       }
@@ -289,6 +288,8 @@ The agent should cancel the whole process group, not only the direct child proce
 ## 13. Local policy validation
 
 An agent must validate every RunSpec against local policy before accepting it.
+
+RunSpecs contain already-resolved execution values. LMT-specific runtime context is not communicated to child processes through implicit environment variables; any such value must have been explicitly referenced by the Mirror TOML and compiled into the RunSpec.
 
 Examples include:
 

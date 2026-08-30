@@ -19,7 +19,23 @@ A Mirror answers:
 - how the synchronization command is produced;
 - what execution policy applies.
 
-One mirror is normally stored in one TOML file.
+One mirror is normally stored in one TOML file under a node-scoped configuration directory.
+
+Example repository layout:
+
+```text
+config/
+└── nodes/
+    ├── mirror01/
+    │   └── mirrors/
+    │       ├── ubuntu.toml
+    │       └── debian.toml
+    └── mirror02/
+        └── mirrors/
+            └── pypi.toml
+```
+
+The directory namespace is authoritative: `config/nodes/mirror01/mirrors/ubuntu.toml` means that the `ubuntu` mirror is owned by node `mirror01`. The mirror file does not repeat that fact.
 
 Example:
 
@@ -33,9 +49,6 @@ target = "ubuntu"
 [schedule]
 cron = "15 * * * *"
 timezone = "Asia/Shanghai"
-
-[placement]
-node = "mirror01"
 
 [sync]
 type = "rsync"
@@ -118,18 +131,25 @@ The two forms are mutually exclusive.
 
 If `[schedule]` is absent, the mirror is manual-only.
 
-## 3. Placement
+## 3. Node ownership
 
-v1 uses explicit placement:
+v1 does not have a `[placement]` section in a Mirror file.
 
-```toml
-[placement]
-node = "mirror02"
+Node ownership is explicit in the configuration namespace:
+
+```text
+config/nodes/mirror01/mirrors/ubuntu.toml
+                         |
+                         +--> ubuntu is owned by mirror01
 ```
 
-The server does not automatically move a mirror to another node when that node becomes unavailable.
+The server records the derived owner node when configuration is applied and dispatches that mirror's Runs only to the matching agent.
 
-This is intentional: large mirrors are persistent data, not stateless jobs.
+This keeps one source of truth for ownership and avoids contradictory configuration such as placing a file under `mirror01/` while declaring `node = "mirror02"` inside it.
+
+Moving a mirror file between node directories is an explicit ownership change. Because this can cause a large re-synchronization on another host, `lmt config apply` must surface the move clearly and may require an explicit acknowledgement flag before applying it.
+
+The server does not automatically move a mirror when a node becomes unavailable. Large mirrors are persistent data, not stateless jobs.
 
 ## 4. Synchronization specification
 
@@ -152,23 +172,32 @@ The server compiles this into an ordinary process RunSpec. The agent does not ne
 [sync]
 type = "command"
 program = "python3"
-args = ["/opt/lmt-sync/pypi.py", "--mode", "mirror"]
+args = [
+  "/opt/lmt-sync/pypi.py",
+  "--target",
+  "{target_dir}",
+]
+cwd = "{mirror_root}"
 ```
 
 This intentionally keeps custom synchronization open to any executable language.
 
-The execution environment provides stable metadata such as:
+LMT does **not** inject hidden LMT-specific environment variables by default. Runtime values are available only through explicit placeholders written in the configuration. Initial placeholders are expected to include:
 
 ```text
-LMT_MIRROR_NAME
-LMT_RUN_ID
-LMT_ATTEMPT
-LMT_NODE_NAME
-LMT_MIRROR_ROOT
-LMT_TARGET_DIR
+{mirror_name}
+{run_id}
+{attempt}
+{node_name}
+{mirror_root}
+{target_dir}
 ```
 
-These environment variables are a small process contract, not a plugin SDK.
+The server resolves placeholders while compiling an immutable RunSpec.
+
+If a custom program needs a value, that dependency is therefore visible in the TOML file itself. For example, a script only receives the target directory if the configuration explicitly includes `"{target_dir}"` in an argument or other supported field.
+
+Ordinary user-defined environment variables may still be configured explicitly in TOML if a synchronization program requires them; LMT must not create implicit configuration channels.
 
 ## 5. Runner
 
@@ -228,30 +257,39 @@ Git remains the long-term source of configuration history; LMT generations provi
 Expected workflow:
 
 ```text
-lmt config validate mirrors/
-lmt config apply mirrors/
+lmt config validate config/
+lmt config plan config/
+lmt config apply config/
 ```
 
 Validation includes at minimum:
 
 - TOML parsing;
 - schema/type validation;
-- unique mirror names;
+- valid node namespaces;
+- unique mirror names within the deployment;
 - safe target paths;
 - valid cron/timezone or interval;
-- valid node reference;
 - valid runner;
+- valid placeholder references;
 - duration and retry bounds.
 
-An apply operation creates or updates configuration. Missing local files do **not** implicitly delete server-side mirrors.
+An applied configuration tree is an **authoritative desired set** for its managed scope.
 
-Deletion must be explicit:
+Therefore `lmt config apply config/` reconciles the server to the files that currently exist:
 
-```text
-lmt mirror delete <name>
-```
+- a new file creates a managed Mirror;
+- a changed file creates a new Mirror generation;
+- a removed file removes that Mirror from active management;
+- moving a file between node directories changes its owner node.
 
-Deleting mirror metadata must never automatically delete mirror files.
+This prevents configuration drift between the repository and LMT's applied state.
+
+`lmt config plan` must show creates, updates, removals, and node moves before application. Automation may apply directly, while interactive CLI usage may ask for confirmation for high-impact changes such as node moves.
+
+Removing a Mirror from management stops future scheduling but does not erase historical Runs. An already-running immutable Run may finish unless the operator explicitly cancels it.
+
+Most importantly, pruning control-plane configuration does **not** delete mirror data from disk. Data removal is a separate, explicit destructive operation and is outside normal configuration reconciliation.
 
 ## 9. Node
 
@@ -304,7 +342,7 @@ Typical fields include:
 - run ID;
 - mirror name;
 - configuration generation;
-- assigned node;
+- owner/execution node;
 - trigger;
 - state;
 - current/total attempts;

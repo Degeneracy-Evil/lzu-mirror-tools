@@ -65,11 +65,19 @@ Control uses bounded long polling. State reports use normal HTTP POST requests.
 
 gRPC and WebSocket are not required.
 
-### D007 - Explicit mirror placement
+### D007 - Node-scoped configuration instead of placement fields
 
 Status: accepted.
 
-v1 Mirror configuration names the target node explicitly.
+Each agent represents one node. Mirror ownership is derived from the configuration namespace, for example:
+
+```text
+config/nodes/mirror01/mirrors/ubuntu.toml
+```
+
+Mirror TOML files do not repeat the owner node in a `[placement]` field.
+
+Moving a file between node namespaces is an explicit reassignment and must be surfaced as a high-impact configuration change.
 
 The project will not implement Kubernetes-like dynamic scheduling unless real mirror deployments later justify it.
 
@@ -102,6 +110,26 @@ Status: accepted.
 If a node disappears while a mirror synchronization is active, LMT does not automatically start the same mirror on another node.
 
 Avoiding duplicate writers is more important than control-plane availability.
+
+### D012 - No implicit LMT environment variables
+
+Status: accepted.
+
+LMT does not inject hidden LMT-specific environment variables into custom synchronization processes.
+
+Runtime values such as target path or Run ID are exposed through explicit placeholders referenced in TOML. User-defined environment variables are allowed only when explicitly configured.
+
+This keeps all synchronization dependencies visible in configuration.
+
+### D013 - Configuration apply is authoritative and prunes removed Mirrors
+
+Status: accepted.
+
+The applied TOML tree is the authoritative desired Mirror set for its managed scope.
+
+If a previously managed Mirror file is removed, the next successful apply removes that Mirror from active management. Historical Run records remain.
+
+Configuration pruning never implicitly deletes mirror data from disk; destructive data removal is a separate explicit operation.
 
 ## Current open questions
 
