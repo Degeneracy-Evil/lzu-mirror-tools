@@ -131,21 +131,21 @@ pub struct PollAction {
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        let connection = Connection::open_in_memory()?;
+        let mut connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
         })
@@ -818,12 +818,14 @@ const fn failure_kind_str(kind: FailureKind) -> &'static str {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<(), StoreError> {
-    connection.execute_batch(include_str!("migration.sql"))?;
-    connection.execute(
+fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(include_str!("migration.sql"))?;
+    transaction.execute(
         "INSERT OR IGNORE INTO schema_migrations(version,applied_at_ms) VALUES(1,?1)",
         [now_ms()],
     )?;
+    transaction.commit()?;
     Ok(())
 }
 
