@@ -209,17 +209,28 @@ Scheduler/state-machine logic should be expressible as deterministic domain logi
 
 Wall-clock sleeps and in-memory connection state must not be required for correctness tests.
 
+### D023 - Dispatch is the config-reconciliation revocation boundary
+
+Status: accepted.
+
+With at-least-once command delivery, the Server cannot assume an unacknowledged StartAttempt was never received.
+
+Therefore disable/remove reconciliation may automatically cancel only Pending work for which no Attempt has yet been dispatched.
+
+Once an Attempt has been dispatched, it is treated as potentially executing until reconciliation proves otherwise. Configuration disable/removal prevents new Attempts and retries, but stopping an already-dispatched Attempt requires the explicit cancellation protocol.
+
+This rule is about configuration reconciliation only; it does not weaken operator-requested cancellation.
+
 ## Current open questions
 
 The following points should be resolved before or during the first implementation milestone:
 
-1. Exact TOML schema and validation rules.
-2. Whether v0.1 ships only the process runner or also an OCI container runner.
-3. Exact Run log retention/rotation/compression policy.
-4. Whether rsync statistics should be parsed into structured Run metrics in the first milestone.
-5. Agent enrollment/token provisioning UX.
-6. Database migration/versioning strategy.
-7. Stable API versioning rules before the first public release.
+1. Exact TOML schema additions needed by M2 scheduling/rsync.
+2. Exact Run log retention/rotation/compression policy.
+3. Whether rsync statistics should be parsed into structured Run metrics.
+4. Agent enrollment/token provisioning UX.
+5. Database migration/versioning strategy beyond schema v1.
+6. Stable API versioning rules before the first public release.
 
 ## Development principle
 

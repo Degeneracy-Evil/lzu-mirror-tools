@@ -287,7 +287,9 @@ This prevents configuration drift between the repository and LMT's applied state
 
 `lmt config plan` must show creates, updates, removals, and node moves before application. Automation may apply directly, while interactive CLI usage may ask for confirmation for high-impact changes such as node moves.
 
-Removing a Mirror from management stops future scheduling but does not erase historical Runs. An already-running immutable Run may finish unless the operator explicitly cancels it.
+Removing a Mirror from management stops future scheduling but does not erase historical Runs.
+
+For reconciliation purposes, **dispatch is the revocation boundary**: a Pending Run with no dispatched Attempt can be cancelled immediately, while an Attempt that has already been delivered to an Agent is treated as potentially executing even if its Accepted event has not yet reached the Server. Config pruning therefore does not implicitly revoke already-dispatched Attempts; stopping them requires the explicit cancellation protocol.
 
 Most importantly, pruning control-plane configuration does **not** delete mirror data from disk. Data removal is a separate, explicit destructive operation and is outside normal configuration reconciliation.
 

@@ -18,3 +18,8 @@ Recommended reading order:
 14. [Architecture Decisions](decisions.md) — accepted decisions and remaining questions.
 
 The documentation is intentionally more detailed than the initial codebase. LMT is a long-lived infrastructure project, so behavior should be designed and testable before implementation complexity accumulates.
+
+
+## Implementation reviews
+
+- [M1 Code Review — 2026-08-30](reviews/m1-review-2026-08-30.md) — review of implementation commit `409ea99502dcc56f0abdbec110cd9529629a4498`, including release blockers and required hardening before M2.

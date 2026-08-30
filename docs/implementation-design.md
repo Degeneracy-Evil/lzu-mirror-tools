@@ -317,6 +317,10 @@ It must support:
 
 The systemd unit and runtime process-group behavior should be designed together and tested on Linux.
 
+Service hardening must not silently make the configured `mirror_root` read-only. In particular, if the packaged unit uses `ProtectSystem=strict`, installation must explicitly make the configured mirror root writable. Because LMT intentionally avoids hidden duplicate configuration, the simpler v0.1 default may instead use a hardening level that relies on the dedicated Agent user's normal filesystem permissions for mirror data while keeping the Agent state directory protected.
+
+Per-Attempt process groups are still required even when systemd uses control-group killing for the Agent service: unit-level cleanup handles Agent death, while per-Attempt groups handle timeout/cancellation without killing unrelated Attempts.
+
 The project should not attempt to support non-Linux Agents in v0.1.
 
 ## 11. Combined Run logs

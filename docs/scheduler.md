@@ -95,7 +95,8 @@ A manual Run freezes the current Mirror generation when it is created.
 - scheduled catch-up state is cleared;
 - new manual sync requests are rejected by default;
 - an already-running Run is allowed to finish unless explicitly cancelled;
-- a Pending Run that has not started is cancelled when the disabled configuration is applied.
+- a Pending Run whose Attempt has **never been dispatched** is cancelled when the disabled configuration is applied;
+- a Run with an already-dispatched Attempt is not implicitly revoked by config reconciliation, even if its public Run state is still Pending while the Server waits for Accepted; explicit cancellation is required to stop dispatched work.
 
 Disabling does not delete mirror data.
 
@@ -104,9 +105,9 @@ Disabling does not delete mirror data.
 Removing a Mirror from the authoritative configuration behaves like disabling it for future execution:
 
 - no future schedule exists;
-- pending not-yet-started work is cancelled;
-- active work may finish;
-- no new retry Attempt is created after removal;
+- pending work that has never had an Attempt dispatched is cancelled;
+- an already-dispatched Attempt may finish unless explicitly cancelled, because at-least-once delivery means the Server cannot safely infer that an unacknowledged dispatch never started;
+- no new Attempt or retry is created after removal;
 - historical Run/Attempt records remain queryable.
 
 Removing management state never removes repository data from disk.
@@ -173,7 +174,7 @@ On startup, the server evaluates elapsed schedule time and coalesces missed elig
 | server restarts after missed due times | coalesce to one catch-up |
 | manual sync while Mirror active | reject with conflict |
 | manual sync while node offline | one Pending manual Run |
-| Mirror disabled | stop future scheduling; active Run may finish |
-| Mirror removed | prune management; preserve history/data |
+| Mirror disabled | stop future scheduling; cancel only undispatched Pending work; dispatched work needs explicit cancel |
+| Mirror removed | prune management; cancel only undispatched Pending work; preserve dispatched work/history/data |
 | config changes during Run | current Run keeps old generation |
 | retry needed | new Attempt under same Run |
