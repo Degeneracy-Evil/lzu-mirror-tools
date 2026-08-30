@@ -181,6 +181,34 @@ Status: accepted.
 
 Operations such as manual Run creation use a client-generated request ID so retrying an HTTP POST after a lost response does not duplicate operator intent.
 
+### D020 - Three library crates and three binaries
+
+Status: accepted.
+
+The initial Rust workspace uses `lmt-core`, `lmt-protocol`, and `lmt-store` as library crates, with `lmt-server`, `lmt-agent`, and `lmt-cli` as binaries.
+
+`lmt-core` must not depend on HTTP, SQL, or async-runtime infrastructure.
+
+The project should not split into more crates until a real dependency or ownership boundary justifies it.
+
+### D021 - Native process runner is the v0.1 execution primitive
+
+Status: accepted.
+
+The Agent initially implements one native Linux process runner.
+
+Built-in rsync and custom commands both compile into the same immutable process RunSpec.
+
+An OCI/container runner is deferred until a real deployment requires it.
+
+### D022 - Implementation must preserve testable time and state semantics
+
+Status: accepted.
+
+Scheduler/state-machine logic should be expressible as deterministic domain logic and tested with an injected/fake clock where appropriate.
+
+Wall-clock sleeps and in-memory connection state must not be required for correctness tests.
+
 ## Current open questions
 
 The following points should be resolved before or during the first implementation milestone:
