@@ -11,6 +11,7 @@ anyhow.workspace = true
 clap.workspace = true
 lmt-core = { path = "../../crates/lmt-core" }
 lmt-protocol = { path = "../../crates/lmt-protocol" }
+nix.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +23,7 @@ tracing-subscriber.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 tempfile.workspace = true
 
 [lints]

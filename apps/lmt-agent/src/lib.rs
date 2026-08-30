@@ -1,0 +1,494 @@
+pub mod config;
+mod executor;
+mod spool;
+
+use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+
+use anyhow::bail;
+use config::Config;
+use lmt_core::{AttemptState, FailureKind, NodeName, ProcessRunSpec};
+use lmt_protocol::v1alpha1::{AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse};
+use reqwest::{Client, StatusCode};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::{
+    fs,
+    sync::{Mutex, watch},
+};
+
+use spool::{SpoolRecord, log_path, read, retire, state_path, write};
+
+#[derive(Clone)]
+pub struct Agent {
+    config: Config,
+    token: Arc<str>,
+    instance: Arc<str>,
+    client: Client,
+    active: Arc<Mutex<HashSet<String>>>,
+    acceptance: Arc<Mutex<()>>,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl Agent {
+    pub async fn new(config: Config, shutdown: watch::Receiver<bool>) -> anyhow::Result<Self> {
+        NodeName::new(&config.node.name)?;
+        if config.execution.max_concurrent_runs == 0 {
+            bail!("max_concurrent_runs must be positive");
+        }
+        fs::create_dir_all(&config.storage.spool_dir).await?;
+        let token = fs::read_to_string(&config.server.token_file).await?.trim().to_owned();
+        Ok(Self {
+            config,
+            token: token.into(),
+            instance: ulid::Ulid::new().to_string().into(),
+            client: Client::builder().timeout(Duration::from_secs(35)).build()?,
+            active: Arc::new(Mutex::new(HashSet::new())),
+            acceptance: Arc::new(Mutex::new(())),
+            shutdown,
+        })
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        self.recover().await;
+        let mut sequence = 0;
+        while !*self.shutdown.borrow() {
+            self.reconcile_all().await;
+            sequence += 1;
+            let request = PollRequest {
+                protocol_version: "v1alpha1".into(),
+                agent_version: env!("CARGO_PKG_VERSION").into(),
+                agent_instance_id: self.instance.to_string(),
+                poll_sequence: sequence,
+                running: self.owned().await,
+                capacity: Capacity {
+                    mirror_root_free_bytes: None,
+                    active_runs: u32::try_from(self.active.lock().await.len()).unwrap_or(u32::MAX),
+                },
+                mirror_root: self.config.storage.mirror_root.to_string_lossy().into_owned(),
+            };
+            match self
+                .client
+                .post(format!("{}/api/v1alpha1/agent/poll", self.config.server.url))
+                .bearer_auth(self.token.as_ref())
+                .json(&request)
+                .send()
+                .await
+            {
+                Ok(response) if response.status() == StatusCode::NO_CONTENT => {}
+                Ok(response) if response.status().is_success() => {
+                    for action in response.json::<PollResponse>().await?.actions {
+                        if let AgentAction::StartAttempt {
+                            run_id,
+                            attempt,
+                            spec_hash,
+                            spec,
+                        } = action
+                        {
+                            self.accept(run_id, attempt, spec_hash, spec).await;
+                        }
+                    }
+                }
+                Ok(response) => tracing::warn!(status=%response.status(), "poll rejected"),
+                Err(error) => tracing::warn!(%error, "poll failed"),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Ok(())
+    }
+
+    async fn accept(&self, run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec) {
+        let _acceptance = self.acceptance.lock().await;
+        let key = format!("{run_id}-{attempt}");
+        let path = state_path(&self.config.storage.spool_dir, &run_id, attempt);
+        if let Ok(mut existing) = read(&path).await {
+            if existing.spec_hash != spec_hash {
+                tracing::error!(%run_id, attempt, expected=%existing.spec_hash, received=%spec_hash,
+                    "protocol integrity error: conflicting StartAttempt preserved original ownership");
+                return;
+            }
+            let _ = self.reconcile(&path, &mut existing).await;
+            return;
+        }
+        let mut active = self.active.lock().await;
+        if active.contains(&key) || active.len() >= self.config.execution.max_concurrent_runs as usize {
+            return;
+        }
+        if !self.config.runner.process.enabled || !safe_spec(&self.config.storage.mirror_root, &spec) {
+            let mut record = SpoolRecord::accepted(run_id, attempt, spec_hash, spec, now());
+            record.terminal(
+                AttemptState::Rejected,
+                None,
+                Some(FailureKind::Rejected),
+                Some("local policy rejected spec".into()),
+                now(),
+            );
+            if write(&path, &record).await.is_ok() {
+                let _ = self.reconcile(&path, &mut record).await;
+            }
+            return;
+        }
+        let record = SpoolRecord::accepted(run_id, attempt, spec_hash, spec, now());
+        if let Err(error) = write(&path, &record).await {
+            tracing::error!(%error, "failed to persist acceptance");
+            return;
+        }
+        active.insert(key.clone());
+        drop(active);
+        let agent = self.clone();
+        tokio::spawn(async move {
+            let mut record = record;
+            let _ = agent.reconcile(&path, &mut record).await;
+            executor::execute(&path, &mut record, agent.shutdown.clone()).await;
+            let _ = agent.reconcile(&path, &mut record).await;
+            agent.active.lock().await.remove(&key);
+        });
+    }
+
+    async fn recover(&self) {
+        let Ok(paths) = spool_paths(&self.config.storage.spool_dir).await else {
+            return;
+        };
+        for path in paths {
+            if path.extension().and_then(|value| value.to_str()) == Some("retired") {
+                let _ = fs::remove_file(log_path(&path)).await;
+                let _ = fs::remove_file(&path).await;
+                continue;
+            }
+            let Ok(mut record) = read(&path).await else {
+                continue;
+            };
+            if !record.state.is_terminal() {
+                record.terminal(
+                    AttemptState::Interrupted,
+                    None,
+                    Some(FailureKind::Interrupted),
+                    Some("agent restarted without terminal result".into()),
+                    now(),
+                );
+                let _ = write(&path, &record).await;
+            }
+            let _ = self.reconcile(&path, &mut record).await;
+        }
+    }
+
+    async fn reconcile_all(&self) {
+        let Ok(paths) = spool_paths(&self.config.storage.spool_dir).await else {
+            return;
+        };
+        for path in paths
+            .into_iter()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        {
+            if let Ok(mut record) = read(&path).await {
+                let _ = self.reconcile(&path, &mut record).await;
+            }
+        }
+    }
+
+    async fn reconcile(&self, path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {
+        if record.acknowledged_sequence < record.sequence {
+            let report_accepted = record.acknowledged_sequence == 0 && record.sequence > 1;
+            let event_sequence = if report_accepted { 1 } else { record.sequence };
+            let event = EventRequest {
+                event_sequence,
+                state: if report_accepted {
+                    AttemptState::Accepted
+                } else {
+                    record.state
+                },
+                agent_instance_id: self.instance.to_string(),
+                accepted_at: record.accepted_at.clone(),
+                started_at: record.started_at.clone(),
+                finished_at: record.finished_at.clone(),
+                exit_code: record.exit_code,
+                failure_kind: record.failure_kind,
+                failure_message: record.failure_message.clone(),
+            };
+            let response = self
+                .client
+                .post(format!(
+                    "{}/api/v1alpha1/agent/attempts/{}/{}/events",
+                    self.config.server.url, record.run_id, record.attempt
+                ))
+                .bearer_auth(self.token.as_ref())
+                .json(&event)
+                .send()
+                .await?;
+            if response.status().is_success() {
+                record.acknowledged_sequence = event_sequence;
+                write(path, record).await?;
+            }
+        }
+        let bytes = match fs::read(log_path(path)).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(error) => return Err(error.into()),
+        };
+        let offset = usize::try_from(record.log_offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let has_bytes = offset < bytes.len();
+        if has_bytes || (record.state.is_terminal() && !record.log_complete_acknowledged) {
+            let end = (offset + 65_536).min(bytes.len());
+            let final_chunk = record.state.is_terminal() && end == bytes.len();
+            let response = self
+                .client
+                .put(format!(
+                    "{}/api/v1alpha1/agent/attempts/{}/{}/log",
+                    self.config.server.url, record.run_id, record.attempt
+                ))
+                .bearer_auth(self.token.as_ref())
+                .header("x-lmt-log-offset", record.log_offset)
+                .header("x-lmt-log-complete", final_chunk.to_string())
+                .body(bytes[offset..end].to_vec())
+                .send()
+                .await?;
+            if response.status().is_success() {
+                record.log_offset = response
+                    .headers()
+                    .get("x-lmt-log-next-offset")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(record.log_offset);
+                if final_chunk {
+                    record.log_complete_acknowledged = true;
+                }
+                write(path, record).await?;
+            }
+        }
+        if record.ready_for_cleanup() {
+            retire(path).await?;
+        }
+        Ok(())
+    }
+
+    async fn owned(&self) -> Vec<OwnedAttempt> {
+        let Ok(paths) = spool_paths(&self.config.storage.spool_dir).await else {
+            return vec![];
+        };
+        let mut owned = Vec::new();
+        for path in paths {
+            if let Ok(record) = read(&path).await
+                && !record.state.is_terminal()
+            {
+                owned.push(OwnedAttempt {
+                    run_id: record.run_id,
+                    attempt: record.attempt,
+                    state: record.state,
+                });
+            }
+        }
+        owned
+    }
+}
+
+async fn spool_paths(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut entries = fs::read_dir(root).await?;
+    let mut paths = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
+fn safe_spec(root: &Path, spec: &ProcessRunSpec) -> bool {
+    spec.runner == "process"
+        && spec.mirror_root == root.to_string_lossy()
+        && Path::new(&spec.target_dir).starts_with(root)
+        && spec.cwd.as_ref().is_none_or(|cwd| Path::new(cwd).starts_with(root))
+}
+
+pub fn now() -> String {
+    OffsetDateTime::now_utc().format(&Rfc3339).expect("format time")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::State,
+        http::{HeaderMap, HeaderValue, StatusCode},
+        routing::{post, put},
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_agent(root: &Path, shutdown: watch::Receiver<bool>, server_url: String) -> Agent {
+        Agent {
+            config: Config {
+                node: config::Node { name: "node-a".into() },
+                server: config::Server {
+                    url: server_url,
+                    token_file: root.join("token"),
+                },
+                storage: config::Storage {
+                    mirror_root: root.join("mirrors"),
+                    spool_dir: root.join("spool"),
+                },
+                execution: config::Execution { max_concurrent_runs: 4 },
+                runner: config::Runner {
+                    process: config::ProcessPolicy { enabled: true },
+                },
+            },
+            token: "token".into(),
+            instance: "instance".into(),
+            client: Client::new(),
+            active: Arc::new(Mutex::new(HashSet::new())),
+            acceptance: Arc::new(Mutex::new(())),
+            shutdown,
+        }
+    }
+
+    fn spec(root: &Path, program: &str, args: Vec<String>, timeout_seconds: u64) -> ProcessRunSpec {
+        ProcessRunSpec {
+            runner: "process".into(),
+            program: program.into(),
+            args,
+            cwd: None,
+            timeout_seconds,
+            mirror_root: root.to_string_lossy().into_owned(),
+            target_dir: root.join("demo").to_string_lossy().into_owned(),
+        }
+    }
+
+    #[test]
+    fn nested_config_rejects_unknown_fields() {
+        let source = "[node]\nname='n'\ntypo=true\n[server]\nurl='http://x'\ntoken_file='/x'\n[storage]\nmirror_root='/x'\nspool_dir='/y'\n[execution]\nmax_concurrent_runs=1\n[runner.process]\nenabled=true\n";
+        assert!(toml::from_str::<Config>(source).is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_start_executes_once_and_conflict_preserves_record() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        fs::create_dir_all(&agent.config.storage.mirror_root)
+            .await
+            .expect("root");
+        let counter = directory.path().join("counter");
+        let command = spec(
+            &agent.config.storage.mirror_root,
+            "/bin/sh",
+            vec!["-c".into(), format!("echo run >> '{}'; sleep 1", counter.display())],
+            5,
+        );
+        let first = agent.accept(
+            "01K00000000000000000000000".into(),
+            1,
+            "sha256:one".into(),
+            command.clone(),
+        );
+        let duplicate = agent.accept("01K00000000000000000000000".into(), 1, "sha256:one".into(), command);
+        tokio::join!(first, duplicate);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        agent
+            .accept(
+                "01K00000000000000000000000".into(),
+                1,
+                "sha256:conflict".into(),
+                spec(&agent.config.storage.mirror_root, "/bin/false", vec![], 5),
+            )
+            .await;
+        let path = state_path(&agent.config.storage.spool_dir, "01K00000000000000000000000", 1);
+        let record = read(&path).await.expect("record");
+        assert_eq!(record.spec_hash, "sha256:one");
+        assert_ne!(record.state, AttemptState::Rejected);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(fs::read_to_string(counter).await.expect("counter").lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_process_group_descendant_and_streams_both_outputs() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let root = directory.path().join("mirrors");
+        fs::create_dir_all(&root).await.expect("root");
+        let state = directory.path().join("attempt.json");
+        let pid_file = directory.path().join("descendant.pid");
+        let command = format!(
+            "echo out; echo err >&2; sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        );
+        let mut record = SpoolRecord::accepted(
+            "01K00000000000000000000000".into(),
+            1,
+            "hash".into(),
+            spec(&root, "/bin/sh", vec!["-c".into(), command], 1),
+            now(),
+        );
+        write(&state, &record).await.expect("write");
+        executor::execute(&state, &mut record, receiver).await;
+        assert_eq!(record.state, AttemptState::TimedOut);
+        let log = fs::read_to_string(log_path(&state)).await.expect("log");
+        assert!(log.contains("[stdout] out"));
+        assert!(log.contains("[stderr] err"));
+        let pid: i32 = fs::read_to_string(pid_file)
+            .await
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("number");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "descendant remained alive"
+        );
+    }
+
+    #[derive(Clone)]
+    struct MockState {
+        saw_empty_complete: Arc<AtomicBool>,
+    }
+
+    async fn mock_event() -> StatusCode {
+        StatusCode::OK
+    }
+    async fn mock_log(State(state): State<MockState>, headers: HeaderMap, body: Bytes) -> (StatusCode, HeaderMap) {
+        if body.is_empty() && headers.get("x-lmt-log-complete").and_then(|v| v.to_str().ok()) == Some("true") {
+            state.saw_empty_complete.store(true, Ordering::SeqCst);
+        }
+        let mut response = HeaderMap::new();
+        response.insert("x-lmt-log-next-offset", HeaderValue::from_static("0"));
+        (StatusCode::NO_CONTENT, response)
+    }
+
+    #[tokio::test]
+    async fn empty_log_completion_ack_retires_spool() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let observed = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route("/api/v1alpha1/agent/attempts/{run}/{attempt}/events", post(mock_event))
+            .route("/api/v1alpha1/agent/attempts/{run}/{attempt}/log", put(mock_log))
+            .with_state(MockState {
+                saw_empty_complete: observed.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, url);
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        let path = state_path(&agent.config.storage.spool_dir, "01K00000000000000000000000", 1);
+        let mut record = SpoolRecord::accepted(
+            "01K00000000000000000000000".into(),
+            1,
+            "hash".into(),
+            spec(&agent.config.storage.mirror_root, "/bin/true", vec![], 5),
+            now(),
+        );
+        record.terminal(AttemptState::Succeeded, Some(0), None, None, now());
+        write(&path, &record).await.expect("write");
+        agent.reconcile(&path, &mut record).await.expect("reconcile");
+        agent.reconcile(&path, &mut record).await.expect("terminal reconcile");
+        assert!(observed.load(Ordering::SeqCst));
+        assert!(!path.exists());
+        assert!(!log_path(&path).exists());
+    }
+}
