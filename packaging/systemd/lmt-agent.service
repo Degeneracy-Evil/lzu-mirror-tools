@@ -1,0 +1,25 @@
+[Unit]
+Description=LZU Mirror Tools agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lmt-agent
+Group=lmt-agent
+ExecStart=/usr/bin/lmt-agent --config /etc/lmt/agent.toml
+Restart=on-failure
+RestartSec=3s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StateDirectory=lmt-agent
+KillMode=control-group
+TimeoutStopSec=30s
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

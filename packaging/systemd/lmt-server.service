@@ -1,0 +1,22 @@
+[Unit]
+Description=LZU Mirror Tools server
+After=network.target
+
+[Service]
+Type=simple
+User=lmt
+Group=lmt
+ExecStart=/usr/bin/lmt-server --config /etc/lmt/server.toml
+Restart=on-failure
+RestartSec=3s
+StartLimitIntervalSec=60
+StartLimitBurst=5
+StateDirectory=lmt
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

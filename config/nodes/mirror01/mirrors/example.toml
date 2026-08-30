@@ -1,0 +1,16 @@
+[mirror]
+name = "example"
+enabled = true
+target = "example"
+
+[sync]
+type = "command"
+program = "/bin/true"
+
+[runner]
+type = "process"
+
+[run]
+timeout_seconds = 60
+max_attempts = 1
+

@@ -1,0 +1,17 @@
+[node]
+name = "mirror01"
+
+[server]
+url = "http://127.0.0.1:8080"
+token_file = "/etc/lmt/agent.token"
+
+[storage]
+mirror_root = "/srv/mirrors"
+spool_dir = "/var/lib/lmt-agent/spool"
+
+[execution]
+max_concurrent_runs = 1
+
+[runner.process]
+enabled = true
+

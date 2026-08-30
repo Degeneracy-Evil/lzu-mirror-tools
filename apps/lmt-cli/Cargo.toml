@@ -8,6 +8,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
+lmt-core = { path = "../../crates/lmt-core" }
+lmt-protocol = { path = "../../crates/lmt-protocol" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ulid.workspace = true
 
 [lints]
 workspace = true
@@ -15,4 +23,3 @@ workspace = true
 [[bin]]
 name = "lmt"
 path = "src/main.rs"
-

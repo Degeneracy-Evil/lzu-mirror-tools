@@ -1,0 +1,10 @@
+bind = "127.0.0.1:8080"
+database_path = "/var/lib/lmt/lmt.db"
+log_dir = "/var/lib/lmt/logs"
+operator_token = "replace-with-a-random-operator-token"
+offline_after_seconds = 90
+
+[[agents]]
+node = "mirror01"
+token = "replace-with-an-independent-random-node-token"
+
