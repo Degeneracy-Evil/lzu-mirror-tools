@@ -162,3 +162,56 @@ LMT intentionally prefers a small core with strong contracts.
 If code changes any architecture invariant, state transition, scheduler behavior, protocol contract, configuration semantics, or persistence meaning, the corresponding `docs/` document must change in the same review.
 
 Code and design documentation must not intentionally drift.
+
+
+## 13. M2 review additions
+
+For M2 changes, additionally check the following.
+
+### Scheduler
+
+- schedule due state is persisted before notification;
+- no one-Run-per-tick backlog is introduced;
+- Scheduled Runs materialize only through the documented Agent-poll transaction;
+- delayed Scheduled work uses the latest generation;
+- cron active-Run occurrences are skipped, not queued;
+- interval is Server-completion-relative;
+- scheduler correctness survives restart without an in-memory queue;
+- all time-dependent logic is testable with explicit/manual time.
+
+### Retry
+
+- retries stay inside one Run;
+- no Attempt N+1 exists before retry deadline dispatch;
+- retry deadline uses Server time;
+- Failed/TimedOut/Interrupted retry only when eligible;
+- Rejected/Cancelled do not retry;
+- disable/remove/move suppress later retry;
+- attempt numbers remain monotonic.
+
+### Cancellation
+
+- undispatched cancellation is immediate;
+- any dispatched Attempt is treated as potentially executing;
+- CancelAttempt carries spec_hash;
+- Cancel-before-Start creates a durable tombstone;
+- delayed Start after tombstone cannot execute;
+- active cancel terminates the entire Attempt process group;
+- natural terminal result already durably observed by Agent is not overwritten.
+
+### Persistence
+
+- populated M1-to-M2 migration is tested;
+- future schema version is rejected;
+- SQLite remains one authoritative connection/database;
+- async Store execution does not leak SQLite concerns into core or HTTP contracts.
+
+### rsync
+
+- args remain visible in TOML;
+- source string is preserved exactly, including trailing slash;
+- destination is the Mirror target directory;
+- Agent contains no rsync-specific execution logic;
+- tests use local resources only.
+
+The authoritative M2 reference for these checks is docs/m2-design.md.
