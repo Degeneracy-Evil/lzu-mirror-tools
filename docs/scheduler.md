@@ -1,4 +1,4 @@
-# Scheduler Semantics v0.1
+# Scheduler Semantics v0.2
 
 LMT schedules long-lived mirror synchronization, not stateless batch jobs. The scheduler therefore prefers freshness, predictability, and avoiding duplicate writers over preserving every timer tick.
 
@@ -178,3 +178,36 @@ On startup, the server evaluates elapsed schedule time and coalesces missed elig
 | Mirror removed | prune management; cancel only undispatched Pending work; preserve dispatched work/history/data |
 | config changes during Run | current Run keeps old generation |
 | retry needed | new Attempt under same Run |
+
+
+## 15. M2 clarification: due intent materializes on Agent poll
+
+A schedule occurrence first becomes one persistent coalesced due marker, not immediately a Run.
+
+A Scheduled Run is materialized only when the owning Agent polls with free capacity. One transaction uses the latest Mirror generation, creates the Run and Attempt, records dispatch, and clears the due marker.
+
+Node-offline and Agent-full cases therefore do not accumulate Pending scheduled Runs. Manual Runs remain durable Pending Runs because they represent explicit operator intent.
+
+## 16. M2 schedule activation
+
+Config apply does not execute synchronization.
+
+- interval add/re-enable/change/move: next due is apply time plus interval;
+- cron add/re-enable/change/move: next matching occurrence strictly after apply time;
+- unchanged semantic schedule preserves runtime state;
+- removed/disabled schedule clears runtime state;
+- unrelated Mirror config changes do not force synchronization.
+
+A semantic schedule hash distinguishes schedule changes from unrelated config changes.
+
+## 17. M2 retry deadlines
+
+A Run remains Running between retry Attempts.
+
+Retry is represented by retry_due_at on the Run, calculated from Server time. Attempt N+1 is created only after the deadline when the owner Agent polls with a free slot.
+
+No in-memory scheduler/retry queue is authoritative.
+
+## 18. M2 authoritative detail
+
+The complete cron syntax, DST behavior, poll priority, move semantics, cancellation interaction, and release gates are defined in m2-design.md.

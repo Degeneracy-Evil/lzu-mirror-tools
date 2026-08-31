@@ -411,3 +411,20 @@ The following concepts are intentionally absent from the v0.1 public model:
 - automatic cross-node failover.
 
 They should only be added after real requirements establish their correct shape.
+
+
+## 12. M2 model extensions
+
+M2 does not add a new public resource. Mirror, Node, and Run remain the core public model; Attempts remain execution records inside a Run.
+
+A Mirror optionally has one schedule: interval, cron, or none. No schedule means manual-only. Runtime due state is Server-owned and is not embedded in the Mirror configuration.
+
+M2 supports both command and rsync sync configuration. Rsync is Server-side configuration sugar and compiles into the same generic process RunSpec; the Agent remains repository-agnostic.
+
+Run trigger becomes a typed Manual/Scheduled value. Run metadata may additionally expose scheduled_for_at, retry_due_at, and cancel_requested_at. Public Run state remains Pending/Running/Succeeded/Failed/Cancelled/TimedOut.
+
+Retries remain Attempts inside one Run. Retry delay is represented by persistent Run retry_due state; no retry queue/resource is introduced.
+
+Node observed state adds max_concurrent_runs reported by the Agent. This remains local policy observed by the Server, not central placement configuration.
+
+For complete M2 semantics, see m2-design.md.
