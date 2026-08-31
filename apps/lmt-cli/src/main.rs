@@ -1,6 +1,6 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use lmt_core::BundleFile;
+use lmt_core::{BundleFile, RunTrigger};
 use lmt_protocol::v1alpha1::{ApplyRequest, BundleRequest, ManualRunRequest, PlanResponse};
 use reqwest::{Client, Response};
 use serde::Serialize;
@@ -141,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
                     format!("{base}/mirrors/{name}/runs"),
                     &ManualRunRequest {
                         request_id: ulid::Ulid::new().to_string(),
-                        trigger: "manual".into(),
+                        trigger: RunTrigger::Manual,
                     },
                 )
                 .await?

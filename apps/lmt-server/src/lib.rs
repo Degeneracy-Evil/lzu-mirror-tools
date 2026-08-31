@@ -81,6 +81,20 @@ struct AppMetrics {
     events: AtomicU64,
     uploaded_bytes: AtomicU64,
     log_failures: AtomicU64,
+    scheduler_interval_due: AtomicU64,
+    scheduler_interval_skipped: AtomicU64,
+    scheduler_cron_due: AtomicU64,
+    scheduler_cron_skipped: AtomicU64,
+    retries_scheduled: AtomicU64,
+    attempts_succeeded: AtomicU64,
+    attempts_failed: AtomicU64,
+    attempts_timed_out: AtomicU64,
+    attempts_cancelled: AtomicU64,
+    attempts_rejected: AtomicU64,
+    attempts_interrupted: AtomicU64,
+    cancellations_immediate: AtomicU64,
+    cancellations_dispatched: AtomicU64,
+    cancellations_already_terminal: AtomicU64,
 }
 impl AppState {
     pub fn new(store: Store, log_dir: PathBuf, token: String, offline_after: Duration) -> Self {
@@ -125,8 +139,24 @@ async fn run_scheduler(state: AppState) {
         let now = state.now_ms();
         match services::evaluate_schedules(&state.store, now).await {
             Ok(evaluated) => {
+                state
+                    .metrics
+                    .scheduler_interval_due
+                    .fetch_add(evaluated.interval_due, Ordering::Relaxed);
+                state
+                    .metrics
+                    .scheduler_interval_skipped
+                    .fetch_add(evaluated.interval_skipped, Ordering::Relaxed);
+                state
+                    .metrics
+                    .scheduler_cron_due
+                    .fetch_add(evaluated.cron_due, Ordering::Relaxed);
+                state
+                    .metrics
+                    .scheduler_cron_skipped
+                    .fetch_add(evaluated.cron_skipped, Ordering::Relaxed);
                 let earliest = state.store.earliest_wakeup().await.unwrap_or(None);
-                if evaluated > 0 || earliest.is_some_and(|deadline| deadline <= now) {
+                if evaluated.evaluated > 0 || earliest.is_some_and(|deadline| deadline <= now) {
                     state.notify.notify_waiters();
                 }
                 let wait = earliest
@@ -180,6 +210,9 @@ async fn ready(State(s): State<AppState>) -> Result<Json<HealthResponse>, Failur
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, Failure> {
     let runs = state.store.list_runs().await?;
+    let mirrors = state.store.list_mirrors().await?;
+    let now = state.now_ms();
+    let nodes = state.store.list_nodes().await?;
     let pending = runs
         .iter()
         .filter(|run| run.state == lmt_core::RunState::Pending)
@@ -188,10 +221,52 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, Failure> {
         .iter()
         .filter(|run| run.state == lmt_core::RunState::Running)
         .count();
+    let mirrors_due = mirrors
+        .iter()
+        .filter(|mirror| mirror.scheduled_due_since_ms.is_some())
+        .count();
+    let nodes_online = nodes
+        .iter()
+        .filter(|node| {
+            node.last_seen_at_ms
+                .is_some_and(|seen| now - seen <= i64::try_from(state.offline_after.as_millis()).unwrap_or(i64::MAX))
+        })
+        .count();
     let body = format!(
-        "lmt_up 1\nlmt_runs_pending {}\nlmt_runs_running {}\nlmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_total {}\nlmt_log_upload_failures_total {}\n",
+        "lmt_up 1\nlmt_runs_pending {}\nlmt_runs_running {}\nlmt_mirrors_due {}\nlmt_nodes_online {}\n\
+lmt_scheduler_occurrences_total{{kind=\"interval\",outcome=\"due\"}} {}\n\
+lmt_scheduler_occurrences_total{{kind=\"interval\",outcome=\"skipped\"}} {}\n\
+lmt_scheduler_occurrences_total{{kind=\"cron\",outcome=\"due\"}} {}\n\
+lmt_scheduler_occurrences_total{{kind=\"cron\",outcome=\"skipped\"}} {}\n\
+lmt_retries_scheduled_total{{reason=\"retryable_failure\"}} {}\n\
+lmt_attempts_terminal_total{{state=\"succeeded\"}} {}\n\
+lmt_attempts_terminal_total{{state=\"failed\"}} {}\n\
+lmt_attempts_terminal_total{{state=\"timed_out\"}} {}\n\
+lmt_attempts_terminal_total{{state=\"cancelled\"}} {}\n\
+lmt_attempts_terminal_total{{state=\"rejected\"}} {}\n\
+lmt_attempts_terminal_total{{state=\"interrupted\"}} {}\n\
+lmt_cancellations_total{{outcome=\"immediate\"}} {}\n\
+lmt_cancellations_total{{outcome=\"dispatched\"}} {}\n\
+lmt_cancellations_total{{outcome=\"already_terminal\"}} {}\n\
+lmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_total {}\nlmt_log_upload_failures_total {}\n",
         pending,
         running,
+        mirrors_due,
+        nodes_online,
+        state.metrics.scheduler_interval_due.load(Ordering::Relaxed),
+        state.metrics.scheduler_interval_skipped.load(Ordering::Relaxed),
+        state.metrics.scheduler_cron_due.load(Ordering::Relaxed),
+        state.metrics.scheduler_cron_skipped.load(Ordering::Relaxed),
+        state.metrics.retries_scheduled.load(Ordering::Relaxed),
+        state.metrics.attempts_succeeded.load(Ordering::Relaxed),
+        state.metrics.attempts_failed.load(Ordering::Relaxed),
+        state.metrics.attempts_timed_out.load(Ordering::Relaxed),
+        state.metrics.attempts_cancelled.load(Ordering::Relaxed),
+        state.metrics.attempts_rejected.load(Ordering::Relaxed),
+        state.metrics.attempts_interrupted.load(Ordering::Relaxed),
+        state.metrics.cancellations_immediate.load(Ordering::Relaxed),
+        state.metrics.cancellations_dispatched.load(Ordering::Relaxed),
+        state.metrics.cancellations_already_terminal.load(Ordering::Relaxed),
         state.metrics.polls.load(Ordering::Relaxed),
         state.metrics.events.load(Ordering::Relaxed),
         state.metrics.uploaded_bytes.load(Ordering::Relaxed),
@@ -268,6 +343,8 @@ async fn mirrors(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<Mir
                 enabled: m.enabled,
                 owner_node: m.owner_node,
                 current_generation: m.current_generation,
+                next_due_at: m.next_due_at_ms.map(timestamp),
+                scheduled_due_since: m.scheduled_due_since_ms.map(timestamp),
             })
             .collect(),
     ))
@@ -289,6 +366,8 @@ async fn mirror(
         enabled: m.enabled,
         owner_node: m.owner_node,
         current_generation: m.current_generation,
+        next_due_at: m.next_due_at_ms.map(timestamp),
+        scheduled_due_since: m.scheduled_due_since_ms.map(timestamp),
     }))
 }
 async fn manual(
@@ -298,16 +377,34 @@ async fn manual(
     Json(r): Json<ManualRunRequest>,
 ) -> Result<Json<RunView>, Failure> {
     operator(&h, &s)?;
-    if r.trigger != "manual" || r.request_id.is_empty() {
+    if r.trigger != lmt_core::RunTrigger::Manual || r.request_id.is_empty() {
         return Err(Failure::bad("invalid_request", "invalid manual request"));
     }
     let result = run_view(services::create_manual_run(&s.store, &name, &r.request_id, s.now_ms()).await?);
     s.notify.notify_waiters();
     Ok(Json(result))
 }
-async fn runs(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<RunView>>, Failure> {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunListQuery {
+    trigger: Option<lmt_core::RunTrigger>,
+}
+
+async fn runs(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    Query(query): Query<RunListQuery>,
+) -> Result<Json<Vec<RunView>>, Failure> {
     operator(&h, &s)?;
-    Ok(Json(s.store.list_runs().await?.into_iter().map(run_view).collect()))
+    Ok(Json(
+        s.store
+            .list_runs()
+            .await?
+            .into_iter()
+            .filter(|run| query.trigger.is_none_or(|trigger| run.trigger == trigger))
+            .map(run_view)
+            .collect(),
+    ))
 }
 async fn run(
     State(s): State<AppState>,
@@ -337,7 +434,20 @@ async fn cancel_run(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<RunView>, Failure> {
     operator(&h, &s)?;
+    let previous = s
+        .store
+        .get_run(&id)
+        .await?
+        .ok_or_else(|| Failure::not_found("run_not_found"))?;
     let run = services::request_cancellation(&s.store, &id, s.now_ms()).await?;
+    let counter = if previous.state.is_terminal() {
+        &s.metrics.cancellations_already_terminal
+    } else if run.state == lmt_core::RunState::Cancelled {
+        &s.metrics.cancellations_immediate
+    } else {
+        &s.metrics.cancellations_dispatched
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
     s.notify.notify_waiters();
     Ok(Json(run_view(run)))
 }
@@ -448,6 +558,7 @@ async fn event(
 ) -> Result<Json<EventResponse>, Failure> {
     let node = agent(&h, &s).await?;
     attempt_auth(&s, &node, &id, no).await?;
+    let terminal_state = r.state;
     let accepted = services::apply_attempt_event(
         &s.store,
         &id,
@@ -468,6 +579,27 @@ async fn event(
     .await?;
     s.notify.notify_waiters();
     s.metrics.events.fetch_add(1, Ordering::Relaxed);
+    if terminal_state.is_terminal() {
+        let counter = match terminal_state {
+            lmt_core::AttemptState::Succeeded => &s.metrics.attempts_succeeded,
+            lmt_core::AttemptState::Failed => &s.metrics.attempts_failed,
+            lmt_core::AttemptState::TimedOut => &s.metrics.attempts_timed_out,
+            lmt_core::AttemptState::Cancelled => &s.metrics.attempts_cancelled,
+            lmt_core::AttemptState::Rejected => &s.metrics.attempts_rejected,
+            lmt_core::AttemptState::Interrupted => &s.metrics.attempts_interrupted,
+            lmt_core::AttemptState::Queued | lmt_core::AttemptState::Accepted | lmt_core::AttemptState::Running => {
+                unreachable!("non-terminal state passed terminal guard")
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if s.store
+            .get_run(&id)
+            .await?
+            .is_some_and(|run| run.retry_due_at_ms.is_some())
+        {
+            s.metrics.retries_scheduled.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     Ok(Json(EventResponse {
         accepted_event_sequence: accepted,
     }))
@@ -663,6 +795,9 @@ fn run_view(r: RunRecord) -> RunView {
         final_exit_code: r.final_exit_code,
         failure_kind: r.failure_kind,
         failure_message: r.failure_message,
+        scheduled_for_at: r.scheduled_for_at_ms.map(timestamp),
+        retry_due_at: r.retry_due_at_ms.map(timestamp),
+        cancel_requested_at: r.cancel_requested_at_ms.map(timestamp),
     }
 }
 fn attempt_view(a: AttemptRecord) -> AttemptView {
@@ -689,6 +824,7 @@ fn node_view(n: lmt_store::NodeRecord, now: i64, d: Duration) -> NodeView {
         last_seen_at: n.last_seen_at_ms.map(timestamp),
         active_runs: n.active_runs,
         mirror_root_free_bytes: n.mirror_root_free_bytes,
+        max_concurrent_runs: n.max_concurrent_runs,
         online: n.last_seen_at_ms.is_some_and(|x| now - x <= d.as_millis() as i64),
     }
 }
@@ -909,7 +1045,8 @@ mod tests {
         assert_eq!(
             services::evaluate_schedules(&store, state.now_ms())
                 .await
-                .expect("tick"),
+                .expect("tick")
+                .evaluated,
             1
         );
         assert_eq!(
@@ -933,7 +1070,7 @@ mod tests {
             lmt_store::PollAction::CancelAttempt { .. } => panic!("unexpected cancellation"),
         };
         let run = reopened.get_run(&run_id).await.expect("get").expect("run");
-        assert_eq!(run.trigger, "scheduled");
+        assert_eq!(run.trigger, lmt_core::RunTrigger::Scheduled);
         assert_eq!(run.scheduled_for_at_ms, Some(60_000));
         assert_eq!(run.max_attempts, 2);
         assert_eq!(reopened.list_runs().await.expect("runs").len(), 1);

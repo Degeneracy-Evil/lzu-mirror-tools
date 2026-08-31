@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any,
 };
-use lmt_core::{BundleFile, RunState};
+use lmt_core::{BundleFile, RunState, RunTrigger};
 use lmt_protocol::v1alpha1::{ApplyRequest, ApplyResponse, BundleRequest, ManualRunRequest, PlanResponse, RunDetail};
 use lmt_server::{AgentCredential, ServerConfig, build_router, initialize};
 use nix::{
@@ -216,7 +216,7 @@ impl Harness {
                     .bearer_auth(OPERATOR_TOKEN)
                     .json(&ManualRunRequest {
                         request_id: ulid::Ulid::new().to_string(),
-                        trigger: "manual".into(),
+                        trigger: RunTrigger::Manual,
                     })
                     .send()
                     .await

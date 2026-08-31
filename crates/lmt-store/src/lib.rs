@@ -110,7 +110,7 @@ pub struct RunRecord {
     pub mirror_name: String,
     pub mirror_generation: u64,
     pub owner_node: String,
-    pub trigger: String,
+    pub trigger: lmt_core::RunTrigger,
     pub state: RunState,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
@@ -1330,12 +1330,13 @@ fn find_run_by_request(transaction: &Transaction<'_>, request_id: &str) -> Resul
 
 fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     let state: String = row.get(5)?;
+    let trigger: String = row.get(4)?;
     Ok(RunRecord {
         id: row.get(0)?,
         mirror_name: row.get(1)?,
         mirror_generation: row.get(2)?,
         owner_node: row.get(3)?,
-        trigger: row.get(4)?,
+        trigger: parse_run_trigger(&trigger)?,
         state: parse_run_state(&state)?,
         created_at_ms: row.get(6)?,
         started_at_ms: row.get(7)?,
@@ -1425,6 +1426,14 @@ fn parse_run_state(value: &str) -> rusqlite::Result<RunState> {
         "failed" => Ok(RunState::Failed),
         "cancelled" => Ok(RunState::Cancelled),
         "timed_out" => Ok(RunState::TimedOut),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
+fn parse_run_trigger(value: &str) -> rusqlite::Result<lmt_core::RunTrigger> {
+    match value {
+        "manual" => Ok(lmt_core::RunTrigger::Manual),
+        "scheduled" => Ok(lmt_core::RunTrigger::Scheduled),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }
@@ -1758,7 +1767,7 @@ mod tests {
         let (run_id, attempt_no, _) = start_fields(&action);
         assert_eq!(attempt_no, 1);
         let run = store.get_run(run_id).await.expect("get").expect("run");
-        assert_eq!(run.trigger, "scheduled");
+        assert_eq!(run.trigger, lmt_core::RunTrigger::Scheduled);
         assert_eq!(run.scheduled_for_at_ms, Some(3_600_000));
         assert_eq!(run.max_attempts, 3);
         assert_eq!(

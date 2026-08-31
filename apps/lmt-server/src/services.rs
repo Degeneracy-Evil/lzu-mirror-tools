@@ -6,6 +6,10 @@ use lmt_core::{
 };
 use lmt_store::{DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store, StoreError, TerminalDecision};
 use sha2::{Digest, Sha256};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 pub async fn next_action(
     store: &Store,
@@ -127,8 +131,19 @@ fn compile(
     Ok((spec, hash, policy))
 }
 
-pub async fn evaluate_schedules(store: &Store, now: i64) -> Result<u64, StoreError> {
-    store
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScheduleEvaluationMetrics {
+    pub evaluated: u64,
+    pub interval_due: u64,
+    pub interval_skipped: u64,
+    pub cron_due: u64,
+    pub cron_skipped: u64,
+}
+
+pub async fn evaluate_schedules(store: &Store, now: i64) -> Result<ScheduleEvaluationMetrics, StoreError> {
+    let counts = Arc::new(std::array::from_fn::<_, 4, _>(|_| AtomicU64::new(0)));
+    let callback_counts = counts.clone();
+    let evaluated = store
         .evaluate_due_schedules(now, move |source| {
             let document: MirrorDocument =
                 toml::from_str(&source.config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
@@ -136,9 +151,23 @@ pub async fn evaluate_schedules(store: &Store, now: i64) -> Result<u64, StoreErr
                 .schedule
                 .as_ref()
                 .ok_or_else(|| StoreError::InvalidConfig("scheduled mirror has no schedule".into()))?;
-            evaluate_schedule_due(schedule, source.runtime, now, source.has_active_run)
-                .map(|evaluation| evaluation.runtime)
-                .map_err(StoreError::InvalidConfig)
+            let evaluation = evaluate_schedule_due(schedule, source.runtime, now, source.has_active_run)
+                .map_err(StoreError::InvalidConfig)?;
+            let index = match (schedule, evaluation.skipped_while_active) {
+                (lmt_core::ScheduleConfig::Interval { .. }, false) => 0,
+                (lmt_core::ScheduleConfig::Interval { .. }, true) => 1,
+                (lmt_core::ScheduleConfig::Cron { .. }, false) => 2,
+                (lmt_core::ScheduleConfig::Cron { .. }, true) => 3,
+            };
+            callback_counts[index].fetch_add(1, Ordering::Relaxed);
+            Ok(evaluation.runtime)
         })
-        .await
+        .await?;
+    Ok(ScheduleEvaluationMetrics {
+        evaluated,
+        interval_due: counts[0].load(Ordering::Relaxed),
+        interval_skipped: counts[1].load(Ordering::Relaxed),
+        cron_due: counts[2].load(Ordering::Relaxed),
+        cron_skipped: counts[3].load(Ordering::Relaxed),
+    })
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use lmt_core::{AttemptState, BundleFile, FailureKind, ProcessRunSpec, RunState};
+use lmt_core::{AttemptState, BundleFile, FailureKind, ProcessRunSpec, RunState, RunTrigger};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -81,7 +81,7 @@ pub struct ApplyResponse {
 #[serde(deny_unknown_fields)]
 pub struct ManualRunRequest {
     pub request_id: String,
-    pub trigger: String,
+    pub trigger: RunTrigger,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -91,7 +91,7 @@ pub struct RunView {
     pub mirror_name: String,
     pub mirror_generation: u64,
     pub owner_node: String,
-    pub trigger: String,
+    pub trigger: RunTrigger,
     pub state: RunState,
     pub created_at: String,
     pub started_at: Option<String>,
@@ -99,6 +99,9 @@ pub struct RunView {
     pub final_exit_code: Option<i32>,
     pub failure_kind: Option<String>,
     pub failure_message: Option<String>,
+    pub scheduled_for_at: Option<String>,
+    pub retry_due_at: Option<String>,
+    pub cancel_requested_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -134,6 +137,8 @@ pub struct MirrorView {
     pub enabled: bool,
     pub owner_node: String,
     pub current_generation: u64,
+    pub next_due_at: Option<String>,
+    pub scheduled_due_since: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -145,6 +150,7 @@ pub struct NodeView {
     pub last_seen_at: Option<String>,
     pub active_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
+    pub max_concurrent_runs: u32,
     pub online: bool,
 }
 
