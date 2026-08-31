@@ -7,7 +7,10 @@ use std::{
 
 use lmt_core::{AttemptState, FailureKind};
 use nix::{
+    errno::Errno,
+    sys::prctl,
     sys::signal::{Signal, killpg},
+    sys::wait::{WaitPidFlag, WaitStatus, waitpid},
     unistd::Pid,
 };
 use tokio::{
@@ -39,6 +42,16 @@ pub async fn execute(
     let Some(spec) = record.spec.as_ref() else {
         return;
     };
+    if let Err(error) = prctl::set_child_subreaper(true) {
+        persist_spawn_failure(
+            path,
+            record,
+            std::io::Error::from_raw_os_error(error as i32),
+            &spool_lock,
+        )
+        .await;
+        return;
+    }
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -77,10 +90,15 @@ pub async fn execute(
     tokio::pin!(timeout);
     let outcome = tokio::select! {
         result = child.wait() => Outcome::Process(result),
-        () = &mut timeout => { terminate_group(process_group).await; let _ = child.wait().await; Outcome::TimedOut },
-        changed = shutdown.changed() => { let _ = changed; terminate_group(process_group).await; let _ = child.wait().await; Outcome::Shutdown },
-        changed = cancel.changed() => { let _ = changed; terminate_group(process_group).await; let _ = child.wait().await; Outcome::Cancelled },
+        () = &mut timeout => Outcome::TimedOut,
+        changed = shutdown.changed() => { let _ = changed; Outcome::Shutdown },
+        changed = cancel.changed() => { let _ = changed; Outcome::Cancelled },
     };
+    terminate_group(process_group).await;
+    if !matches!(outcome, Outcome::Process(_)) {
+        let _ = child.wait().await;
+    }
+    reap_group(process_group).await;
     let _ = capture.await;
     let _guard = spool_lock.lock().await;
     if let Ok(latest) = read(path).await {
@@ -145,9 +163,30 @@ async fn persist_spawn_failure(path: &Path, record: &mut SpoolRecord, error: std
 
 async fn terminate_group(group: Option<Pid>) {
     if let Some(group) = group {
-        let _ = killpg(group, Signal::SIGTERM);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let _ = killpg(group, Signal::SIGKILL);
+        if killpg(group, Signal::SIGTERM).is_ok() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = killpg(group, Signal::SIGKILL);
+        }
+    }
+}
+
+async fn reap_group(group: Option<Pid>) {
+    let Some(group) = group else {
+        return;
+    };
+    let group = Pid::from_raw(-group.as_raw());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match waitpid(group, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive) => {}
+            Ok(_) => continue,
+            Err(Errno::ECHILD) => return,
+            Err(_) => return,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

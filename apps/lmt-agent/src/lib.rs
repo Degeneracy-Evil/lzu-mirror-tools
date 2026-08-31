@@ -631,6 +631,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_direct_child_completion_closes_and_reaps_its_process_group() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path().join("mirrors");
+        fs::create_dir_all(&root).await.expect("root");
+        let state = directory.path().join("normal-exit.json");
+        let pid_file = directory.path().join("background.pid");
+        let command = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+            pid_file.display()
+        );
+        let mut record = SpoolRecord::accepted(
+            "01K00000000000000000000005".into(),
+            1,
+            "hash".into(),
+            spec(&root, "/bin/sh", vec!["-c".into(), command], 10),
+            now(),
+        );
+        write(&state, &record).await.expect("write");
+        let (_shutdown, shutdown_receiver) = watch::channel(false);
+        let (_cancel, cancel_receiver) = watch::channel(false);
+
+        executor::execute(
+            &state,
+            &mut record,
+            shutdown_receiver,
+            cancel_receiver,
+            Arc::new(Mutex::new(())),
+        )
+        .await;
+
+        assert_eq!(record.state, AttemptState::Succeeded);
+        let pid: i32 = fs::read_to_string(pid_file)
+            .await
+            .expect("pid")
+            .trim()
+            .parse()
+            .expect("number");
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "background descendant remained after terminal persistence"
+        );
+    }
+
+    #[tokio::test]
     async fn local_rsync_uses_the_native_executor_for_success_and_failure() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mirror_root = directory.path().join("mirrors");
