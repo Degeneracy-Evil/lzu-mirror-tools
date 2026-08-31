@@ -19,22 +19,33 @@ use tokio::{
 
 use crate::{
     now,
-    spool::{SpoolRecord, write},
+    spool::{SpoolRecord, read, write},
 };
+
+enum Outcome {
+    Process(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Shutdown,
+    Cancelled,
+}
 
 pub async fn execute(
     path: &Path,
     record: &mut SpoolRecord,
     mut shutdown: watch::Receiver<bool>,
+    mut cancel: watch::Receiver<bool>,
     spool_lock: Arc<Mutex<()>>,
 ) {
-    let mut command = Command::new(&record.spec.program);
+    let Some(spec) = record.spec.as_ref() else {
+        return;
+    };
+    let mut command = Command::new(&spec.program);
     command
-        .args(&record.spec.args)
+        .args(&spec.args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    if let Some(cwd) = &record.spec.cwd {
+    if let Some(cwd) = &spec.cwd {
         command.current_dir(cwd);
     }
     let mut child = match command.spawn() {
@@ -65,53 +76,60 @@ pub async fn execute(
     record.started_at = Some(now());
     {
         let _guard = spool_lock.lock().await;
+        if let Ok(latest) = read(path).await {
+            record.cancel_requested |= latest.cancel_requested;
+        }
         let _ = write(path, record).await;
     }
-    let timeout = tokio::time::sleep(Duration::from_secs(record.spec.timeout_seconds));
+    let timeout = tokio::time::sleep(Duration::from_secs(spec.timeout_seconds));
     tokio::pin!(timeout);
     let outcome = tokio::select! {
-        result = child.wait() => Some(result),
-        () = &mut timeout => { terminate_group(process_group).await; let _ = child.wait().await; None },
-        changed = shutdown.changed() => { let _ = changed; terminate_group(process_group).await; let _ = child.wait().await; None },
+        result = child.wait() => Outcome::Process(result),
+        () = &mut timeout => { terminate_group(process_group).await; let _ = child.wait().await; Outcome::TimedOut },
+        changed = shutdown.changed() => { let _ = changed; terminate_group(process_group).await; let _ = child.wait().await; Outcome::Shutdown },
+        changed = cancel.changed() => { let _ = changed; terminate_group(process_group).await; let _ = child.wait().await; Outcome::Cancelled },
     };
     let _ = capture.await;
+    let _guard = spool_lock.lock().await;
+    if let Ok(latest) = read(path).await {
+        record.cancel_requested |= latest.cancel_requested;
+    }
     match outcome {
-        Some(Ok(status)) if status.success() => {
+        _ if record.cancel_requested => record.terminal(AttemptState::Cancelled, None, None, None, now()),
+        Outcome::Process(Ok(status)) if status.success() => {
             record.terminal(AttemptState::Succeeded, status.code(), None, None, now())
         }
-        Some(Ok(status)) => record.terminal(
+        Outcome::Process(Ok(status)) => record.terminal(
             AttemptState::Failed,
             status.code(),
             Some(FailureKind::Process),
             Some("process exited non-zero".into()),
             now(),
         ),
-        Some(Err(error)) => record.terminal(
+        Outcome::Process(Err(error)) => record.terminal(
             AttemptState::Interrupted,
             None,
             Some(FailureKind::Interrupted),
             Some(error.to_string()),
             now(),
         ),
-        None if *shutdown.borrow() => record.terminal(
+        Outcome::Shutdown => record.terminal(
             AttemptState::Interrupted,
             None,
             Some(FailureKind::Interrupted),
             Some("agent shutdown".into()),
             now(),
         ),
-        None => record.terminal(
+        Outcome::TimedOut => record.terminal(
             AttemptState::TimedOut,
             None,
             Some(FailureKind::Timeout),
             Some("attempt timed out".into()),
             now(),
         ),
+        Outcome::Cancelled => record.terminal(AttemptState::Cancelled, None, None, None, now()),
     }
-    {
-        let _guard = spool_lock.lock().await;
-        let _ = write(path, record).await;
-    }
+    let _ = write(path, record).await;
 }
 
 async fn terminate_group(group: Option<Pid>) {

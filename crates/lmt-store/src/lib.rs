@@ -142,11 +142,18 @@ pub struct AttemptRecord {
 }
 
 #[derive(Debug, Clone)]
-pub struct PollAction {
-    pub run_id: String,
-    pub attempt_no: u32,
-    pub spec_hash: String,
-    pub spec: ProcessRunSpec,
+pub enum PollAction {
+    StartAttempt {
+        run_id: String,
+        attempt_no: u32,
+        spec_hash: String,
+        spec: ProcessRunSpec,
+    },
+    CancelAttempt {
+        run_id: String,
+        attempt_no: u32,
+        spec_hash: String,
+    },
 }
 
 pub struct DispatchSource {
@@ -619,6 +626,10 @@ impl Store {
         let node = node.to_owned();
         self.call(move |connection| {
             let transaction = connection.transaction()?;
+            if let Some(action) = find_cancellation(&transaction, &node)? {
+                transaction.commit()?;
+                return Ok(Some(action));
+            }
             let redelivery = transaction
                 .query_row(
                     "SELECT a.run_id,a.attempt_no,a.spec_hash,a.spec_json
@@ -631,10 +642,16 @@ impl Store {
                 )
                 .optional()?;
             if let Some(action) = redelivery {
+                let PollAction::StartAttempt {
+                    ref run_id, attempt_no, ..
+                } = action
+                else {
+                    unreachable!("StartAttempt query returned another action")
+                };
                 transaction.execute(
                     "UPDATE attempts SET dispatch_count=dispatch_count+1,last_dispatch_at_ms=?3
                      WHERE run_id=?1 AND attempt_no=?2",
-                    params![action.run_id, action.attempt_no, now],
+                    params![run_id, attempt_no, now],
                 )?;
                 transaction.commit()?;
                 return Ok(Some(action));
@@ -696,12 +713,74 @@ impl Store {
                 params![run_id, attempt_no],
             )?;
             transaction.commit()?;
-            Ok(Some(PollAction {
+            Ok(Some(PollAction::StartAttempt {
                 run_id,
                 attempt_no,
                 spec_hash,
                 spec,
             }))
+        })
+        .await
+    }
+
+    pub async fn request_cancellation(&self, run_id: &str, now: i64) -> Result<RunRecord, StoreError> {
+        let run_id = run_id.to_owned();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let run = transaction
+                .query_row(
+                    "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,
+                     finished_at_ms,final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,
+                     scheduled_for_at_ms,retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE id=?1",
+                    [&run_id],
+                    map_run,
+                )
+                .optional()?
+                .ok_or(StoreError::AttemptNotFound)?;
+            transaction.execute(
+                "UPDATE runs SET cancel_requested_at_ms=COALESCE(cancel_requested_at_ms,?2) WHERE id=?1",
+                params![run_id, now],
+            )?;
+            if run.state.is_terminal() {
+                let result = transaction.query_row(
+                    "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,
+                     finished_at_ms,final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,
+                     scheduled_for_at_ms,retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE id=?1",
+                    [&run_id],
+                    map_run,
+                )?;
+                transaction.commit()?;
+                return Ok(result);
+            }
+            let active_dispatched: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempts a JOIN runs r ON r.id=a.run_id
+                  WHERE a.run_id=?1 AND a.attempt_no=r.attempt_count AND a.dispatch_count>0
+                    AND a.state NOT IN('succeeded','failed','timed_out','cancelled','rejected','interrupted'))",
+                [&run_id],
+                |row| row.get(0),
+            )?;
+            if !active_dispatched {
+                transaction.execute(
+                    "UPDATE attempts SET state='cancelled',finished_at_ms=COALESCE(finished_at_ms,?2)
+                     WHERE run_id=?1 AND dispatch_count=0
+                       AND state NOT IN('succeeded','failed','timed_out','cancelled','rejected','interrupted')",
+                    params![run_id, now],
+                )?;
+                transaction.execute(
+                    "UPDATE runs SET state='cancelled',finished_at_ms=?2,retry_due_at_ms=NULL,
+                       final_exit_code=NULL,failure_kind=NULL,failure_message=NULL WHERE id=?1",
+                    params![run_id, now],
+                )?;
+            }
+            let result = transaction.query_row(
+                "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,
+                 finished_at_ms,final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,
+                 scheduled_for_at_ms,retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE id=?1",
+                [&run_id],
+                map_run,
+            )?;
+            transaction.commit()?;
+            Ok(result)
         })
         .await
     }
@@ -1063,6 +1142,28 @@ fn cancel_undispatched_pending(transaction: &Transaction<'_>, mirror: &str, now:
     Ok(())
 }
 
+fn find_cancellation(transaction: &Transaction<'_>, node: &str) -> Result<Option<PollAction>, StoreError> {
+    Ok(transaction
+        .query_row(
+            "SELECT a.run_id,a.attempt_no,a.spec_hash
+             FROM attempts a JOIN runs r ON r.id=a.run_id
+             WHERE r.owner_node=?1 AND r.state IN('pending','running')
+               AND r.cancel_requested_at_ms IS NOT NULL
+               AND a.attempt_no=r.attempt_count AND a.dispatch_count>0
+               AND a.state NOT IN('succeeded','failed','timed_out','cancelled','rejected','interrupted')
+             ORDER BY r.cancel_requested_at_ms,a.run_id LIMIT 1",
+            [node],
+            |row| {
+                Ok(PollAction::CancelAttempt {
+                    run_id: row.get(0)?,
+                    attempt_no: row.get(1)?,
+                    spec_hash: row.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 fn finalize_ineligible_retries(transaction: &Transaction<'_>, mirror: &str, now: i64) -> Result<(), StoreError> {
     let waiting = {
         let mut statement = transaction.prepare(
@@ -1131,7 +1232,7 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
 
 fn map_poll_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<PollAction> {
     let spec_json: String = row.get(3)?;
-    Ok(PollAction {
+    Ok(PollAction::StartAttempt {
         run_id: row.get(0)?,
         attempt_no: row.get(1)?,
         spec_hash: row.get(2)?,
@@ -1314,6 +1415,18 @@ mod tests {
             .await
             .expect("poll")
             .expect("action")
+    }
+
+    fn start_fields(action: &PollAction) -> (&str, u32, &str) {
+        match action {
+            PollAction::StartAttempt {
+                run_id,
+                attempt_no,
+                spec_hash,
+                ..
+            } => (run_id, *attempt_no, spec_hash),
+            PollAction::CancelAttempt { .. } => panic!("expected StartAttempt"),
+        }
     }
 
     fn policy(config: &str) -> Result<RunPolicySnapshot, StoreError> {
@@ -1621,7 +1734,7 @@ mod tests {
                 .create_manual_run("demo", &format!("request-{outcome:?}"), 10, policy)
                 .await
                 .expect("run");
-            assert_eq!(poll(&store).await.attempt_no, 1);
+            assert_eq!(start_fields(&poll(&store).await).1, 1);
             store
                 .apply_event(&run.id, 1, &terminal_event(outcome, 3), 100, decide)
                 .await
@@ -1636,7 +1749,7 @@ mod tests {
                     .expect("poll")
                     .is_none()
             );
-            assert_eq!(poll_at(&store, 5_100).await.attempt_no, 2);
+            assert_eq!(start_fields(&poll_at(&store, 5_100).await).1, 2);
             store
                 .apply_event(&run.id, 2, &terminal_event(AttemptState::Succeeded, 3), 6_000, decide)
                 .await
@@ -1707,6 +1820,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_is_idempotent_immediate_before_dispatch_and_during_retry_delay() {
+        let store = Store::open_in_memory().await.expect("open");
+        store
+            .apply(&scheduled_bundle("/bin/true", "1h", 3), 0, "test", 0)
+            .await
+            .expect("apply");
+        let pending = store
+            .create_manual_run("demo", "pending-cancel", 10, policy)
+            .await
+            .expect("run");
+        let cancelled = store.request_cancellation(&pending.id, 20).await.expect("cancel");
+        assert_eq!(cancelled.state, RunState::Cancelled);
+        assert_eq!(cancelled.cancel_requested_at_ms, Some(20));
+        assert_eq!(
+            store
+                .request_cancellation(&pending.id, 30)
+                .await
+                .expect("duplicate")
+                .cancel_requested_at_ms,
+            Some(20)
+        );
+
+        let retrying = store
+            .create_manual_run("demo", "retry-cancel", 40, policy)
+            .await
+            .expect("run");
+        poll_at(&store, 50).await;
+        store
+            .apply_event(&retrying.id, 1, &terminal_event(AttemptState::Failed, 3), 100, decide)
+            .await
+            .expect("failed");
+        let cancelled = store
+            .request_cancellation(&retrying.id, 200)
+            .await
+            .expect("cancel retry");
+        assert_eq!(cancelled.state, RunState::Cancelled);
+        assert_eq!(cancelled.retry_due_at_ms, None);
+        assert!(poll_optional(&store, 10_000).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatched_cancellation_has_priority_and_repeats_until_terminal() {
+        let store = Store::open_in_memory().await.expect("open");
+        store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
+        let first_run = store.create_manual_run("demo", "first", 20, policy).await.expect("run");
+        let start = poll_at(&store, 30).await;
+        let (_, _, hash) = start_fields(&start);
+        let cancelled = store.request_cancellation(&first_run.id, 40).await.expect("cancel");
+        assert_eq!(cancelled.state, RunState::Pending);
+
+        for now in [41, 42] {
+            match poll_at(&store, now).await {
+                PollAction::CancelAttempt {
+                    run_id,
+                    attempt_no,
+                    spec_hash,
+                } => {
+                    assert_eq!(run_id, first_run.id);
+                    assert_eq!(attempt_no, 1);
+                    assert_eq!(spec_hash, hash);
+                }
+                PollAction::StartAttempt { .. } => panic!("cancel must outrank Start redelivery"),
+            }
+        }
+        store
+            .apply_event(
+                &first_run.id,
+                1,
+                &terminal_event(AttemptState::Cancelled, 1),
+                50,
+                decide,
+            )
+            .await
+            .expect("cancelled event");
+        assert_eq!(
+            store.get_run(&first_run.id).await.expect("get").expect("run").state,
+            RunState::Cancelled
+        );
+        assert!(poll_optional(&store, 60).await.is_none());
+    }
+
+    #[tokio::test]
     async fn removal_cancels_only_never_dispatched_pending_work() {
         let empty = canonicalize_bundle(&ConfigBundle { files: vec![] }).expect("empty bundle");
 
@@ -1735,7 +1930,7 @@ mod tests {
             RunState::Pending
         );
         let redelivered = poll(&store).await;
-        assert_eq!(redelivered.run_id, first.run_id);
-        assert_eq!(redelivered.spec_hash, first.spec_hash);
+        assert_eq!(start_fields(&redelivered).0, start_fields(&first).0);
+        assert_eq!(start_fields(&redelivered).2, start_fields(&first).2);
     }
 }

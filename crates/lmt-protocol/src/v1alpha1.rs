@@ -187,6 +187,7 @@ pub enum AgentAction {
     CancelAttempt {
         run_id: String,
         attempt: u32,
+        spec_hash: String,
     },
 }
 
@@ -248,6 +249,20 @@ mod tests {
         let json = serde_json::to_value(message).expect("serialize");
         assert_eq!(json["actions"][0]["type"], "start_attempt");
         assert_eq!(json["actions"][0]["attempt"], 1);
+    }
+
+    #[test]
+    fn cancel_attempt_carries_the_immutable_spec_identity() {
+        let message = PollResponse {
+            actions: vec![AgentAction::CancelAttempt {
+                run_id: "01K00000000000000000000000".into(),
+                attempt: 2,
+                spec_hash: "sha256:abc".into(),
+            }],
+        };
+        let json = serde_json::to_value(message).expect("serialize");
+        assert_eq!(json["actions"][0]["type"], "cancel_attempt");
+        assert_eq!(json["actions"][0]["spec_hash"], "sha256:abc");
     }
 
     #[test]

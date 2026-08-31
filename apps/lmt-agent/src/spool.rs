@@ -10,7 +10,9 @@ pub struct SpoolRecord {
     pub run_id: String,
     pub attempt: u32,
     pub spec_hash: String,
-    pub spec: ProcessRunSpec,
+    pub spec: Option<ProcessRunSpec>,
+    #[serde(default)]
+    pub cancel_requested: bool,
     pub state: AttemptState,
     pub sequence: u64,
     pub acknowledged_sequence: u64,
@@ -30,13 +32,35 @@ impl SpoolRecord {
             run_id,
             attempt,
             spec_hash,
-            spec,
+            spec: Some(spec),
+            cancel_requested: false,
             state: AttemptState::Accepted,
             sequence: 1,
             acknowledged_sequence: 0,
             accepted_at: Some(now),
             started_at: None,
             finished_at: None,
+            exit_code: None,
+            failure_kind: None,
+            failure_message: None,
+            log_offset: 0,
+            log_complete_acknowledged: false,
+        }
+    }
+
+    pub fn cancellation_tombstone(run_id: String, attempt: u32, spec_hash: String, now: String) -> Self {
+        Self {
+            run_id,
+            attempt,
+            spec_hash,
+            spec: None,
+            cancel_requested: true,
+            state: AttemptState::Cancelled,
+            sequence: 1,
+            acknowledged_sequence: 0,
+            accepted_at: None,
+            started_at: None,
+            finished_at: Some(now),
             exit_code: None,
             failure_kind: None,
             failure_message: None,
@@ -62,7 +86,10 @@ impl SpoolRecord {
     }
 
     pub fn ready_for_cleanup(&self) -> bool {
-        self.state.is_terminal() && self.acknowledged_sequence >= self.sequence && self.log_complete_acknowledged
+        self.spec.is_some()
+            && self.state.is_terminal()
+            && self.acknowledged_sequence >= self.sequence
+            && self.log_complete_acknowledged
     }
 }
 

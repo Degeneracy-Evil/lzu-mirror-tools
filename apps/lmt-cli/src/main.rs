@@ -73,6 +73,9 @@ enum RunCommand {
         #[arg(long, default_value_t = 1)]
         attempt: u32,
     },
+    Cancel {
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -154,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             RunCommand::Logs { id, attempt } => {
                 get(&client, &token, format!("{base}/runs/{id}/logs?attempt={attempt}")).await?
             }
+            RunCommand::Cancel { id } => post_empty(&client, &token, format!("{base}/runs/{id}/cancel")).await?,
         },
     };
     let response = checked(response).await?;
@@ -170,6 +174,9 @@ async fn get(c: &Client, t: &str, u: String) -> anyhow::Result<Response> {
 }
 async fn post<T: Serialize + ?Sized>(c: &Client, t: &str, u: String, b: &T) -> anyhow::Result<Response> {
     Ok(c.post(u).bearer_auth(t).json(b).send().await?)
+}
+async fn post_empty(c: &Client, t: &str, u: String) -> anyhow::Result<Response> {
+    Ok(c.post(u).bearer_auth(t).send().await?)
 }
 async fn checked(r: Response) -> anyhow::Result<Response> {
     if r.status().is_success() {

@@ -2,7 +2,7 @@ pub mod config;
 mod executor;
 mod spool;
 
-use std::{collections::HashSet, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::bail;
 use config::Config;
@@ -24,7 +24,7 @@ pub struct Agent {
     token: Arc<str>,
     instance: Arc<str>,
     client: Client,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     acceptance: Arc<Mutex<()>>,
     shutdown: watch::Receiver<bool>,
 }
@@ -42,7 +42,7 @@ impl Agent {
             token: token.into(),
             instance: ulid::Ulid::new().to_string().into(),
             client: Client::builder().timeout(Duration::from_secs(35)).build()?,
-            active: Arc::new(Mutex::new(HashSet::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
             shutdown,
         })
@@ -83,14 +83,18 @@ impl Agent {
                 Ok(response) if response.status() == StatusCode::NO_CONTENT => {}
                 Ok(response) if response.status().is_success() => {
                     for action in response.json::<PollResponse>().await?.actions {
-                        if let AgentAction::StartAttempt {
-                            run_id,
-                            attempt,
-                            spec_hash,
-                            spec,
-                        } = action
-                        {
-                            self.accept(run_id, attempt, spec_hash, spec).await;
+                        match action {
+                            AgentAction::StartAttempt {
+                                run_id,
+                                attempt,
+                                spec_hash,
+                                spec,
+                            } => self.accept(run_id, attempt, spec_hash, spec).await,
+                            AgentAction::CancelAttempt {
+                                run_id,
+                                attempt,
+                                spec_hash,
+                            } => self.cancel(run_id, attempt, spec_hash).await,
                         }
                     }
                 }
@@ -118,7 +122,7 @@ impl Agent {
             return;
         }
         let mut active = self.active.lock().await;
-        if active.contains(&key) || active.len() >= self.config.execution.max_concurrent_runs as usize {
+        if active.contains_key(&key) || active.len() >= self.config.execution.max_concurrent_runs as usize {
             return;
         }
         if !self.config.runner.process.enabled || !safe_spec(&self.config.storage.mirror_root, &spec) {
@@ -141,7 +145,8 @@ impl Agent {
             tracing::error!(%error, "failed to persist acceptance");
             return;
         }
-        active.insert(key.clone());
+        let (cancel, cancel_receiver) = watch::channel(false);
+        active.insert(key.clone(), cancel);
         drop(active);
         let agent = self.clone();
         tokio::spawn(async move {
@@ -149,13 +154,62 @@ impl Agent {
             if let Err(error) = agent.reconcile(&path, &mut record).await {
                 tracing::warn!(%error, "accepted reconciliation failed");
             }
-            executor::execute(&path, &mut record, agent.shutdown.clone(), agent.acceptance.clone()).await;
+            executor::execute(
+                &path,
+                &mut record,
+                agent.shutdown.clone(),
+                cancel_receiver,
+                agent.acceptance.clone(),
+            )
+            .await;
             tracing::info!(run_id=%record.run_id, sequence=record.sequence, "execution reached terminal reconciliation");
             if let Err(error) = agent.reconcile(&path, &mut record).await {
                 tracing::warn!(%error, "terminal reconciliation failed");
             }
             agent.active.lock().await.remove(&key);
         });
+    }
+
+    async fn cancel(&self, run_id: String, attempt: u32, spec_hash: String) {
+        let acceptance = self.acceptance.lock().await;
+        let key = format!("{run_id}-{attempt}");
+        let path = state_path(&self.config.storage.spool_dir, &run_id, attempt);
+        let mut record = match read(&path).await {
+            Ok(record) => record,
+            Err(_) if !path.exists() => {
+                SpoolRecord::cancellation_tombstone(run_id.clone(), attempt, spec_hash.clone(), now())
+            }
+            Err(error) => {
+                tracing::error!(%error, %run_id, attempt, "failed to read existing cancellation state");
+                return;
+            }
+        };
+        if record.spec_hash != spec_hash {
+            tracing::error!(%run_id, attempt, expected=%record.spec_hash, received=%spec_hash,
+                "protocol integrity error: conflicting CancelAttempt preserved original ownership");
+            return;
+        }
+        if record.state.is_terminal() {
+            if !path.exists()
+                && let Err(error) = write(&path, &record).await
+            {
+                tracing::error!(%error, "failed to persist cancellation tombstone");
+                return;
+            }
+            drop(acceptance);
+            let _ = self.reconcile(&path, &mut record).await;
+            return;
+        }
+        record.cancel_requested = true;
+        if let Err(error) = write(&path, &record).await {
+            tracing::error!(%error, "failed to persist cancellation intent");
+            return;
+        }
+        let control = self.active.lock().await.get(&key).cloned();
+        drop(acceptance);
+        if let Some(control) = control {
+            let _ = control.send(true);
+        }
     }
 
     async fn recover(&self) {
@@ -171,7 +225,10 @@ impl Agent {
             let Ok(mut record) = read(&path).await else {
                 continue;
             };
-            if !record.state.is_terminal() {
+            if !record.state.is_terminal() && record.cancel_requested {
+                record.terminal(AttemptState::Cancelled, None, None, None, now());
+                let _ = write(&path, &record).await;
+            } else if !record.state.is_terminal() {
                 record.terminal(
                     AttemptState::Interrupted,
                     None,
@@ -362,7 +419,7 @@ mod tests {
             token: "token".into(),
             instance: "instance".into(),
             client: Client::new(),
-            active: Arc::new(Mutex::new(HashSet::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
             shutdown,
         }
@@ -430,6 +487,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_before_start_is_a_durable_hash_bound_tombstone() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        fs::create_dir_all(&agent.config.storage.mirror_root)
+            .await
+            .expect("root");
+        let run_id = "01K00000000000000000000001";
+        let counter = directory.path().join("counter");
+        agent.cancel(run_id.into(), 1, "sha256:one".into()).await;
+        let path = state_path(&agent.config.storage.spool_dir, run_id, 1);
+        let tombstone = read(&path).await.expect("tombstone");
+        assert_eq!(tombstone.state, AttemptState::Cancelled);
+        assert!(tombstone.spec.is_none());
+
+        let command = spec(
+            &agent.config.storage.mirror_root,
+            "/bin/sh",
+            vec!["-c".into(), format!("touch '{}'", counter.display())],
+            5,
+        );
+        agent
+            .accept(run_id.into(), 1, "sha256:one".into(), command.clone())
+            .await;
+        agent.accept(run_id.into(), 1, "sha256:conflict".into(), command).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!counter.exists(), "delayed Start executed after cancellation");
+        assert_eq!(read(&path).await.expect("preserved").spec_hash, "sha256:one");
+
+        let (_sender, restarted_receiver) = watch::channel(false);
+        let restarted = test_agent(directory.path(), restarted_receiver, "http://127.0.0.1:1".into());
+        restarted.recover().await;
+        let recovered = read(&path).await.expect("recovered tombstone");
+        assert_eq!(recovered.state, AttemptState::Cancelled);
+        assert!(recovered.spec.is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_active_cancel_kills_the_process_group_and_persists_cancelled() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        fs::create_dir_all(&agent.config.storage.mirror_root)
+            .await
+            .expect("root");
+        let run_id = "01K00000000000000000000002";
+        let pid_file = directory.path().join("descendant.pid");
+        let command = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        agent
+            .accept(
+                run_id.into(),
+                1,
+                "sha256:active".into(),
+                spec(
+                    &agent.config.storage.mirror_root,
+                    "/bin/sh",
+                    vec!["-c".into(), command],
+                    60,
+                ),
+            )
+            .await;
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .await
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("number");
+        agent.cancel(run_id.into(), 1, "sha256:active".into()).await;
+        agent.cancel(run_id.into(), 1, "sha256:active".into()).await;
+        let path = state_path(&agent.config.storage.spool_dir, run_id, 1);
+        let mut final_record = None;
+        for _ in 0..100 {
+            if let Ok(record) = read(&path).await
+                && record.state.is_terminal()
+            {
+                final_record = Some(record);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(final_record.expect("terminal record").state, AttemptState::Cancelled);
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
+            "cancelled descendant remained alive"
+        );
+    }
+
+    #[tokio::test]
     async fn timeout_kills_process_group_descendant_and_streams_both_outputs() {
         let directory = tempfile::tempdir().expect("tempdir");
         let (_sender, receiver) = watch::channel(false);
@@ -449,7 +606,8 @@ mod tests {
             now(),
         );
         write(&state, &record).await.expect("write");
-        executor::execute(&state, &mut record, receiver, Arc::new(Mutex::new(()))).await;
+        let (_cancel, cancel_receiver) = watch::channel(false);
+        executor::execute(&state, &mut record, receiver, cancel_receiver, Arc::new(Mutex::new(()))).await;
         assert_eq!(record.state, AttemptState::TimedOut);
         let log = fs::read_to_string(log_path(&state)).await.expect("log");
         assert!(log.contains("[stdout] out"));

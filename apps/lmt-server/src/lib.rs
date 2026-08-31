@@ -115,6 +115,7 @@ pub fn build_router(s: AppState) -> Router {
         .route("/api/v1alpha1/mirrors/{name}/runs", post(manual))
         .route("/api/v1alpha1/runs", get(runs))
         .route("/api/v1alpha1/runs/{id}", get(run))
+        .route("/api/v1alpha1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1alpha1/runs/{id}/attempts", get(attempts))
         .route("/api/v1alpha1/runs/{id}/logs", get(read_log))
         .route("/api/v1alpha1/nodes", get(nodes))
@@ -281,6 +282,16 @@ async fn run(
             .collect(),
     }))
 }
+async fn cancel_run(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<RunView>, Failure> {
+    operator(&h, &s)?;
+    let run = s.store.request_cancellation(&id, now_ms()).await?;
+    s.notify.notify_waiters();
+    Ok(Json(run_view(run)))
+}
 async fn attempts(
     State(s): State<AppState>,
     h: HeaderMap,
@@ -354,11 +365,27 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
 }
 fn action(a: lmt_store::PollAction) -> Json<PollResponse> {
     Json(PollResponse {
-        actions: vec![AgentAction::StartAttempt {
-            run_id: a.run_id,
-            attempt: a.attempt_no,
-            spec_hash: a.spec_hash,
-            spec: a.spec,
+        actions: vec![match a {
+            lmt_store::PollAction::StartAttempt {
+                run_id,
+                attempt_no,
+                spec_hash,
+                spec,
+            } => AgentAction::StartAttempt {
+                run_id,
+                attempt: attempt_no,
+                spec_hash,
+                spec,
+            },
+            lmt_store::PollAction::CancelAttempt {
+                run_id,
+                attempt_no,
+                spec_hash,
+            } => AgentAction::CancelAttempt {
+                run_id,
+                attempt: attempt_no,
+                spec_hash,
+            },
         }],
     })
 }
