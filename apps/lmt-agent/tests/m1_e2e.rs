@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -20,8 +20,11 @@ use axum::{
     routing::any,
 };
 use lmt_core::{BundleFile, RunState, RunTrigger};
-use lmt_protocol::v1alpha1::{ApplyRequest, ApplyResponse, BundleRequest, ManualRunRequest, PlanResponse, RunDetail};
-use lmt_server::{AgentCredential, ServerConfig, build_router, initialize};
+use lmt_protocol::v1alpha1::{
+    AgentAction, ApplyRequest, ApplyResponse, BundleRequest, ManualRunRequest, PlanResponse, PollResponse, RunDetail,
+    RunView,
+};
+use lmt_server::{AgentCredential, AppState, Clock, ServerConfig, build_router, initialize, initialize_with_clock};
 use nix::{
     sys::signal::{Signal, kill, killpg},
     unistd::Pid,
@@ -43,6 +46,7 @@ struct Harness {
     server_config: ServerConfig,
     server_address: SocketAddr,
     server_task: Option<JoinHandle<()>>,
+    server_state: Option<AppState>,
     proxy_task: JoinHandle<()>,
     client: Client,
     agent_config: PathBuf,
@@ -50,6 +54,8 @@ struct Harness {
     files: BTreeMap<String, String>,
     drop_accepted: Arc<AtomicUsize>,
     lose_terminal_ack: Arc<AtomicUsize>,
+    drop_start_response: Arc<AtomicUsize>,
+    clock: Option<Arc<TestClock>>,
 }
 
 #[derive(Clone)]
@@ -58,10 +64,27 @@ struct ProxyState {
     client: Client,
     drop_accepted: Arc<AtomicUsize>,
     lose_terminal_ack: Arc<AtomicUsize>,
+    drop_start_response: Arc<AtomicUsize>,
+}
+
+struct TestClock(AtomicI64);
+
+impl Clock for TestClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 
 impl Harness {
     async fn new() -> Self {
+        Self::new_inner(None).await
+    }
+
+    async fn with_clock(now_ms: i64) -> Self {
+        Self::new_inner(Some(Arc::new(TestClock(AtomicI64::new(now_ms))))).await
+    }
+
+    async fn new_inner(clock: Option<Arc<TestClock>>) -> Self {
         let directory = tempfile::tempdir().expect("tempdir");
         let server_listener = TcpListener::bind("127.0.0.1:0").await.expect("server bind");
         let server_address = server_listener.local_addr().expect("server address");
@@ -77,16 +100,18 @@ impl Harness {
                 token: AGENT_TOKEN.into(),
             }],
         };
-        let server_task = Some(start_server(&server_config, server_address).await);
+        let (server_task, server_state) = start_server(&server_config, server_address, clock.clone()).await;
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
         let proxy_address = proxy_listener.local_addr().expect("proxy address");
         let drop_accepted = Arc::new(AtomicUsize::new(2));
         let lose_terminal_ack = Arc::new(AtomicUsize::new(1));
+        let drop_start_response = Arc::new(AtomicUsize::new(0));
         let proxy_state = ProxyState {
             upstream: format!("http://{server_address}"),
             client: Client::new(),
             drop_accepted: drop_accepted.clone(),
             lose_terminal_ack: lose_terminal_ack.clone(),
+            drop_start_response: drop_start_response.clone(),
         };
         let proxy_task = tokio::spawn(async move {
             axum::serve(
@@ -109,7 +134,8 @@ impl Harness {
             directory,
             server_config,
             server_address,
-            server_task,
+            server_task: Some(server_task),
+            server_state: Some(server_state),
             proxy_task,
             client: Client::new(),
             agent_config,
@@ -117,6 +143,8 @@ impl Harness {
             files: BTreeMap::new(),
             drop_accepted,
             lose_terminal_ack,
+            drop_start_response,
+            clock,
         }
     }
 
@@ -144,9 +172,12 @@ impl Harness {
             task.abort();
             let _ = task.await;
         }
+        self.server_state = None;
     }
     async fn restart_server(&mut self) {
-        self.server_task = Some(start_server(&self.server_config, self.server_address).await);
+        let (task, state) = start_server(&self.server_config, self.server_address, self.clock.clone()).await;
+        self.server_task = Some(task);
+        self.server_state = Some(state);
     }
 
     async fn set_mirror(&mut self, name: &str, program: &str, args: &[String], timeout: u64) {
@@ -191,6 +222,21 @@ impl Harness {
             format!(
                 "[mirror]\nname='{name}'\ntarget='{name}'\n[sync]\ntype='rsync'\nsource='{}/'\nargs=['--archive']\n",
                 source.display()
+            ),
+        );
+        self.apply().await;
+    }
+
+    async fn set_scheduled_mirror(&mut self, name: &str, program: &str, args: &[String]) {
+        let arguments = args
+            .iter()
+            .map(|arg| toml::Value::String(arg.clone()).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.files.insert(
+            format!("nodes/node-a/mirrors/{name}.toml"),
+            format!(
+                "[mirror]\nname='{name}'\ntarget='{name}'\n[schedule]\ninterval='1m'\n[sync]\ntype='command'\nprogram='{program}'\nargs=[{arguments}]\n[run]\ntimeout_seconds=10\nmax_attempts=1\n"
             ),
         );
         self.apply().await;
@@ -296,6 +342,40 @@ impl Harness {
         panic!("run {id} did not reach {expected:?}; last state was {observed:?}; spool={spool:?}")
     }
 
+    async fn wait_scheduled_run(&self, mirror: &str, expected: RunState) -> RunDetail {
+        for _ in 0..150 {
+            let response = self
+                .client
+                .get(format!("{}/api/v1alpha1/runs", self.server_url()))
+                .bearer_auth(OPERATOR_TOKEN)
+                .send()
+                .await
+                .expect("runs request");
+            if response.status().is_success()
+                && let Some(run) = response
+                    .json::<Vec<RunView>>()
+                    .await
+                    .expect("runs")
+                    .into_iter()
+                    .find(|run| run.mirror_name == mirror && run.trigger == RunTrigger::Scheduled)
+                && run.state == expected
+            {
+                return self.detail(&run.id).await.expect("scheduled detail");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("scheduled run for {mirror} did not reach {expected:?}")
+    }
+
+    fn advance_clock(&self, now_ms: i64) {
+        self.clock
+            .as_ref()
+            .expect("deterministic clock")
+            .0
+            .store(now_ms, Ordering::SeqCst);
+        self.server_state.as_ref().expect("server state").wake_scheduler();
+    }
+
     async fn detail(&self, id: &str) -> Option<RunDetail> {
         let response = self
             .client
@@ -393,12 +473,22 @@ impl Drop for Harness {
     }
 }
 
-async fn start_server(config: &ServerConfig, address: SocketAddr) -> JoinHandle<()> {
-    let state = initialize(config).await.expect("initialize server");
+async fn start_server(
+    config: &ServerConfig,
+    address: SocketAddr,
+    clock: Option<Arc<TestClock>>,
+) -> (JoinHandle<()>, AppState) {
+    let state = if let Some(clock) = clock {
+        initialize_with_clock(config, clock).await.expect("initialize server")
+    } else {
+        initialize(config).await.expect("initialize server")
+    };
     let listener = TcpListener::bind(address).await.expect("bind server");
-    tokio::spawn(async move {
-        axum::serve(listener, build_router(state)).await.expect("server");
-    })
+    let served_state = state.clone();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, build_router(served_state)).await.expect("server");
+    });
+    (task, state)
 }
 
 async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
@@ -443,6 +533,18 @@ async fn proxy(State(state): State<ProxyState>, request: Request) -> Response {
     let status = upstream.status();
     let response_headers = upstream.headers().clone();
     let bytes = upstream.bytes().await.unwrap_or_default();
+    if serde_json::from_slice::<PollResponse>(&bytes).is_ok_and(|response| {
+        response
+            .actions
+            .iter()
+            .any(|action| matches!(action, AgentAction::StartAttempt { .. }))
+    }) && state
+        .drop_start_response
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| value.checked_sub(1))
+        .is_ok()
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let mut response = (status, bytes).into_response();
     for (name, value) in &response_headers {
         response.headers_mut().insert(name, value.clone());
@@ -825,4 +927,74 @@ async fn m2_release_fault_matrix() {
     assert!(metrics.contains("lmt_retries_scheduled_total"));
     assert!(metrics.contains("lmt_cancellations_total{outcome=\"dispatched\"}"));
     assert!(metrics.contains("lmt_nodes_online 1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deterministic_interval_schedule_reaches_real_agent_execution() {
+    let mut harness = Harness::with_clock(0).await;
+    harness.drop_accepted.store(0, Ordering::SeqCst);
+    harness.lose_terminal_ack.store(0, Ordering::SeqCst);
+    let counter = harness.directory.path().join("scheduled-counter");
+    harness
+        .set_scheduled_mirror(
+            "scheduled",
+            "/bin/sh",
+            &["-c".into(), format!("echo run >> '{}'", counter.display())],
+        )
+        .await;
+    harness.start_agent();
+
+    assert!(!counter.exists(), "schedule ran before its Server-clock deadline");
+    harness.advance_clock(60_000);
+    let detail = harness.wait_scheduled_run("scheduled", RunState::Succeeded).await;
+
+    assert_eq!(detail.run.trigger, RunTrigger::Scheduled);
+    assert_eq!(detail.run.scheduled_for_at.as_deref(), Some("1970-01-01T00:01:00Z"));
+    assert_eq!(detail.attempts.len(), 1);
+    assert_eq!(fs::read_to_string(counter).await.expect("counter"), "run\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_start_response_followed_by_cancel_executes_nothing_and_retires_tombstone() {
+    let mut harness = Harness::new().await;
+    harness.drop_accepted.store(0, Ordering::SeqCst);
+    harness.lose_terminal_ack.store(0, Ordering::SeqCst);
+    let counter = harness.directory.path().join("must-not-run");
+    harness
+        .set_command_policy(
+            "lost-start",
+            "/bin/sh",
+            &["-c".into(), format!("echo run >> '{}'", counter.display())],
+            10,
+            1,
+            0,
+            true,
+        )
+        .await;
+    let run_id = harness.run("lost-start").await;
+    harness.drop_start_response.store(1, Ordering::SeqCst);
+    harness.start_agent();
+    for _ in 0..100 {
+        if harness.drop_start_response.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        harness.drop_start_response.load(Ordering::SeqCst),
+        0,
+        "StartAttempt response-loss fault was not injected"
+    );
+
+    harness.cancel(&run_id).await;
+    let detail = harness.wait_state(&run_id, RunState::Cancelled).await;
+    harness.wait_spool_retired(&run_id).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        !counter.exists(),
+        "lost StartAttempt response still executed the command"
+    );
+    assert_eq!(detail.attempts.len(), 1);
+    assert_eq!(detail.attempts[0].state, lmt_core::AttemptState::Cancelled);
 }

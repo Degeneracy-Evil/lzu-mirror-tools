@@ -63,7 +63,7 @@ pub struct AppState {
     clock: Arc<dyn Clock>,
 }
 
-trait Clock: Send + Sync {
+pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
 }
 
@@ -113,22 +113,31 @@ impl AppState {
     fn now_ms(&self) -> i64 {
         self.clock.now_ms()
     }
+
+    pub fn wake_scheduler(&self) {
+        self.notify.notify_waiters();
+    }
 }
 pub async fn initialize(c: &ServerConfig) -> anyhow::Result<AppState> {
+    initialize_with_clock(c, Arc::new(SystemClock)).await
+}
+
+pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> anyhow::Result<AppState> {
     if let Some(p) = c.database_path.parent() {
         fs::create_dir_all(p).await?;
     }
     fs::create_dir_all(&c.log_dir).await?;
     let store = Store::open(&c.database_path).await?;
     for a in &c.agents {
-        store.upsert_credential(&a.node, &a.token, now_ms()).await?;
+        store.upsert_credential(&a.node, &a.token, clock.now_ms()).await?;
     }
-    let state = AppState::new(
+    let mut state = AppState::new(
         store,
         c.log_dir.clone(),
         c.operator_token.clone(),
         Duration::from_secs(c.offline_after_seconds),
     );
+    state.clock = clock;
     tokio::spawn(run_scheduler(state.clone()));
     Ok(state)
 }
