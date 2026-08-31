@@ -6,7 +6,8 @@ use std::{
 };
 
 use lmt_core::{
-    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, ProcessRunSpec, RunId, RunState, project_attempt_event,
+    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, ProcessRunSpec, RunId, RunState,
+    ScheduleRuntime, activate_schedule, project_attempt_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -77,6 +78,8 @@ pub struct MirrorRecord {
     pub enabled: bool,
     pub owner_node: String,
     pub current_generation: u64,
+    pub next_due_at_ms: Option<i64>,
+    pub scheduled_due_since_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +90,7 @@ pub struct NodeRecord {
     pub last_seen_at_ms: Option<i64>,
     pub active_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
+    pub max_concurrent_runs: u32,
 }
 
 pub struct NodeObservation {
@@ -113,6 +117,11 @@ pub struct RunRecord {
     pub final_exit_code: Option<i32>,
     pub failure_kind: Option<String>,
     pub failure_message: Option<String>,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+    pub scheduled_for_at_ms: Option<i64>,
+    pub retry_due_at_ms: Option<i64>,
+    pub cancel_requested_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +154,19 @@ pub struct DispatchSource {
     pub mirror_name: String,
     pub mirror_generation: u64,
     pub config_toml: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RunPolicySnapshot {
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+}
+
+pub struct ScheduleTickSource {
+    pub mirror_name: String,
+    pub config_toml: String,
+    pub runtime: ScheduleRuntime,
+    pub has_active_run: bool,
 }
 
 impl Store {
@@ -193,6 +215,75 @@ impl Store {
         .await
     }
 
+    pub async fn earliest_wakeup(&self) -> Result<Option<i64>, StoreError> {
+        self.call(|connection| {
+            Ok(connection.query_row(
+                "SELECT MIN(deadline) FROM (
+                   SELECT MIN(next_due_at_ms) AS deadline FROM mirror_schedule_state WHERE next_due_at_ms IS NOT NULL
+                   UNION ALL
+                   SELECT MIN(retry_due_at_ms) AS deadline FROM runs
+                     WHERE state='running' AND retry_due_at_ms IS NOT NULL
+                 )",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+    }
+
+    pub async fn evaluate_due_schedules<F>(&self, now: i64, mut evaluate: F) -> Result<u64, StoreError>
+    where
+        F: FnMut(&ScheduleTickSource) -> Result<ScheduleRuntime, StoreError> + Send + 'static,
+    {
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let sources = {
+                let mut statement = transaction.prepare(
+                    "SELECT m.name,g.config_toml,s.next_due_at_ms,s.last_evaluated_at_ms,
+                       s.catch_up_pending,s.catch_up_since_ms,
+                       EXISTS(SELECT 1 FROM runs r WHERE r.mirror_name=m.name AND r.state IN('pending','running'))
+                     FROM mirror_schedule_state s
+                     JOIN mirrors m ON m.name=s.mirror_name
+                     JOIN mirror_generations g ON g.mirror_name=m.name AND g.generation=m.current_generation
+                     WHERE m.managed=1 AND m.enabled=1 AND s.next_due_at_ms IS NOT NULL AND s.next_due_at_ms<=?1
+                     ORDER BY s.next_due_at_ms,m.name",
+                )?;
+                statement
+                    .query_map([now], |row| {
+                        Ok(ScheduleTickSource {
+                            mirror_name: row.get(0)?,
+                            config_toml: row.get(1)?,
+                            runtime: ScheduleRuntime {
+                                next_due_at_ms: row.get(2)?,
+                                last_evaluated_at_ms: row.get(3)?,
+                                catch_up_pending: row.get(4)?,
+                                catch_up_since_ms: row.get(5)?,
+                            },
+                            has_active_run: row.get(6)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for source in &sources {
+                let runtime = evaluate(source)?;
+                transaction.execute(
+                    "UPDATE mirror_schedule_state SET next_due_at_ms=?2,last_evaluated_at_ms=?3,
+                       catch_up_pending=?4,catch_up_since_ms=?5 WHERE mirror_name=?1",
+                    params![
+                        source.mirror_name,
+                        runtime.next_due_at_ms,
+                        runtime.last_evaluated_at_ms,
+                        runtime.catch_up_pending,
+                        runtime.catch_up_since_ms
+                    ],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(u64::try_from(sources.len()).unwrap_or(u64::MAX))
+        })
+        .await
+    }
+
     pub async fn plan(&self, bundle: &CanonicalBundle) -> Result<ConfigPlan, StoreError> {
         let bundle = bundle.clone();
         self.call(move |connection| plan_with_connection(connection, &bundle))
@@ -237,11 +328,19 @@ impl Store {
                         params![change.mirror, now],
                     )?;
                     cancel_undispatched_pending(&transaction, &change.mirror, now)?;
+                    transaction.execute("DELETE FROM mirror_schedule_state WHERE mirror_name=?1", [&change.mirror])?;
                 }
                 ChangeKind::Create | ChangeKind::Update | ChangeKind::Move => {
                     let mirror = &bundle.mirrors[&lmt_core::MirrorName::new(&change.mirror)
                         .map_err(|error| StoreError::InvalidConfig(error.to_string()))?];
                     let generation = change.to_generation.expect("changed mirror has generation");
+                    let previous: Option<(bool, bool, String)> = transaction
+                        .query_row(
+                            "SELECT managed,enabled,owner_node FROM mirrors WHERE name=?1",
+                            [&change.mirror],
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        )
+                        .optional()?;
                     transaction.execute(
                         "INSERT INTO mirrors(name, managed, enabled, owner_node, current_generation, removed_at_ms)
                          VALUES(?1,1,?2,?3,?4,NULL)
@@ -264,6 +363,14 @@ impl Store {
                             mirror.canonical_toml,
                             now
                         ],
+                    )?;
+                    reconcile_schedule(
+                        &transaction,
+                        change,
+                        &mirror.document,
+                        mirror.owner_node.as_str(),
+                        previous.as_ref(),
+                        now,
                     )?;
                 }
             }
@@ -333,28 +440,33 @@ impl Store {
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
         self.call(|connection| {
-        let mut statement = connection.prepare(
-            "SELECT name,agent_version,agent_instance_id,last_seen_at_ms,active_runs,mirror_root_free_bytes FROM nodes ORDER BY name",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(NodeRecord {
-                name: row.get(0)?,
-                agent_version: row.get(1)?,
-                agent_instance_id: row.get(2)?,
-                last_seen_at_ms: row.get(3)?,
-                active_runs: row.get(4)?,
-                mirror_root_free_bytes: row.get(5)?,
-            })
-        })?;
-        rows.collect::<Result<_, _>>().map_err(StoreError::from)
+            let mut statement = connection.prepare(
+                "SELECT name,agent_version,agent_instance_id,last_seen_at_ms,active_runs,mirror_root_free_bytes,
+                 max_concurrent_runs FROM nodes ORDER BY name",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(NodeRecord {
+                    name: row.get(0)?,
+                    agent_version: row.get(1)?,
+                    agent_instance_id: row.get(2)?,
+                    last_seen_at_ms: row.get(3)?,
+                    active_runs: row.get(4)?,
+                    mirror_root_free_bytes: row.get(5)?,
+                    max_concurrent_runs: row.get(6)?,
+                })
+            })?;
+            rows.collect::<Result<_, _>>().map_err(StoreError::from)
         })
         .await
     }
 
     pub async fn list_mirrors(&self) -> Result<Vec<MirrorRecord>, StoreError> {
         self.call(|connection| {
-            let mut statement = connection
-                .prepare("SELECT name,managed,enabled,owner_node,current_generation FROM mirrors ORDER BY name")?;
+            let mut statement = connection.prepare(
+                "SELECT m.name,m.managed,m.enabled,m.owner_node,m.current_generation,s.next_due_at_ms,
+                     CASE WHEN s.catch_up_pending=1 THEN s.catch_up_since_ms END
+                     FROM mirrors m LEFT JOIN mirror_schedule_state s ON s.mirror_name=m.name ORDER BY m.name",
+            )?;
             let rows = statement.query_map([], |row| {
                 Ok(MirrorRecord {
                     name: row.get(0)?,
@@ -362,6 +474,8 @@ impl Store {
                     enabled: row.get(2)?,
                     owner_node: row.get(3)?,
                     current_generation: row.get(4)?,
+                    next_due_at_ms: row.get(5)?,
+                    scheduled_due_since_ms: row.get(6)?,
                 })
             })?;
             rows.collect::<Result<_, _>>().map_err(StoreError::from)
@@ -374,7 +488,9 @@ impl Store {
         self.call(move |connection| {
             Ok(connection
                 .query_row(
-                    "SELECT name,managed,enabled,owner_node,current_generation FROM mirrors WHERE name=?1",
+                    "SELECT m.name,m.managed,m.enabled,m.owner_node,m.current_generation,s.next_due_at_ms,
+                     CASE WHEN s.catch_up_pending=1 THEN s.catch_up_since_ms END
+                     FROM mirrors m LEFT JOIN mirror_schedule_state s ON s.mirror_name=m.name WHERE m.name=?1",
                     [name],
                     |row| {
                         Ok(MirrorRecord {
@@ -383,6 +499,8 @@ impl Store {
                             enabled: row.get(2)?,
                             owner_node: row.get(3)?,
                             current_generation: row.get(4)?,
+                            next_due_at_ms: row.get(5)?,
+                            scheduled_due_since_ms: row.get(6)?,
                         })
                     },
                 )
@@ -391,7 +509,16 @@ impl Store {
         .await
     }
 
-    pub async fn create_manual_run(&self, mirror: &str, request_id: &str, now: i64) -> Result<RunRecord, StoreError> {
+    pub async fn create_manual_run<F>(
+        &self,
+        mirror: &str,
+        request_id: &str,
+        now: i64,
+        policy: F,
+    ) -> Result<RunRecord, StoreError>
+    where
+        F: FnOnce(&str) -> Result<RunPolicySnapshot, StoreError> + Send + 'static,
+    {
         let mirror = mirror.to_owned();
         let request_id = request_id.to_owned();
         self.call(move |connection| {
@@ -405,7 +532,9 @@ impl Store {
         }
         let current = transaction
             .query_row(
-                "SELECT managed,enabled,owner_node,current_generation FROM mirrors WHERE name=?1",
+                "SELECT m.managed,m.enabled,m.owner_node,m.current_generation,g.config_toml
+                 FROM mirrors m JOIN mirror_generations g ON g.mirror_name=m.name AND g.generation=m.current_generation
+                 WHERE m.name=?1",
                 [&mirror],
                 |row| {
                     Ok((
@@ -413,6 +542,7 @@ impl Store {
                         row.get::<_, bool>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, u64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
@@ -431,17 +561,32 @@ impl Store {
         {
             return Err(StoreError::MirrorBusy { run_id });
         }
+        let policy = policy(&current.4)?;
         let run_id = RunId::new().to_string();
         transaction.execute(
             "INSERT INTO runs(id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,max_attempts,retry_delay_ms,manual_request_id)
-             SELECT ?1,?2,?3,?4,'manual','pending',?5,1,0,?6",
-            params![run_id, mirror, current.3, current.2, now, request_id],
+             VALUES(?1,?2,?3,?4,'manual','pending',?5,?6,?7,?8)",
+            params![
+                run_id,
+                mirror,
+                current.3,
+                current.2,
+                now,
+                policy.max_attempts,
+                policy.retry_delay_ms,
+                request_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE mirror_schedule_state SET catch_up_pending=0,catch_up_since_ms=NULL WHERE mirror_name=?1",
+            [&mirror],
         )?;
         transaction.commit()?;
         connection
             .query_row(
                 "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,finished_at_ms,
-                 final_exit_code,failure_kind,failure_message FROM runs WHERE id=?1",
+                 final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,scheduled_for_at_ms,
+                 retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE id=?1",
                 [&run_id],
                 map_run,
             )
@@ -626,7 +771,8 @@ impl Store {
         let id = id.to_owned();
         self.call(move |connection| Ok(connection.query_row(
             "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,finished_at_ms,
-             final_exit_code,failure_kind,failure_message FROM runs WHERE id=?1",
+             final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,scheduled_for_at_ms,
+             retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE id=?1",
             [id], map_run,
         ).optional()?))
         .await
@@ -636,7 +782,8 @@ impl Store {
         self.call(|connection| {
         let mut statement = connection.prepare(
             "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,finished_at_ms,
-             final_exit_code,failure_kind,failure_message FROM runs ORDER BY created_at_ms DESC",
+             final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,scheduled_for_at_ms,
+             retry_due_at_ms,cancel_requested_at_ms FROM runs ORDER BY created_at_ms DESC",
         )?;
         statement
             .query_map([], map_run)?
@@ -720,6 +867,53 @@ impl Store {
         })
         .await
     }
+}
+
+fn reconcile_schedule(
+    transaction: &Transaction<'_>,
+    change: &ConfigChange,
+    document: &MirrorDocument,
+    owner_node: &str,
+    previous: Option<&(bool, bool, String)>,
+    now: i64,
+) -> Result<(), StoreError> {
+    let Some(schedule) = document.schedule.as_ref().filter(|_| document.mirror.enabled) else {
+        transaction.execute(
+            "DELETE FROM mirror_schedule_state WHERE mirror_name=?1",
+            [&change.mirror],
+        )?;
+        return Ok(());
+    };
+    let schedule_hash = schedule.semantic_hash();
+    let existing_hash: Option<String> = transaction
+        .query_row(
+            "SELECT schedule_hash FROM mirror_schedule_state WHERE mirror_name=?1",
+            [&change.mirror],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let reset = matches!(change.kind, ChangeKind::Create | ChangeKind::Move)
+        || previous.is_none_or(|(managed, enabled, owner)| !managed || !enabled || owner != owner_node)
+        || existing_hash.as_deref() != Some(&schedule_hash);
+    if reset {
+        let runtime = activate_schedule(schedule, now).map_err(StoreError::InvalidConfig)?;
+        transaction.execute(
+            "INSERT INTO mirror_schedule_state(
+               mirror_name,schedule_hash,next_due_at_ms,last_evaluated_at_ms,catch_up_pending,catch_up_since_ms
+             ) VALUES(?1,?2,?3,?4,0,NULL)
+             ON CONFLICT(mirror_name) DO UPDATE SET
+               schedule_hash=excluded.schedule_hash,next_due_at_ms=excluded.next_due_at_ms,
+               last_evaluated_at_ms=excluded.last_evaluated_at_ms,catch_up_pending=0,catch_up_since_ms=NULL",
+            params![
+                change.mirror,
+                schedule_hash,
+                runtime.next_due_at_ms,
+                runtime.last_evaluated_at_ms
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Result<ConfigPlan, StoreError> {
@@ -811,7 +1005,8 @@ fn cancel_undispatched_pending(transaction: &Transaction<'_>, mirror: &str, now:
 fn find_run_by_request(transaction: &Transaction<'_>, request_id: &str) -> Result<Option<RunRecord>, StoreError> {
     Ok(transaction.query_row(
         "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,finished_at_ms,
-         final_exit_code,failure_kind,failure_message FROM runs WHERE manual_request_id=?1",
+         final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,scheduled_for_at_ms,
+         retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE manual_request_id=?1",
         [request_id], map_run,
     ).optional()?)
 }
@@ -831,6 +1026,11 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         final_exit_code: row.get(9)?,
         failure_kind: row.get(10)?,
         failure_message: row.get(11)?,
+        max_attempts: row.get(12)?,
+        retry_delay_ms: row.get(13)?,
+        scheduled_for_at_ms: row.get(14)?,
+        retry_due_at_ms: row.get(15)?,
+        cancel_requested_at_ms: row.get(16)?,
     })
 }
 
@@ -972,6 +1172,18 @@ mod tests {
         .expect("valid")
     }
 
+    fn scheduled_bundle(program: &str, interval: &str, max_attempts: u32) -> CanonicalBundle {
+        canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: format!(
+                    "[mirror]\nname='demo'\ntarget='demo'\n[schedule]\ninterval='{interval}'\n[sync]\ntype='command'\nprogram='{program}'\n[run]\nmax_attempts={max_attempts}\nretry_delay_seconds=5\n"
+                ),
+            }],
+        })
+        .expect("valid")
+    }
+
     async fn poll(store: &Store) -> PollAction {
         store
             .poll_action("node-a", 20, |_| {
@@ -991,6 +1203,15 @@ mod tests {
             .await
             .expect("poll")
             .expect("action")
+    }
+
+    fn policy(config: &str) -> Result<RunPolicySnapshot, StoreError> {
+        let document: MirrorDocument =
+            toml::from_str(config).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+        Ok(RunPolicySnapshot {
+            max_attempts: document.run.max_attempts,
+            retry_delay_ms: document.run.retry_delay_seconds * 1_000,
+        })
     }
 
     #[tokio::test]
@@ -1106,16 +1327,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_state_is_coalesced_and_preserved_by_unrelated_updates() {
+        let store = Store::open_in_memory().await.expect("open");
+        let initial = scheduled_bundle("/bin/true", "1h", 3);
+        store.apply(&initial, 0, "test", 1_000).await.expect("apply");
+        let mirror = store.get_mirror("demo").await.expect("query").expect("mirror");
+        assert_eq!(mirror.next_due_at_ms, Some(3_601_000));
+        assert_eq!(store.earliest_wakeup().await.expect("wakeup"), Some(3_601_000));
+
+        let evaluated = store
+            .evaluate_due_schedules(10_000_000, |source| {
+                let document: lmt_core::MirrorDocument = toml::from_str(&source.config_toml)
+                    .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                Ok(lmt_core::evaluate_schedule_due(
+                    document.schedule.as_ref().expect("schedule"),
+                    source.runtime,
+                    10_000_000,
+                    source.has_active_run,
+                )
+                .map_err(StoreError::InvalidConfig)?
+                .runtime)
+            })
+            .await
+            .expect("tick");
+        assert_eq!(evaluated, 1);
+        let due = store.get_mirror("demo").await.expect("query").expect("mirror");
+        assert_eq!(due.scheduled_due_since_ms, Some(3_601_000));
+        assert_eq!(due.next_due_at_ms, None);
+
+        let unrelated = scheduled_bundle("/bin/false", "60m", 3);
+        store.apply(&unrelated, 1, "test", 20_000_000).await.expect("update");
+        let preserved = store.get_mirror("demo").await.expect("query").expect("mirror");
+        assert_eq!(preserved.scheduled_due_since_ms, Some(3_601_000));
+        assert_eq!(preserved.next_due_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn manual_run_snapshots_generation_policy_and_clears_due_intent() {
+        let store = Store::open_in_memory().await.expect("open");
+        store
+            .apply(&scheduled_bundle("/bin/true", "1h", 3), 0, "test", 0)
+            .await
+            .expect("apply");
+        store
+            .evaluate_due_schedules(3_600_000, |source| {
+                Ok(ScheduleRuntime {
+                    next_due_at_ms: None,
+                    last_evaluated_at_ms: Some(3_600_000),
+                    catch_up_pending: true,
+                    catch_up_since_ms: source.runtime.next_due_at_ms,
+                })
+            })
+            .await
+            .expect("due");
+        let run = store
+            .create_manual_run("demo", "request", 4_000_000, |config| {
+                let document: lmt_core::MirrorDocument =
+                    toml::from_str(config).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                Ok(RunPolicySnapshot {
+                    max_attempts: document.run.max_attempts,
+                    retry_delay_ms: document.run.retry_delay_seconds * 1_000,
+                })
+            })
+            .await
+            .expect("run");
+        assert_eq!(run.max_attempts, 3);
+        assert_eq!(run.retry_delay_ms, 5_000);
+        assert_eq!(
+            store
+                .get_mirror("demo")
+                .await
+                .expect("query")
+                .expect("mirror")
+                .scheduled_due_since_ms,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn manual_request_and_active_run_are_idempotent() {
         let store = Store::open_in_memory().await.expect("open");
         store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
-        let first = store.create_manual_run("demo", "request-1", 20).await.expect("run");
+        let first = store
+            .create_manual_run("demo", "request-1", 20, policy)
+            .await
+            .expect("run");
         assert_eq!(
-            store.create_manual_run("demo", "request-1", 30).await.expect("same").id,
+            store
+                .create_manual_run("demo", "request-1", 30, policy)
+                .await
+                .expect("same")
+                .id,
             first.id
         );
         assert!(matches!(
-            store.create_manual_run("demo", "request-2", 40).await,
+            store.create_manual_run("demo", "request-2", 40, policy).await,
             Err(StoreError::MirrorBusy { .. })
         ));
     }
@@ -1124,7 +1430,10 @@ mod tests {
     async fn duplicate_terminal_event_cannot_regress() {
         let store = Store::open_in_memory().await.expect("open");
         store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
-        let run = store.create_manual_run("demo", "request", 20).await.expect("run");
+        let run = store
+            .create_manual_run("demo", "request", 20, policy)
+            .await
+            .expect("run");
         poll(&store).await;
         let terminal = AttemptEvent {
             event_sequence: 3,
@@ -1156,7 +1465,10 @@ mod tests {
 
         let store = Store::open_in_memory().await.expect("open");
         store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
-        let undispatched = store.create_manual_run("demo", "request-1", 20).await.expect("run");
+        let undispatched = store
+            .create_manual_run("demo", "request-1", 20, policy)
+            .await
+            .expect("run");
         store.apply(&empty, 1, "remove", 30).await.expect("remove");
         assert_eq!(
             store.get_run(&undispatched.id).await.expect("get").expect("run").state,
@@ -1165,7 +1477,10 @@ mod tests {
 
         let store = Store::open_in_memory().await.expect("open");
         store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
-        let dispatched = store.create_manual_run("demo", "request-2", 20).await.expect("run");
+        let dispatched = store
+            .create_manual_run("demo", "request-2", 20, policy)
+            .await
+            .expect("run");
         let first = poll(&store).await;
         store.apply(&empty, 1, "remove", 30).await.expect("remove");
         assert_eq!(

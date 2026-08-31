@@ -1029,6 +1029,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rusqlite",
+ "toml",
 ]
 
 [[package]]

@@ -251,7 +251,7 @@ async fn manual(
     if r.trigger != "manual" || r.request_id.is_empty() {
         return Err(Failure::bad("invalid_request", "invalid manual request"));
     }
-    let result = run_view(s.store.create_manual_run(&name, &r.request_id, now_ms()).await?);
+    let result = run_view(services::create_manual_run(&s.store, &name, &r.request_id, now_ms()).await?);
     s.notify.notify_waiters();
     Ok(Json(result))
 }
@@ -738,7 +738,9 @@ mod tests {
         })
         .expect("bundle");
         store.apply(&bundle, 0, "test", 2).await.expect("apply");
-        let run = store.create_manual_run("demo", "request", 3).await.expect("run");
+        let run = services::create_manual_run(&store, "demo", "request", 3)
+            .await
+            .expect("run");
         services::next_action(&store, "node-a", "/tmp/mirrors", 4)
             .await
             .expect("poll")
