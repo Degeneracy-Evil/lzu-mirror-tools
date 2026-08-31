@@ -1522,6 +1522,18 @@ mod tests {
         .expect("valid")
     }
 
+    fn cron_bundle(program: &str) -> CanonicalBundle {
+        canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: format!(
+                    "[mirror]\nname='demo'\ntarget='demo'\n[schedule]\ncron='* * * * *'\ntimezone='UTC'\n[sync]\ntype='command'\nprogram='{program}'\n"
+                ),
+            }],
+        })
+        .expect("valid")
+    }
+
     async fn poll(store: &Store) -> PollAction {
         poll_at(store, 20).await
     }
@@ -1734,6 +1746,118 @@ mod tests {
         let preserved = store.get_mirror("demo").await.expect("query").expect("mirror");
         assert_eq!(preserved.scheduled_due_since_ms, Some(3_601_000));
         assert_eq!(preserved.next_due_at_ms, None);
+        let action = poll_at(&store, 20_000_001).await;
+        let run = store
+            .get_run(start_fields(&action).0)
+            .await
+            .expect("get")
+            .expect("scheduled run");
+        assert_eq!(run.mirror_generation, 2, "due intent used a stale generation");
+        assert_eq!(run.scheduled_for_at_ms, Some(3_601_000));
+    }
+
+    #[tokio::test]
+    async fn cron_misses_skip_while_busy_then_coalesce_offline_and_wait_at_capacity() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("cron.db");
+        let store = Store::open(&database).await.expect("open");
+        store
+            .apply(&cron_bundle("/bin/true"), 0, "test", 0)
+            .await
+            .expect("apply");
+        let active = store
+            .create_manual_run("demo", "active", 10, policy)
+            .await
+            .expect("active run");
+        store
+            .evaluate_due_schedules(600_000, |source| {
+                let document: MirrorDocument = toml::from_str(&source.config_toml)
+                    .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                Ok(lmt_core::evaluate_schedule_due(
+                    document.schedule.as_ref().expect("schedule"),
+                    source.runtime,
+                    600_000,
+                    source.has_active_run,
+                )
+                .expect("evaluate")
+                .runtime)
+            })
+            .await
+            .expect("busy tick");
+        let skipped = store.get_mirror("demo").await.expect("get").expect("mirror");
+        assert_eq!(skipped.scheduled_due_since_ms, None);
+        assert_eq!(skipped.next_due_at_ms, Some(660_000));
+        store
+            .request_cancellation(&active.id, 610_000, |_| Ok(None))
+            .await
+            .expect("clear active");
+
+        for now in [1_200_000, 1_800_000] {
+            store
+                .evaluate_due_schedules(now, move |source| {
+                    let document: MirrorDocument = toml::from_str(&source.config_toml)
+                        .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                    Ok(lmt_core::evaluate_schedule_due(
+                        document.schedule.as_ref().expect("schedule"),
+                        source.runtime,
+                        now,
+                        source.has_active_run,
+                    )
+                    .expect("evaluate")
+                    .runtime)
+                })
+                .await
+                .expect("offline tick");
+        }
+        let coalesced = store.get_mirror("demo").await.expect("get").expect("mirror");
+        assert_eq!(coalesced.scheduled_due_since_ms, Some(660_000));
+        drop(store);
+
+        let store = Store::open(&database).await.expect("restart");
+        assert_eq!(
+            store
+                .get_mirror("demo")
+                .await
+                .expect("get")
+                .expect("mirror")
+                .scheduled_due_since_ms,
+            Some(660_000)
+        );
+        store
+            .upsert_credential("node-a", "secret", 1_800_001)
+            .await
+            .expect("node");
+        store
+            .observe_node(NodeObservation {
+                node: "node-a".into(),
+                agent_version: "test".into(),
+                agent_instance_id: "instance".into(),
+                active_runs: 1,
+                max_concurrent_runs: 1,
+                mirror_root_free_bytes: None,
+                mirror_root: "/tmp/mirrors".into(),
+                observed_at_ms: 1_800_001,
+            })
+            .await
+            .expect("full");
+        assert!(poll_optional(&store, 1_800_002).await.is_none());
+        assert!(
+            store
+                .list_runs()
+                .await
+                .expect("runs")
+                .iter()
+                .all(|run| run.id == active.id)
+        );
+        assert_eq!(
+            store
+                .get_mirror("demo")
+                .await
+                .expect("get")
+                .expect("mirror")
+                .scheduled_due_since_ms,
+            Some(660_000)
+        );
     }
 
     #[tokio::test]

@@ -160,6 +160,42 @@ impl Harness {
         self.apply().await;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn set_command_policy(
+        &mut self,
+        name: &str,
+        program: &str,
+        args: &[String],
+        timeout: u64,
+        max_attempts: u32,
+        retry_delay_seconds: u64,
+        enabled: bool,
+    ) {
+        let arguments = args
+            .iter()
+            .map(|arg| toml::Value::String(arg.clone()).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.files.insert(
+            format!("nodes/node-a/mirrors/{name}.toml"),
+            format!(
+                "[mirror]\nname='{name}'\nenabled={enabled}\ntarget='{name}'\n[sync]\ntype='command'\nprogram='{program}'\nargs=[{arguments}]\n[run]\ntimeout_seconds={timeout}\nmax_attempts={max_attempts}\nretry_delay_seconds={retry_delay_seconds}\n"
+            ),
+        );
+        self.apply().await;
+    }
+
+    async fn set_rsync_mirror(&mut self, name: &str, source: &Path) {
+        self.files.insert(
+            format!("nodes/node-a/mirrors/{name}.toml"),
+            format!(
+                "[mirror]\nname='{name}'\ntarget='{name}'\n[sync]\ntype='rsync'\nsource='{}/'\nargs=['--archive']\n",
+                source.display()
+            ),
+        );
+        self.apply().await;
+    }
+
     async fn remove_mirror(&mut self, name: &str) {
         self.files.remove(&format!("nodes/node-a/mirrors/{name}.toml"));
         self.apply().await;
@@ -258,6 +294,47 @@ impl Harness {
             .map(|entry| (entry.path(), std::fs::read_to_string(entry.path()).ok()))
             .collect::<Vec<_>>();
         panic!("run {id} did not reach {expected:?}; last state was {observed:?}; spool={spool:?}")
+    }
+
+    async fn detail(&self, id: &str) -> Option<RunDetail> {
+        let response = self
+            .client
+            .get(format!("{}/api/v1alpha1/runs/{id}", self.server_url()))
+            .bearer_auth(OPERATOR_TOKEN)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        Some(response.json().await.expect("run detail"))
+    }
+
+    async fn wait_retry_delay(&self, id: &str) -> RunDetail {
+        for _ in 0..150 {
+            if let Some(detail) = self.detail(id).await
+                && detail.run.state == RunState::Running
+                && detail.run.retry_due_at.is_some()
+                && detail.attempts.len() == 1
+                && detail.attempts[0].state.is_terminal()
+            {
+                return detail;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("run {id} did not enter retry delay")
+    }
+
+    async fn cancel(&self, id: &str) {
+        self.checked(
+            self.client
+                .post(format!("{}/api/v1alpha1/runs/{id}/cancel", self.server_url()))
+                .bearer_auth(OPERATOR_TOKEN)
+                .send()
+                .await
+                .expect("cancel request"),
+        )
+        .await;
     }
 
     async fn logs(&self, id: &str) -> (String, bool) {
@@ -526,4 +603,226 @@ async fn m1_release_fault_matrix() {
         0,
         "terminal acknowledgement was not lost"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn m2_release_fault_matrix() {
+    let mut harness = Harness::new().await;
+    harness.drop_accepted.store(0, Ordering::SeqCst);
+    harness.lose_terminal_ack.store(0, Ordering::SeqCst);
+    let config = fs::read_to_string(&harness.agent_config).await.expect("agent config");
+    fs::write(
+        &harness.agent_config,
+        config.replace("max_concurrent_runs=4", "max_concurrent_runs=1"),
+    )
+    .await
+    .expect("capacity config");
+
+    harness
+        .set_command_policy("pending-cancel", "/bin/true", &[], 10, 1, 0, true)
+        .await;
+    let pending = harness.run("pending-cancel").await;
+    harness.cancel(&pending).await;
+    harness.cancel(&pending).await;
+    let pending = harness.wait_state(&pending, RunState::Cancelled).await;
+    assert!(pending.attempts.is_empty(), "cancel before dispatch created an Attempt");
+
+    harness.start_agent();
+    let retry_counter = harness.directory.path().join("retry-counter");
+    harness
+        .set_command_policy(
+            "retry-success",
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!(
+                    "echo run >> '{}'; [ $(wc -l < '{}') -ge 2 ]",
+                    retry_counter.display(),
+                    retry_counter.display()
+                ),
+            ],
+            10,
+            2,
+            1,
+            true,
+        )
+        .await;
+    let retry = harness.run("retry-success").await;
+    let retry = harness.wait_state(&retry, RunState::Succeeded).await;
+    assert_eq!(retry.attempts.len(), 2);
+    assert_eq!(retry.attempts[0].state, lmt_core::AttemptState::Failed);
+    assert_eq!(retry.attempts[1].state, lmt_core::AttemptState::Succeeded);
+
+    harness
+        .set_command_policy("retry-restart", "/bin/false", &[], 10, 2, 2, true)
+        .await;
+    let retry_restart = harness.run("retry-restart").await;
+    harness.wait_retry_delay(&retry_restart).await;
+    harness.stop_server().await;
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+    harness.restart_server().await;
+    let retry_restart = harness.wait_state(&retry_restart, RunState::Failed).await;
+    assert_eq!(
+        retry_restart.attempts.len(),
+        2,
+        "retry deadline was lost across restart"
+    );
+
+    harness
+        .set_command_policy("disable-retry", "/bin/false", &[], 10, 2, 2, true)
+        .await;
+    let disabled = harness.run("disable-retry").await;
+    harness.wait_retry_delay(&disabled).await;
+    harness
+        .set_command_policy("disable-retry", "/bin/false", &[], 10, 2, 2, false)
+        .await;
+    let disabled = harness.wait_state(&disabled, RunState::Failed).await;
+    tokio::time::sleep(Duration::from_millis(2_300)).await;
+    assert_eq!(disabled.attempts.len(), 1, "disabled mirror dispatched a retry");
+
+    let crash_leader = harness.directory.path().join("m2-crash-leader.pid");
+    let crash_child = harness.directory.path().join("m2-crash-child.pid");
+    harness
+        .set_command_policy(
+            "interrupted-retry",
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!(
+                    "if [ {{attempt}} -eq 1 ]; then echo $$ > '{}'; sleep 30 & echo $! > '{}'; wait; fi",
+                    crash_leader.display(),
+                    crash_child.display()
+                ),
+            ],
+            60,
+            2,
+            1,
+            true,
+        )
+        .await;
+    let interrupted = harness.run("interrupted-retry").await;
+    harness.wait_state(&interrupted, RunState::Running).await;
+    for _ in 0..50 {
+        if crash_leader.exists() && crash_child.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let crash_group = fs::read_to_string(&crash_leader)
+        .await
+        .expect("crash leader")
+        .trim()
+        .parse()
+        .expect("pid");
+    harness.stop_agent().await;
+    let _ = killpg(Pid::from_raw(crash_group), Signal::SIGKILL);
+    harness.start_agent();
+    let interrupted = harness.wait_state(&interrupted, RunState::Succeeded).await;
+    assert_eq!(interrupted.attempts.len(), 2);
+    assert_eq!(interrupted.attempts[0].state, lmt_core::AttemptState::Interrupted);
+
+    harness
+        .set_command_policy(
+            "capacity-a",
+            "/bin/sh",
+            &["-c".into(), "sleep 2".into()],
+            10,
+            1,
+            0,
+            true,
+        )
+        .await;
+    harness
+        .set_command_policy("capacity-b", "/bin/true", &[], 10, 1, 0, true)
+        .await;
+    let capacity_a = harness.run("capacity-a").await;
+    harness.wait_state(&capacity_a, RunState::Running).await;
+    let capacity_b = harness.run("capacity-b").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let waiting = harness.detail(&capacity_b).await.expect("capacity run");
+    assert_eq!(waiting.run.state, RunState::Pending);
+    assert!(waiting.attempts.is_empty(), "full Agent received a new Start");
+    harness.wait_state(&capacity_a, RunState::Succeeded).await;
+    harness.wait_state(&capacity_b, RunState::Succeeded).await;
+
+    let cancel_leader = harness.directory.path().join("cancel-leader.pid");
+    let cancel_child = harness.directory.path().join("cancel-child.pid");
+    harness
+        .set_command_policy(
+            "active-cancel",
+            "/bin/sh",
+            &[
+                "-c".into(),
+                format!(
+                    "echo $$ > '{}'; sleep 30 & echo $! > '{}'; wait",
+                    cancel_leader.display(),
+                    cancel_child.display()
+                ),
+            ],
+            60,
+            1,
+            0,
+            true,
+        )
+        .await;
+    let cancelled = harness.run("active-cancel").await;
+    harness.wait_state(&cancelled, RunState::Running).await;
+    for _ in 0..50 {
+        if cancel_child.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let cancel_child_pid = fs::read_to_string(&cancel_child)
+        .await
+        .expect("cancel child")
+        .trim()
+        .parse()
+        .expect("pid");
+    harness.cancel(&cancelled).await;
+    harness.cancel(&cancelled).await;
+    harness.wait_state(&cancelled, RunState::Cancelled).await;
+    for _ in 0..30 {
+        if kill(Pid::from_raw(cancel_child_pid), None).is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        kill(Pid::from_raw(cancel_child_pid), None).is_err(),
+        "cancel left descendant alive"
+    );
+
+    let rsync_source = harness.directory.path().join("rsync-source");
+    fs::create_dir_all(&rsync_source).await.expect("rsync source");
+    fs::write(rsync_source.join("payload"), b"local-rsync\n")
+        .await
+        .expect("payload");
+    harness.set_rsync_mirror("rsync-local", &rsync_source).await;
+    let rsync = harness.run("rsync-local").await;
+    harness.wait_state(&rsync, RunState::Succeeded).await;
+    assert_eq!(
+        fs::read(harness.directory.path().join("mirrors/rsync-local/payload"))
+            .await
+            .expect("rsync destination"),
+        b"local-rsync\n"
+    );
+
+    let metrics = harness
+        .checked(
+            harness
+                .client
+                .get(format!("{}/metrics", harness.server_url()))
+                .send()
+                .await
+                .expect("metrics"),
+        )
+        .await
+        .text()
+        .await
+        .expect("metrics body");
+    assert!(metrics.contains("lmt_retries_scheduled_total"));
+    assert!(metrics.contains("lmt_cancellations_total{outcome=\"dispatched\"}"));
+    assert!(metrics.contains("lmt_nodes_online 1"));
 }
