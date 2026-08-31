@@ -1,4 +1,4 @@
-# HTTP API v0.1
+# HTTP API v0.2
 
 LMT is CLI-first, but the CLI is a client of the same HTTP API used by automation.
 
@@ -416,3 +416,44 @@ Before stable v1:
 - the server should reject unsupported Agent protocol versions clearly rather than accepting ambiguous behavior.
 
 Before the first stable release, the project should define a concrete API compatibility policy.
+
+
+## 22. M2 Run and Mirror fields
+
+Run trigger becomes a typed manual/scheduled value.
+
+Run responses additionally expose nullable scheduled_for_at, retry_due_at, and cancel_requested_at.
+
+Mirror responses expose derived next_due_at and scheduled_due_since where applicable.
+
+Node responses expose observed max_concurrent_runs.
+
+## 23. M2 cancellation endpoint
+
+~~~text
+POST /api/v1alpha1/runs/{run_id}/cancel
+~~~
+
+No request ID is required because the target Run itself provides idempotent identity.
+
+Repeated requests preserve one cancel_requested_at value.
+
+- terminal Run: unchanged terminal response;
+- safe undispatched Run or retry wait: may become Cancelled immediately;
+- dispatched active work: returns non-terminal Run with cancel intent while Server delivers CancelAttempt.
+
+## 24. M2 Agent protocol changes
+
+Poll capacity adds max_concurrent_runs.
+
+CancelAttempt adds spec_hash.
+
+One action is returned per poll according to the priority defined in m2-design.md.
+
+## 25. M2 query behavior
+
+Run list should support trigger filtering.
+
+Run detail shows all Attempts plus retry/cancel metadata.
+
+Mirror detail includes scheduler-derived timing status; TOML remains the source of schedule expression itself.

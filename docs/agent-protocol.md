@@ -340,7 +340,7 @@ The agent therefore captures output locally and uploads it incrementally to the 
 A conceptual endpoint is:
 
 ```text
-POST /api/v1/agent/attempts/{run_id}/{attempt}/logs
+PUT /api/v1alpha1/agent/attempts/{run_id}/{attempt}/log
 ```
 
 Log upload uses byte offsets or chunk sequence numbers so retransmission is idempotent. The server acknowledges the highest durably stored offset.
@@ -356,3 +356,48 @@ The server stores the log bytes in its central log directory rather than inside 
 The local agent copy is a temporary spool and may be removed after the server has acknowledged both the terminal result and all log bytes.
 
 This built-in central Run log path is distinct from daemon observability logs. `tracing` output from `lmt-server` and `lmt-agent` still goes to journald and may optionally be collected by Loki.
+
+
+## 16. M2 Agent capacity
+
+Poll capacity additionally reports max_concurrent_runs.
+
+The Server does not offer new StartAttempt work while active_runs is greater than or equal to max_concurrent_runs. Cancellation remains deliverable regardless of capacity.
+
+## 17. M2 CancelAttempt
+
+Cancel action becomes:
+
+~~~text
+CancelAttempt {
+  run_id,
+  attempt,
+  spec_hash
+}
+~~~
+
+The spec hash protects against message reordering and integrity conflicts.
+
+If an Agent receives CancelAttempt for an execution key it has never seen, it persists a durable cancellation tombstone containing the key and hash. A later StartAttempt with the same hash is never executed and reconciles Cancelled. A later StartAttempt with a different hash is a protocol-integrity error and is never executed.
+
+For an active Attempt, cancellation is persisted locally, then the Agent terminates the Attempt-specific process group and records Attempt Cancelled. Duplicate CancelAttempt messages are harmless.
+
+## 18. M2 action priority
+
+Each poll returns at most one action.
+
+Priority:
+
+1. cancellation;
+2. already-dispatched Start redelivery;
+3. manual initial dispatch;
+4. retry dispatch;
+5. Scheduled due materialization.
+
+The database remains the durable action source. Long-poll memory state is never authoritative.
+
+## 19. M2 retry responsibility
+
+The Agent never calculates retry deadlines and never creates retry Attempts.
+
+Retry remains entirely a Server decision. The Agent only executes immutable Attempt RunSpecs and reports results.
