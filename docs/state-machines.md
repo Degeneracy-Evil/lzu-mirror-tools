@@ -1,4 +1,4 @@
-# State Machines v0.1
+# State Machines v0.2
 
 This document defines the externally visible Run state and the more detailed internal Attempt state.
 
@@ -342,3 +342,32 @@ enum AttemptState {
 Database/API conversion should be explicit and tested exhaustively.
 
 The implementation should centralize state-transition validation rather than scattering direct SQL updates throughout handlers.
+
+
+## 19. M2 retry state
+
+M2 does not add a public Retrying state.
+
+After a retryable terminal Attempt, if retry remains eligible, the Run remains Running and retry_due_at is persisted. No next Attempt exists during the delay. At or after the deadline, the Server may create Attempt N+1 on an eligible owner-Agent poll.
+
+Retryable Attempt outcomes are Failed, TimedOut, and Interrupted. Rejected, Cancelled, Succeeded, and permanent invalid-result failures do not retry.
+
+## 20. M2 cancellation state
+
+M2 does not add a public Cancelling state.
+
+Cancellation is persistent Run intent in cancel_requested_at.
+
+Before dispatch, cancellation can terminalize the Run immediately. After dispatch, the Server repeatedly delivers CancelAttempt until Agent terminal reconciliation.
+
+CancelAttempt includes spec_hash. If Cancel arrives before a delayed Start, the Agent persists a cancellation tombstone and the later matching Start cannot execute.
+
+Natural terminal completion already durably observed by the Agent is preserved; otherwise cancellation takes control and produces Attempt Cancelled.
+
+## 21. Config eligibility during retry
+
+Disable, removal, or owner move suppresses future retry Attempts.
+
+It does not implicitly cancel an already-dispatched Attempt. A Run waiting only for retry is finalized from its previous terminal Attempt when it becomes ineligible.
+
+See m2-design.md for the authoritative M2 transition rules.

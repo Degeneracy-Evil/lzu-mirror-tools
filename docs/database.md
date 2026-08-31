@@ -1,4 +1,4 @@
-# Central Database Schema v0.1
+# Central Database Schema v0.2
 
 LMT v0.1 uses one authoritative SQLite database on the machine running `lmt-server`.
 
@@ -439,3 +439,54 @@ Because the database is authoritative control-plane state, LMT should eventually
 The first implementation may wrap SQLite's online backup API rather than relying on copying a live WAL database by hand.
 
 Mirror files themselves are not part of this control-plane backup.
+
+
+## 18. M2 asynchronous Store boundary
+
+M2 retains one SQLite connection but moves connection execution to a dedicated background thread behind an async Store handle.
+
+This prevents synchronous SQLite work from blocking Axum/Tokio worker threads without adding a pool or changing databases.
+
+## 19. M2 ordered migrations
+
+The accepted M1 schema becomes ordered migration 0001. M2 additions are migration 0002.
+
+The migration runner applies missing versions transactionally and refuses a database newer than the binary.
+
+M1-to-M2 upgrade with populated state is a release-gating test.
+
+## 20. M2 schema additions
+
+Conceptually schema v2 adds:
+
+~~~text
+mirror_schedule_state.schedule_hash
+nodes.max_concurrent_runs
+runs.scheduled_for_at_ms
+runs.retry_due_at_ms
+~~~
+
+plus indexes for earliest schedule and retry deadlines.
+
+The existing catch_up_pending/catch_up_since_ms fields remain and represent one coalesced scheduled due intent.
+
+No queue table is introduced.
+
+## 21. M2 clock rule
+
+Store operations that persist scheduler/retry deadlines receive Server time explicitly.
+
+Agent timestamps do not determine future deadlines.
+
+## 22. M2 transactional operations
+
+M2 adds four especially important transaction classes:
+
+- schedule due evaluation;
+- Scheduled Run materialization plus first dispatch;
+- terminal Attempt retry/final decision plus interval re-arm;
+- retry Attempt creation/dispatch.
+
+Cancellation intent is transactional and terminalizes immediately only when no Attempt may already have been dispatched.
+
+See m2-design.md for exact eligibility and priority rules.
