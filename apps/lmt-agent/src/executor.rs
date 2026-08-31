@@ -7,7 +7,6 @@ use std::{
 
 use lmt_core::{AttemptState, FailureKind};
 use nix::{
-    errno::Errno,
     sys::prctl,
     sys::signal::{Signal, killpg},
     sys::wait::{WaitPidFlag, WaitStatus, waitpid},
@@ -94,11 +93,7 @@ pub async fn execute(
         changed = shutdown.changed() => { let _ = changed; Outcome::Shutdown },
         changed = cancel.changed() => { let _ = changed; Outcome::Cancelled },
     };
-    terminate_group(process_group).await;
-    if !matches!(outcome, Outcome::Process(_)) {
-        let _ = child.wait().await;
-    }
-    reap_group(process_group).await;
+    close_process_group(process_group, &mut child, matches!(outcome, Outcome::Process(_))).await;
     let _ = capture.await;
     let _guard = spool_lock.lock().await;
     if let Ok(latest) = read(path).await {
@@ -170,6 +165,14 @@ async fn terminate_group(group: Option<Pid>) {
     }
 }
 
+async fn close_process_group(group: Option<Pid>, child: &mut tokio::process::Child, child_completed: bool) {
+    terminate_group(group).await;
+    if !child_completed {
+        let _ = child.wait().await;
+    }
+    reap_group(group).await;
+}
+
 async fn reap_group(group: Option<Pid>) {
     let Some(group) = group else {
         return;
@@ -180,7 +183,6 @@ async fn reap_group(group: Option<Pid>) {
         match waitpid(group, Some(WaitPidFlag::WNOHANG)) {
             Ok(WaitStatus::StillAlive) => {}
             Ok(_) => continue,
-            Err(Errno::ECHILD) => return,
             Err(_) => return,
         }
         if tokio::time::Instant::now() >= deadline {
