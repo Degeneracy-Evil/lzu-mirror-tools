@@ -7,7 +7,11 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
 hex.workspace = true
+humantime.workspace = true
 serde.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
@@ -16,4 +20,3 @@ ulid.workspace = true
 
 [lints]
 workspace = true
-

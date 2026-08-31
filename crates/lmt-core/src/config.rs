@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{AttemptNo, MirrorName, NodeName, ProcessRunSpec, RunId};
+use crate::{AttemptNo, MirrorName, NodeName, ProcessRunSpec, RunId, ScheduleConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -23,7 +23,9 @@ pub struct ConfigBundle {
 #[serde(deny_unknown_fields)]
 pub struct MirrorDocument {
     pub mirror: MirrorConfig,
-    pub sync: CommandSync,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
+    pub sync: SyncConfig,
     #[serde(default)]
     pub runner: ProcessRunner,
     #[serde(default)]
@@ -46,20 +48,19 @@ const fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct CommandSync {
-    #[serde(rename = "type")]
-    pub kind: CommandKind,
-    pub program: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    pub cwd: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum CommandKind {
-    Command,
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SyncConfig {
+    Command {
+        program: String,
+        #[serde(default)]
+        args: Vec<String>,
+        cwd: Option<String>,
+    },
+    Rsync {
+        source: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -142,8 +143,14 @@ pub enum ConfigError {
     EmptyProgram,
     #[error("timeout_seconds must be between 1 and 604800")]
     InvalidTimeout,
-    #[error("M1 supports exactly one attempt")]
-    UnsupportedRetries,
+    #[error("max_attempts must be between 1 and 10")]
+    InvalidMaxAttempts,
+    #[error("retry_delay_seconds must not exceed 86400")]
+    InvalidRetryDelay,
+    #[error("rsync source must not be empty")]
+    EmptyRsyncSource,
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
     #[error("unsupported placeholder {0}")]
     UnsupportedPlaceholder(String),
 }
@@ -173,11 +180,25 @@ pub fn compile_process_run_spec(document: &MirrorDocument, context: &RunSpecCont
             .replace("{mirror_root}", &mirror_root)
             .replace("{target_dir}", &target_dir)
     };
+    let (program, args, cwd) = match &document.sync {
+        SyncConfig::Command { program, args, cwd } => (
+            resolve(program),
+            args.iter().map(|value| resolve(value)).collect(),
+            cwd.as_deref().map(resolve),
+        ),
+        SyncConfig::Rsync { source, args } => {
+            let mut compiled = args.clone();
+            compiled.push("--".into());
+            compiled.push(source.clone());
+            compiled.push(format!("{}/", target_dir.trim_end_matches('/')));
+            ("rsync".into(), compiled, None)
+        }
+    };
     ProcessRunSpec {
         runner: "process".into(),
-        program: resolve(&document.sync.program),
-        args: document.sync.args.iter().map(|value| resolve(value)).collect(),
-        cwd: document.sync.cwd.as_deref().map(resolve),
+        program,
+        args,
+        cwd,
         timeout_seconds: document.run.timeout_seconds,
         mirror_root: mirror_root.into_owned(),
         target_dir,
@@ -232,7 +253,7 @@ fn canonicalize_file(file: &BundleFile) -> Result<(MirrorName, CanonicalMirror),
             path: file.path.clone(),
         })?;
     let stem = path.file_stem().and_then(|value| value.to_str()).unwrap_or_default();
-    let document: MirrorDocument = toml::from_str(&file.contents).map_err(|error| ConfigError::InvalidToml {
+    let mut document: MirrorDocument = toml::from_str(&file.contents).map_err(|error| ConfigError::InvalidToml {
         path: file.path.clone(),
         message: error.to_string(),
     })?;
@@ -243,6 +264,12 @@ fn canonicalize_file(file: &BundleFile) -> Result<(MirrorName, CanonicalMirror),
         });
     }
     validate_document(&document)?;
+    document.schedule = document
+        .schedule
+        .take()
+        .map(ScheduleConfig::canonicalized)
+        .transpose()
+        .map_err(ConfigError::InvalidSchedule)?;
     let canonical_toml = toml::to_string(&document).map_err(|error| ConfigError::InvalidToml {
         path: file.path.clone(),
         message: error.to_string(),
@@ -270,20 +297,29 @@ fn validate_document(document: &MirrorDocument) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::UnsafeTarget(document.mirror.target.clone()));
     }
-    if document.sync.program.is_empty() {
-        return Err(ConfigError::EmptyProgram);
+    match &document.sync {
+        SyncConfig::Command { program, args, cwd } => {
+            if program.is_empty() {
+                return Err(ConfigError::EmptyProgram);
+            }
+            for value in std::iter::once(program).chain(args).chain(cwd.iter()) {
+                validate_placeholders(value)?;
+            }
+        }
+        SyncConfig::Rsync { source, .. } if source.is_empty() => return Err(ConfigError::EmptyRsyncSource),
+        SyncConfig::Rsync { .. } => {}
     }
     if !(1..=604_800).contains(&document.run.timeout_seconds) {
         return Err(ConfigError::InvalidTimeout);
     }
-    if document.run.max_attempts != 1 {
-        return Err(ConfigError::UnsupportedRetries);
+    if !(1..=10).contains(&document.run.max_attempts) {
+        return Err(ConfigError::InvalidMaxAttempts);
     }
-    for value in std::iter::once(&document.sync.program)
-        .chain(document.sync.args.iter())
-        .chain(document.sync.cwd.iter())
-    {
-        validate_placeholders(value)?;
+    if document.run.retry_delay_seconds > 86_400 {
+        return Err(ConfigError::InvalidRetryDelay);
+    }
+    if let Some(schedule) = &document.schedule {
+        schedule.validate().map_err(ConfigError::InvalidSchedule)?;
     }
     Ok(())
 }
@@ -354,5 +390,53 @@ mod tests {
         ] {
             assert!(canonicalize_bundle(&bundle(contents)).is_err());
         }
+    }
+
+    #[test]
+    fn schedule_and_retry_policy_are_strict_and_canonical() {
+        let first = canonicalize_bundle(&bundle(
+            "[mirror]\nname='example'\ntarget='example'\n[schedule]\ninterval='60m'\n[sync]\ntype='command'\nprogram='/bin/true'\n[run]\nmax_attempts=10\nretry_delay_seconds=86400\n",
+        ))
+        .expect("valid");
+        let equivalent = canonicalize_bundle(&bundle(
+            "[mirror]\nname='example'\ntarget='example'\n[schedule]\ninterval='1h'\n[sync]\ntype='command'\nprogram='/bin/true'\n[run]\nmax_attempts=10\nretry_delay_seconds=86400\n",
+        ))
+        .expect("valid");
+        assert_eq!(first.bundle_hash, equivalent.bundle_hash);
+
+        for run in ["max_attempts=0\n", "max_attempts=11\n", "retry_delay_seconds=86401\n"] {
+            assert!(
+                canonicalize_bundle(&bundle(&format!(
+                    "[mirror]\nname='example'\ntarget='example'\n[sync]\ntype='command'\nprogram='/bin/true'\n[run]\n{run}"
+                )))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rsync_compiles_to_the_generic_process_runner() {
+        let canonical = canonicalize_bundle(&bundle(
+            "[mirror]\nname='example'\ntarget='example'\n[sync]\ntype='rsync'\nsource='local/source/'\nargs=['--archive','--delete']\n",
+        ))
+        .expect("valid");
+        let document = &canonical.mirrors.values().next().expect("mirror").document;
+        let mirror = MirrorName::new("example").expect("name");
+        let node = NodeName::new("node-a").expect("node");
+        let spec = compile_process_run_spec(
+            document,
+            &RunSpecContext {
+                mirror_name: &mirror,
+                run_id: RunId::new(),
+                attempt_no: AttemptNo::new(1).expect("attempt"),
+                node_name: &node,
+                mirror_root: Path::new("/srv/mirrors"),
+            },
+        );
+        assert_eq!(spec.program, "rsync");
+        assert_eq!(
+            spec.args,
+            ["--archive", "--delete", "--", "local/source/", "/srv/mirrors/example/"]
+        );
     }
 }
