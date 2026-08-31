@@ -350,6 +350,48 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_step_cron_skips_the_spring_forward_gap() {
+        let every_quarter_hour = ScheduleConfig::Cron {
+            cron: "*/15 * * * *".into(),
+            timezone: "America/New_York".into(),
+        };
+        let before_gap = Utc.with_ymd_and_hms(2025, 3, 9, 6, 59, 0).unwrap().timestamp_millis();
+
+        let next = every_quarter_hour.next_after_ms(before_gap).expect("next occurrence");
+
+        assert_eq!(
+            DateTime::<Utc>::from_timestamp_millis(next).expect("time"),
+            Utc.with_ymd_and_hms(2025, 3, 9, 7, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn wildcard_step_cron_handles_the_fall_back_overlap_without_time_regression() {
+        let every_quarter_hour = ScheduleConfig::Cron {
+            cron: "*/15 * * * *".into(),
+            timezone: "America/New_York".into(),
+        };
+        let during_first_pass = Utc.with_ymd_and_hms(2025, 11, 2, 5, 29, 0).unwrap().timestamp_millis();
+        let first_pass_next = every_quarter_hour
+            .next_after_ms(during_first_pass)
+            .expect("first-pass occurrence");
+        assert_eq!(
+            DateTime::<Utc>::from_timestamp_millis(first_pass_next).expect("time"),
+            Utc.with_ymd_and_hms(2025, 11, 2, 5, 30, 0).unwrap()
+        );
+
+        let end_of_first_pass = Utc.with_ymd_and_hms(2025, 11, 2, 5, 59, 0).unwrap().timestamp_millis();
+        let next = every_quarter_hour
+            .next_after_ms(end_of_first_pass)
+            .expect("post-overlap occurrence");
+
+        assert_eq!(
+            DateTime::<Utc>::from_timestamp_millis(next).expect("time"),
+            Utc.with_ymd_and_hms(2025, 11, 2, 7, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
     fn due_intent_coalesces_and_retry_stays_in_run() {
         let cron = ScheduleConfig::Cron {
             cron: "* * * * *".into(),
