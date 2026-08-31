@@ -370,25 +370,24 @@ async fn event(
 ) -> Result<Json<EventResponse>, Failure> {
     let node = agent(&h, &s).await?;
     attempt_auth(&s, &node, &id, no).await?;
-    let accepted = s
-        .store
-        .apply_event(
-            &id,
-            no,
-            &AttemptEvent {
-                event_sequence: r.event_sequence,
-                state: r.state,
-                agent_instance_id: r.agent_instance_id,
-                accepted_at_ms: parse_time(r.accepted_at.as_deref())?,
-                started_at_ms: parse_time(r.started_at.as_deref())?,
-                finished_at_ms: parse_time(r.finished_at.as_deref())?,
-                exit_code: r.exit_code,
-                failure_kind: r.failure_kind,
-                failure_message: r.failure_message,
-            },
-            now_ms(),
-        )
-        .await?;
+    let accepted = services::apply_attempt_event(
+        &s.store,
+        &id,
+        no,
+        &AttemptEvent {
+            event_sequence: r.event_sequence,
+            state: r.state,
+            agent_instance_id: r.agent_instance_id,
+            accepted_at_ms: parse_time(r.accepted_at.as_deref())?,
+            started_at_ms: parse_time(r.started_at.as_deref())?,
+            finished_at_ms: parse_time(r.finished_at.as_deref())?,
+            exit_code: r.exit_code,
+            failure_kind: r.failure_kind,
+            failure_message: r.failure_message,
+        },
+        now_ms(),
+    )
+    .await?;
     s.metrics.events.fetch_add(1, Ordering::Relaxed);
     Ok(Json(EventResponse {
         accepted_event_sequence: accepted,
@@ -763,25 +762,25 @@ mod tests {
                 .expect("retry"),
             15
         );
-        store
-            .apply_event(
-                &run.id,
-                1,
-                &AttemptEvent {
-                    event_sequence: 3,
-                    state: lmt_core::AttemptState::Succeeded,
-                    agent_instance_id: "instance".into(),
-                    accepted_at_ms: Some(1),
-                    started_at_ms: Some(2),
-                    finished_at_ms: Some(3),
-                    exit_code: Some(0),
-                    failure_kind: None,
-                    failure_message: None,
-                },
-                5,
-            )
-            .await
-            .expect("event");
+        services::apply_attempt_event(
+            &store,
+            &run.id,
+            1,
+            &AttemptEvent {
+                event_sequence: 3,
+                state: lmt_core::AttemptState::Succeeded,
+                agent_instance_id: "instance".into(),
+                accepted_at_ms: Some(1),
+                started_at_ms: Some(2),
+                finished_at_ms: Some(3),
+                exit_code: Some(0),
+                failure_kind: None,
+                failure_message: None,
+            },
+            5,
+        )
+        .await
+        .expect("event");
         drop(state);
         drop(store);
         let reopened = Store::open(database).await.expect("reopen");

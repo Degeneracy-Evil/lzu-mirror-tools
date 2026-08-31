@@ -6,8 +6,8 @@ use std::{
 };
 
 use lmt_core::{
-    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, ProcessRunSpec, RunId, RunState,
-    ScheduleRuntime, activate_schedule, project_attempt_event,
+    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, ProcessRunSpec, RetryDecision, RunId,
+    RunState, ScheduleRuntime, activate_schedule, project_attempt_event,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -151,9 +151,21 @@ pub struct PollAction {
 
 pub struct DispatchSource {
     pub run_id: String,
+    pub attempt_no: u32,
     pub mirror_name: String,
     pub mirror_generation: u64,
     pub config_toml: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalDecisionSource {
+    pub outcome: AttemptState,
+    pub attempt_no: u32,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+    pub cancel_requested: bool,
+    pub mirror_eligible: bool,
+    pub owner_unchanged: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -328,6 +340,7 @@ impl Store {
                         params![change.mirror, now],
                     )?;
                     cancel_undispatched_pending(&transaction, &change.mirror, now)?;
+                    finalize_ineligible_retries(&transaction, &change.mirror, now)?;
                     transaction.execute("DELETE FROM mirror_schedule_state WHERE mirror_name=?1", [&change.mirror])?;
                 }
                 ChangeKind::Create | ChangeKind::Update | ChangeKind::Move => {
@@ -350,6 +363,9 @@ impl Store {
                     )?;
                     if !mirror.document.mirror.enabled {
                         cancel_undispatched_pending(&transaction, &change.mirror, now)?;
+                        finalize_ineligible_retries(&transaction, &change.mirror, now)?;
+                    } else if change.kind == ChangeKind::Move {
+                        finalize_ineligible_retries(&transaction, &change.mirror, now)?;
                     }
                     transaction.execute(
                         "INSERT INTO mirror_generations(mirror_name,generation,config_revision,owner_node,config_hash,config_toml,created_at_ms)
@@ -602,89 +618,105 @@ impl Store {
     {
         let node = node.to_owned();
         self.call(move |connection| {
-        let transaction = connection.transaction()?;
-        let pending: Option<(String, String, u64)> = transaction
-            .query_row(
-                "SELECT r.id,r.mirror_name,r.mirror_generation FROM runs r JOIN mirrors m ON m.name=r.mirror_name
-                 WHERE r.owner_node=?1 AND r.state='pending' AND ((m.managed=1 AND m.enabled=1) OR EXISTS(
-                   SELECT 1 FROM attempts a WHERE a.run_id=r.id AND a.dispatch_count>0))
-                 ORDER BY r.created_at_ms LIMIT 1",
-                [&node],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((run_id, mirror_name, generation)) = pending else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let existing: Option<PollAction> = transaction
-            .query_row(
-                "SELECT spec_hash,spec_json FROM attempts WHERE run_id=?1 AND attempt_no=1 AND state='queued'",
-                [&run_id],
-                |row| {
-                    let spec_json: String = row.get(1)?;
-                    let spec = serde_json::from_str(&spec_json).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            spec_json.len(),
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    Ok(PollAction {
-                        run_id: run_id.clone(),
-                        attempt_no: 1,
-                        spec_hash: row.get(0)?,
-                        spec,
-                    })
-                },
-            )
-            .optional()?;
-        if let Some(mut action) = existing {
-            transaction.execute(
-                "UPDATE attempts SET dispatch_count=dispatch_count+1,last_dispatch_at_ms=?2 WHERE run_id=?1 AND attempt_no=1",
-                params![run_id, now],
+            let transaction = connection.transaction()?;
+            let redelivery = transaction
+                .query_row(
+                    "SELECT a.run_id,a.attempt_no,a.spec_hash,a.spec_json
+                     FROM attempts a JOIN runs r ON r.id=a.run_id
+                     WHERE r.owner_node=?1 AND r.state IN('pending','running')
+                       AND a.state='queued' AND a.dispatch_count>0
+                     ORDER BY a.last_dispatch_at_ms,a.run_id,a.attempt_no LIMIT 1",
+                    [&node],
+                    map_poll_action,
+                )
+                .optional()?;
+            if let Some(action) = redelivery {
+                transaction.execute(
+                    "UPDATE attempts SET dispatch_count=dispatch_count+1,last_dispatch_at_ms=?3
+                     WHERE run_id=?1 AND attempt_no=?2",
+                    params![action.run_id, action.attempt_no, now],
+                )?;
+                transaction.commit()?;
+                return Ok(Some(action));
+            }
+
+            let initial: Option<(String, String, u64, u32)> = transaction
+                .query_row(
+                    "SELECT r.id,r.mirror_name,r.mirror_generation,1
+                     FROM runs r JOIN mirrors m ON m.name=r.mirror_name
+                     WHERE r.owner_node=?1 AND r.state='pending' AND m.managed=1 AND m.enabled=1
+                       AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.run_id=r.id)
+                     ORDER BY r.created_at_ms LIMIT 1",
+                    [&node],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            let candidate = if initial.is_some() {
+                initial
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT r.id,r.mirror_name,r.mirror_generation,r.attempt_count+1
+                         FROM runs r JOIN mirrors m ON m.name=r.mirror_name
+                         WHERE r.owner_node=?1 AND r.state='running' AND r.retry_due_at_ms<=?2
+                           AND r.cancel_requested_at_ms IS NULL AND m.managed=1 AND m.enabled=1
+                           AND m.owner_node=r.owner_node AND r.attempt_count<r.max_attempts
+                         ORDER BY r.retry_due_at_ms,r.created_at_ms LIMIT 1",
+                        params![node, now],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?
+            };
+            let Some((run_id, mirror_name, generation, attempt_no)) = candidate else {
+                transaction.commit()?;
+                return Ok(None);
+            };
+            let config_toml: String = transaction.query_row(
+                "SELECT config_toml FROM mirror_generations WHERE mirror_name=?1 AND generation=?2",
+                params![mirror_name, generation],
+                |row| row.get(0),
             )?;
-            action.run_id = run_id;
+            let source = DispatchSource {
+                run_id: run_id.clone(),
+                attempt_no,
+                mirror_name,
+                mirror_generation: generation,
+                config_toml,
+            };
+            let (spec, spec_hash) = compile(&source)?;
+            let spec_json = serde_json::to_string(&spec)?;
+            transaction.execute(
+                "INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,
+                   last_event_sequence,dispatch_count,last_dispatch_at_ms)
+                 VALUES(?1,?2,'queued',?3,?4,?5,0,1,?5)",
+                params![run_id, attempt_no, spec_hash, spec_json, now],
+            )?;
+            transaction.execute(
+                "UPDATE runs SET attempt_count=?2,retry_due_at_ms=NULL WHERE id=?1",
+                params![run_id, attempt_no],
+            )?;
             transaction.commit()?;
-            return Ok(Some(action));
-        }
-        let config_toml: String = transaction.query_row(
-            "SELECT config_toml FROM mirror_generations WHERE mirror_name=?1 AND generation=?2",
-            params![mirror_name, generation],
-            |row| row.get(0),
-        )?;
-        let source = DispatchSource {
-            run_id: run_id.clone(),
-            mirror_name,
-            mirror_generation: generation,
-            config_toml,
-        };
-        let (spec, spec_hash) = compile(&source)?;
-        let spec_json = serde_json::to_string(&spec)?;
-        transaction.execute(
-            "INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,last_event_sequence,dispatch_count,last_dispatch_at_ms)
-             VALUES(?1,1,'queued',?2,?3,?4,0,1,?4)",
-            params![run_id, spec_hash, spec_json, now],
-        )?;
-        transaction.execute("UPDATE runs SET attempt_count=1 WHERE id=?1", [&run_id])?;
-        transaction.commit()?;
-        Ok(Some(PollAction {
-            run_id,
-            attempt_no: 1,
-            spec_hash,
-            spec,
-        }))
+            Ok(Some(PollAction {
+                run_id,
+                attempt_no,
+                spec_hash,
+                spec,
+            }))
         })
         .await
     }
 
-    pub async fn apply_event(
+    pub async fn apply_event<F>(
         &self,
         run_id: &str,
         attempt_no: u32,
         event: &AttemptEvent,
         now: i64,
-    ) -> Result<u64, StoreError> {
+        decide_terminal: F,
+    ) -> Result<u64, StoreError>
+    where
+        F: FnOnce(TerminalDecisionSource, i64) -> RetryDecision + Send + 'static,
+    {
         let run_id = run_id.to_owned();
         let event = event.clone();
         self.call(move |connection| {
@@ -731,21 +763,50 @@ impl Store {
                 "UPDATE runs SET state='running',started_at_ms=COALESCE(started_at_ms,?2) WHERE id=?1 AND state='pending'",
                 params![run_id, projection.run_started_at_ms.unwrap_or(now)],
             )?;
-        } else if let Some(run_state) = projection.run_state {
-            transaction.execute(
-                "UPDATE runs SET state=?2,started_at_ms=COALESCE(started_at_ms,?3),finished_at_ms=?4,
-                 final_exit_code=?5,failure_kind=?6,failure_message=?7
-                 WHERE id=?1 AND state IN ('pending','running')",
-                params![
-                    run_id,
-                    run_state_str(run_state),
-                    projection.run_started_at_ms,
-                    projection.run_finished_at_ms.unwrap_or(now),
-                    event.exit_code,
-                    event.failure_kind.map(failure_kind_str),
-                    event.failure_message,
-                ],
+        } else if projection.run_state.is_some() {
+            let source = transaction.query_row(
+                "SELECT r.max_attempts,r.retry_delay_ms,r.cancel_requested_at_ms IS NOT NULL,
+                   m.managed=1 AND m.enabled=1,m.owner_node=r.owner_node
+                 FROM runs r JOIN mirrors m ON m.name=r.mirror_name WHERE r.id=?1",
+                [&run_id],
+                |row| {
+                    Ok(TerminalDecisionSource {
+                        outcome: event.state,
+                        attempt_no,
+                        max_attempts: row.get(0)?,
+                        retry_delay_ms: row.get(1)?,
+                        cancel_requested: row.get(2)?,
+                        mirror_eligible: row.get(3)?,
+                        owner_unchanged: row.get(4)?,
+                    })
+                },
             )?;
+            match decide_terminal(source, now) {
+                RetryDecision::Schedule { retry_due_at_ms } => {
+                    transaction.execute(
+                        "UPDATE runs SET state='running',started_at_ms=COALESCE(started_at_ms,?2),
+                           retry_due_at_ms=?3,finished_at_ms=NULL,final_exit_code=NULL,
+                           failure_kind=NULL,failure_message=NULL WHERE id=?1 AND state IN('pending','running')",
+                        params![run_id, projection.run_started_at_ms, retry_due_at_ms],
+                    )?;
+                }
+                RetryDecision::Final(run_state) => {
+                    transaction.execute(
+                        "UPDATE runs SET state=?2,started_at_ms=COALESCE(started_at_ms,?3),finished_at_ms=?4,
+                           retry_due_at_ms=NULL,final_exit_code=?5,failure_kind=?6,failure_message=?7
+                         WHERE id=?1 AND state IN('pending','running')",
+                        params![
+                            run_id,
+                            run_state_str(run_state),
+                            projection.run_started_at_ms,
+                            projection.run_finished_at_ms.unwrap_or(now),
+                            event.exit_code,
+                            event.failure_kind.map(failure_kind_str),
+                            event.failure_message,
+                        ],
+                    )?;
+                }
+            }
         }
         transaction.commit()?;
         Ok(event.event_sequence)
@@ -1002,6 +1063,40 @@ fn cancel_undispatched_pending(transaction: &Transaction<'_>, mirror: &str, now:
     Ok(())
 }
 
+fn finalize_ineligible_retries(transaction: &Transaction<'_>, mirror: &str, now: i64) -> Result<(), StoreError> {
+    let waiting = {
+        let mut statement = transaction.prepare(
+            "SELECT r.id,a.state,a.exit_code,a.failure_kind,a.failure_message
+             FROM runs r JOIN attempts a ON a.run_id=r.id AND a.attempt_no=r.attempt_count
+             WHERE r.mirror_name=?1 AND r.state='running' AND r.retry_due_at_ms IS NOT NULL",
+        )?;
+        statement
+            .query_map([mirror], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i32>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    for (run_id, attempt_state, exit_code, failure_kind, failure_message) in waiting {
+        let state = if attempt_state == "timed_out" {
+            "timed_out"
+        } else {
+            "failed"
+        };
+        transaction.execute(
+            "UPDATE runs SET state=?2,finished_at_ms=?3,retry_due_at_ms=NULL,final_exit_code=?4,
+               failure_kind=?5,failure_message=?6 WHERE id=?1",
+            params![run_id, state, now, exit_code, failure_kind, failure_message],
+        )?;
+    }
+    Ok(())
+}
+
 fn find_run_by_request(transaction: &Transaction<'_>, request_id: &str) -> Result<Option<RunRecord>, StoreError> {
     Ok(transaction.query_row(
         "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,finished_at_ms,
@@ -1031,6 +1126,18 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
         scheduled_for_at_ms: row.get(14)?,
         retry_due_at_ms: row.get(15)?,
         cancel_requested_at_ms: row.get(16)?,
+    })
+}
+
+fn map_poll_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<PollAction> {
+    let spec_json: String = row.get(3)?;
+    Ok(PollAction {
+        run_id: row.get(0)?,
+        attempt_no: row.get(1)?,
+        spec_hash: row.get(2)?,
+        spec: serde_json::from_str(&spec_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(spec_json.len(), rusqlite::types::Type::Text, Box::new(error))
+        })?,
     })
 }
 
@@ -1185,8 +1292,12 @@ mod tests {
     }
 
     async fn poll(store: &Store) -> PollAction {
+        poll_at(store, 20).await
+    }
+
+    async fn poll_at(store: &Store, now: i64) -> PollAction {
         store
-            .poll_action("node-a", 20, |_| {
+            .poll_action("node-a", now, |_| {
                 Ok((
                     ProcessRunSpec {
                         runner: "process".into(),
@@ -1211,6 +1322,19 @@ mod tests {
         Ok(RunPolicySnapshot {
             max_attempts: document.run.max_attempts,
             retry_delay_ms: document.run.retry_delay_seconds * 1_000,
+        })
+    }
+
+    fn decide(source: TerminalDecisionSource, now: i64) -> RetryDecision {
+        lmt_core::decide_retry(lmt_core::RetryContext {
+            outcome: source.outcome,
+            attempt_no: source.attempt_no,
+            max_attempts: source.max_attempts,
+            retry_delay_seconds: source.retry_delay_ms / 1_000,
+            cancel_requested: source.cancel_requested,
+            mirror_eligible: source.mirror_eligible,
+            owner_unchanged: source.owner_unchanged,
+            server_now_ms: now,
         })
     }
 
@@ -1446,17 +1570,140 @@ mod tests {
             failure_kind: None,
             failure_message: None,
         };
-        assert_eq!(store.apply_event(&run.id, 1, &terminal, 30).await.expect("event"), 3);
+        assert_eq!(
+            store
+                .apply_event(&run.id, 1, &terminal, 30, decide)
+                .await
+                .expect("event"),
+            3
+        );
         let late = AttemptEvent {
             event_sequence: 2,
             state: AttemptState::Running,
             ..terminal
         };
-        assert_eq!(store.apply_event(&run.id, 1, &late, 40).await.expect("duplicate"), 3);
+        assert_eq!(
+            store
+                .apply_event(&run.id, 1, &late, 40, decide)
+                .await
+                .expect("duplicate"),
+            3
+        );
         assert_eq!(
             store.get_run(&run.id).await.expect("get").expect("run").state,
             RunState::Succeeded
         );
+    }
+
+    fn terminal_event(state: AttemptState, sequence: u64) -> AttemptEvent {
+        AttemptEvent {
+            event_sequence: sequence,
+            state,
+            agent_instance_id: "agent-1".into(),
+            accepted_at_ms: Some(1),
+            started_at_ms: Some(2),
+            finished_at_ms: Some(3),
+            exit_code: (state == AttemptState::Succeeded).then_some(0).or(Some(1)),
+            failure_kind: None,
+            failure_message: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_outcomes_create_later_attempt_in_the_same_run() {
+        for outcome in [AttemptState::Failed, AttemptState::TimedOut, AttemptState::Interrupted] {
+            let store = Store::open_in_memory().await.expect("open");
+            store
+                .apply(&scheduled_bundle("/bin/true", "1h", 3), 0, "test", 0)
+                .await
+                .expect("apply");
+            let run = store
+                .create_manual_run("demo", &format!("request-{outcome:?}"), 10, policy)
+                .await
+                .expect("run");
+            assert_eq!(poll(&store).await.attempt_no, 1);
+            store
+                .apply_event(&run.id, 1, &terminal_event(outcome, 3), 100, decide)
+                .await
+                .expect("terminal");
+            let waiting = store.get_run(&run.id).await.expect("query").expect("run");
+            assert_eq!(waiting.state, RunState::Running);
+            assert_eq!(waiting.retry_due_at_ms, Some(5_100));
+            assert!(
+                store
+                    .poll_action("node-a", 5_099, |_| unreachable!("retry not due"))
+                    .await
+                    .expect("poll")
+                    .is_none()
+            );
+            assert_eq!(poll_at(&store, 5_100).await.attempt_no, 2);
+            store
+                .apply_event(&run.id, 2, &terminal_event(AttemptState::Succeeded, 3), 6_000, decide)
+                .await
+                .expect("success");
+            let complete = store.get_run(&run.id).await.expect("query").expect("run");
+            assert_eq!(complete.state, RunState::Succeeded);
+            assert_eq!(complete.id, run.id);
+            assert_eq!(store.list_attempts(&run.id).await.expect("attempts").len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_survives_restart_and_config_removal_suppresses_it() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("retry.db");
+        let store = Store::open(&path).await.expect("open");
+        store
+            .apply(&scheduled_bundle("/bin/true", "1h", 3), 0, "test", 0)
+            .await
+            .expect("apply");
+        let run = store
+            .create_manual_run("demo", "request", 10, policy)
+            .await
+            .expect("run");
+        poll(&store).await;
+        store
+            .apply_event(&run.id, 1, &terminal_event(AttemptState::Failed, 3), 100, decide)
+            .await
+            .expect("failed");
+        drop(store);
+
+        let store = Store::open(&path).await.expect("reopen");
+        assert_eq!(store.earliest_wakeup().await.expect("wakeup"), Some(5_100));
+        let empty = canonicalize_bundle(&ConfigBundle { files: vec![] }).expect("empty");
+        store.apply(&empty, 1, "remove", 200).await.expect("remove");
+        let final_run = store.get_run(&run.id).await.expect("query").expect("run");
+        assert_eq!(final_run.state, RunState::Failed);
+        assert_eq!(final_run.retry_due_at_ms, None);
+        assert!(poll_optional(&store, 6_000).await.is_none());
+    }
+
+    async fn poll_optional(store: &Store, now: i64) -> Option<PollAction> {
+        store
+            .poll_action("node-a", now, |_| unreachable!("no dispatch expected"))
+            .await
+            .expect("poll")
+    }
+
+    #[tokio::test]
+    async fn rejected_attempt_never_retries() {
+        let store = Store::open_in_memory().await.expect("open");
+        store
+            .apply(&scheduled_bundle("/bin/true", "1h", 3), 0, "test", 0)
+            .await
+            .expect("apply");
+        let run = store
+            .create_manual_run("demo", "rejected", 10, policy)
+            .await
+            .expect("run");
+        poll(&store).await;
+        store
+            .apply_event(&run.id, 1, &terminal_event(AttemptState::Rejected, 1), 100, decide)
+            .await
+            .expect("rejected");
+        let run = store.get_run(&run.id).await.expect("query").expect("run");
+        assert_eq!(run.state, RunState::Failed);
+        assert_eq!(run.retry_due_at_ms, None);
     }
 
     #[tokio::test]

@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use lmt_core::{AttemptNo, MirrorDocument, MirrorName, NodeName, RunId, RunSpecContext, compile_process_run_spec};
+use lmt_core::{
+    AttemptEvent, AttemptNo, MirrorDocument, MirrorName, NodeName, RetryContext, RunId, RunSpecContext,
+    compile_process_run_spec, decide_retry,
+};
 use lmt_store::{DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store, StoreError};
 use sha2::{Digest, Sha256};
 
@@ -26,6 +29,29 @@ pub async fn create_manual_run(
     store.create_manual_run(mirror, request_id, now, compile_policy).await
 }
 
+pub async fn apply_attempt_event(
+    store: &Store,
+    run_id: &str,
+    attempt_no: u32,
+    event: &AttemptEvent,
+    now: i64,
+) -> Result<u64, StoreError> {
+    store
+        .apply_event(run_id, attempt_no, event, now, |source, server_now_ms| {
+            decide_retry(RetryContext {
+                outcome: source.outcome,
+                attempt_no: source.attempt_no,
+                max_attempts: source.max_attempts,
+                retry_delay_seconds: source.retry_delay_ms / 1_000,
+                cancel_requested: source.cancel_requested,
+                mirror_eligible: source.mirror_eligible,
+                owner_unchanged: source.owner_unchanged,
+                server_now_ms,
+            })
+        })
+        .await
+}
+
 fn compile_policy(config_toml: &str) -> Result<RunPolicySnapshot, StoreError> {
     let document: MirrorDocument =
         toml::from_str(config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
@@ -48,7 +74,7 @@ fn compile(
         .run_id
         .parse::<RunId>()
         .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
-    let attempt_no = AttemptNo::new(1).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+    let attempt_no = AttemptNo::new(source.attempt_no).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
     let spec = compile_process_run_spec(
         &document,
         &RunSpecContext {
