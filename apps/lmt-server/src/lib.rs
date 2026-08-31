@@ -94,7 +94,6 @@ struct AppMetrics {
     attempts_interrupted: AtomicU64,
     cancellations_immediate: AtomicU64,
     cancellations_dispatched: AtomicU64,
-    cancellations_already_terminal: AtomicU64,
 }
 impl AppState {
     pub fn new(store: Store, log_dir: PathBuf, token: String, offline_after: Duration) -> Self {
@@ -247,7 +246,6 @@ lmt_attempts_terminal_total{{state=\"rejected\"}} {}\n\
 lmt_attempts_terminal_total{{state=\"interrupted\"}} {}\n\
 lmt_cancellations_total{{outcome=\"immediate\"}} {}\n\
 lmt_cancellations_total{{outcome=\"dispatched\"}} {}\n\
-lmt_cancellations_total{{outcome=\"already_terminal\"}} {}\n\
 lmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_total {}\nlmt_log_upload_failures_total {}\n",
         pending,
         running,
@@ -266,7 +264,6 @@ lmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_to
         state.metrics.attempts_interrupted.load(Ordering::Relaxed),
         state.metrics.cancellations_immediate.load(Ordering::Relaxed),
         state.metrics.cancellations_dispatched.load(Ordering::Relaxed),
-        state.metrics.cancellations_already_terminal.load(Ordering::Relaxed),
         state.metrics.polls.load(Ordering::Relaxed),
         state.metrics.events.load(Ordering::Relaxed),
         state.metrics.uploaded_bytes.load(Ordering::Relaxed),
@@ -434,22 +431,21 @@ async fn cancel_run(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<RunView>, Failure> {
     operator(&h, &s)?;
-    let previous = s
-        .store
+    s.store
         .get_run(&id)
         .await?
         .ok_or_else(|| Failure::not_found("run_not_found"))?;
-    let run = services::request_cancellation(&s.store, &id, s.now_ms()).await?;
-    let counter = if previous.state.is_terminal() {
-        &s.metrics.cancellations_already_terminal
-    } else if run.state == lmt_core::RunState::Cancelled {
-        &s.metrics.cancellations_immediate
-    } else {
-        &s.metrics.cancellations_dispatched
-    };
-    counter.fetch_add(1, Ordering::Relaxed);
+    let result = services::request_cancellation(&s.store, &id, s.now_ms()).await?;
+    if result.newly_requested {
+        let counter = if result.run.state == lmt_core::RunState::Cancelled {
+            &s.metrics.cancellations_immediate
+        } else {
+            &s.metrics.cancellations_dispatched
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
     s.notify.notify_waiters();
-    Ok(Json(run_view(run)))
+    Ok(Json(run_view(result.run)))
 }
 async fn attempts(
     State(s): State<AppState>,
@@ -559,7 +555,7 @@ async fn event(
     let node = agent(&h, &s).await?;
     attempt_auth(&s, &node, &id, no).await?;
     let terminal_state = r.state;
-    let accepted = services::apply_attempt_event(
+    let applied = services::apply_attempt_event(
         &s.store,
         &id,
         no,
@@ -579,7 +575,7 @@ async fn event(
     .await?;
     s.notify.notify_waiters();
     s.metrics.events.fetch_add(1, Ordering::Relaxed);
-    if terminal_state.is_terminal() {
+    if terminal_state.is_terminal() && applied.newly_applied {
         let counter = match terminal_state {
             lmt_core::AttemptState::Succeeded => &s.metrics.attempts_succeeded,
             lmt_core::AttemptState::Failed => &s.metrics.attempts_failed,
@@ -592,16 +588,12 @@ async fn event(
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
-        if s.store
-            .get_run(&id)
-            .await?
-            .is_some_and(|run| run.retry_due_at_ms.is_some())
-        {
+        if applied.retry_scheduled {
             s.metrics.retries_scheduled.fetch_add(1, Ordering::Relaxed);
         }
     }
     Ok(Json(EventResponse {
-        accepted_event_sequence: accepted,
+        accepted_event_sequence: applied.accepted_event_sequence,
     }))
 }
 async fn upload_log(
@@ -1104,5 +1096,88 @@ mod tests {
                 .next_due_at_ms,
             Some(130_000)
         );
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_events_and_cancellations_do_not_duplicate_semantic_metrics() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open_in_memory().await.expect("store");
+        store
+            .upsert_credential("node-a", "secret", 1)
+            .await
+            .expect("credential");
+        let bundle = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: "[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='command'\nprogram='/bin/false'\n[run]\nmax_attempts=2\nretry_delay_seconds=5\n".into(),
+            }],
+        })
+        .expect("bundle");
+        store.apply(&bundle, 0, "test", 0).await.expect("apply");
+        let run = services::create_manual_run(&store, "demo", "event-metrics", 1)
+            .await
+            .expect("run");
+        services::next_action(&store, "node-a", "/tmp/mirrors", 2)
+            .await
+            .expect("poll")
+            .expect("action");
+        let mut state = AppState::new(
+            store.clone(),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.clock = Arc::new(FakeClock(AtomicI64::new(3)));
+        let mut agent_headers = HeaderMap::new();
+        agent_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer secret"));
+        let request = EventRequest {
+            event_sequence: 1,
+            state: lmt_core::AttemptState::Failed,
+            agent_instance_id: "instance".into(),
+            accepted_at: None,
+            started_at: None,
+            finished_at: None,
+            exit_code: Some(1),
+            failure_kind: None,
+            failure_message: None,
+        };
+
+        for _ in 0..2 {
+            let _ = event(
+                State(state.clone()),
+                agent_headers.clone(),
+                AxumPath((run.id.clone(), 1)),
+                Json(request.clone()),
+            )
+            .await
+            .expect("event");
+        }
+        assert_eq!(state.metrics.events.load(Ordering::Relaxed), 2);
+        assert_eq!(state.metrics.attempts_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(state.metrics.retries_scheduled.load(Ordering::Relaxed), 1);
+
+        let cancel_store = Store::open_in_memory().await.expect("cancel store");
+        cancel_store.apply(&bundle, 0, "test", 0).await.expect("apply");
+        let cancellable = services::create_manual_run(&cancel_store, "demo", "cancel-metrics", 1)
+            .await
+            .expect("run");
+        let cancel_state = AppState::new(
+            cancel_store,
+            directory.path().join("cancel-logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        let mut operator_headers = HeaderMap::new();
+        operator_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
+        for _ in 0..2 {
+            let _ = cancel_run(
+                State(cancel_state.clone()),
+                operator_headers.clone(),
+                AxumPath(cancellable.id.clone()),
+            )
+            .await
+            .expect("cancel");
+        }
+        assert_eq!(cancel_state.metrics.cancellations_immediate.load(Ordering::Relaxed), 1);
     }
 }

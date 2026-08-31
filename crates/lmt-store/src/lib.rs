@@ -104,7 +104,7 @@ pub struct NodeObservation {
     pub observed_at_ms: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RunRecord {
     pub id: String,
     pub mirror_name: String,
@@ -182,6 +182,19 @@ pub struct TerminalDecisionSource {
 pub struct TerminalDecision {
     pub retry: RetryDecision,
     pub interval_next_due_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CancellationApplyResult {
+    pub run: RunRecord,
+    pub newly_requested: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AttemptEventApplyResult {
+    pub accepted_event_sequence: u64,
+    pub newly_applied: bool,
+    pub retry_scheduled: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -733,7 +746,12 @@ impl Store {
         .await
     }
 
-    pub async fn request_cancellation<F>(&self, run_id: &str, now: i64, rearm: F) -> Result<RunRecord, StoreError>
+    pub async fn request_cancellation<F>(
+        &self,
+        run_id: &str,
+        now: i64,
+        rearm: F,
+    ) -> Result<CancellationApplyResult, StoreError>
     where
         F: FnOnce(&str) -> Result<Option<i64>, StoreError> + Send + 'static,
     {
@@ -750,21 +768,18 @@ impl Store {
                 )
                 .optional()?
                 .ok_or(StoreError::AttemptNotFound)?;
+            if run.state.is_terminal() {
+                transaction.commit()?;
+                return Ok(CancellationApplyResult {
+                    run,
+                    newly_requested: false,
+                });
+            }
+            let newly_requested = run.cancel_requested_at_ms.is_none();
             transaction.execute(
                 "UPDATE runs SET cancel_requested_at_ms=COALESCE(cancel_requested_at_ms,?2) WHERE id=?1",
                 params![run_id, now],
             )?;
-            if run.state.is_terminal() {
-                let result = transaction.query_row(
-                    "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,
-                     finished_at_ms,final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,
-                     scheduled_for_at_ms,retry_due_at_ms,cancel_requested_at_ms FROM runs WHERE id=?1",
-                    [&run_id],
-                    map_run,
-                )?;
-                transaction.commit()?;
-                return Ok(result);
-            }
             let active_dispatched: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM attempts a JOIN runs r ON r.id=a.run_id
                   WHERE a.run_id=?1 AND a.attempt_no=r.attempt_count AND a.dispatch_count>0
@@ -813,7 +828,10 @@ impl Store {
                 map_run,
             )?;
             transaction.commit()?;
-            Ok(result)
+            Ok(CancellationApplyResult {
+                run: result,
+                newly_requested,
+            })
         })
         .await
     }
@@ -825,7 +843,7 @@ impl Store {
         event: &AttemptEvent,
         now: i64,
         decide_terminal: F,
-    ) -> Result<u64, StoreError>
+    ) -> Result<AttemptEventApplyResult, StoreError>
     where
         F: FnOnce(TerminalDecisionSource, i64) -> Result<TerminalDecision, StoreError> + Send + 'static,
     {
@@ -845,7 +863,11 @@ impl Store {
         };
         if event.event_sequence <= sequence {
             transaction.commit()?;
-            return Ok(sequence);
+            return Ok(AttemptEventApplyResult {
+                accepted_event_sequence: sequence,
+                newly_applied: false,
+                retry_scheduled: false,
+            });
         }
         let projection = project_attempt_event(state, &event).map_err(|error| StoreError::IllegalTransition {
             from: error.from,
@@ -870,6 +892,7 @@ impl Store {
                 event.failure_message,
             ],
         )?;
+        let mut retry_scheduled = false;
         if projection.run_state == Some(RunState::Running) {
             transaction.execute(
                 "UPDATE runs SET state='running',started_at_ms=COALESCE(started_at_ms,?2) WHERE id=?1 AND state='pending'",
@@ -880,6 +903,7 @@ impl Store {
             let decision = decide_terminal(source.clone(), now)?;
             match decision.retry {
                 RetryDecision::Schedule { retry_due_at_ms } => {
+                    retry_scheduled = true;
                     transaction.execute(
                         "UPDATE runs SET state='running',started_at_ms=COALESCE(started_at_ms,?2),
                            retry_due_at_ms=?3,finished_at_ms=NULL,final_exit_code=NULL,
@@ -909,7 +933,11 @@ impl Store {
             }
         }
         transaction.commit()?;
-        Ok(event.event_sequence)
+        Ok(AttemptEventApplyResult {
+            accepted_event_sequence: event.event_sequence,
+            newly_applied: true,
+            retry_scheduled,
+        })
         })
         .await
     }
@@ -2028,7 +2056,11 @@ mod tests {
                 .apply_event(&run.id, 1, &terminal, 30, |source, now| Ok(decide(source, now)))
                 .await
                 .expect("event"),
-            3
+            AttemptEventApplyResult {
+                accepted_event_sequence: 3,
+                newly_applied: true,
+                retry_scheduled: false,
+            }
         );
         let late = AttemptEvent {
             event_sequence: 2,
@@ -2040,7 +2072,11 @@ mod tests {
                 .apply_event(&run.id, 1, &late, 40, |source, now| Ok(decide(source, now)))
                 .await
                 .expect("duplicate"),
-            3
+            AttemptEventApplyResult {
+                accepted_event_sequence: 3,
+                newly_applied: false,
+                retry_scheduled: false,
+            }
         );
         assert_eq!(
             store.get_run(&run.id).await.expect("get").expect("run").state,
@@ -2194,13 +2230,15 @@ mod tests {
             .request_cancellation(&pending.id, 20, |_| Ok(None))
             .await
             .expect("cancel");
-        assert_eq!(cancelled.state, RunState::Cancelled);
-        assert_eq!(cancelled.cancel_requested_at_ms, Some(20));
+        assert_eq!(cancelled.run.state, RunState::Cancelled);
+        assert_eq!(cancelled.run.cancel_requested_at_ms, Some(20));
+        assert!(cancelled.newly_requested);
         assert_eq!(
             store
                 .request_cancellation(&pending.id, 30, |_| Ok(None))
                 .await
                 .expect("duplicate")
+                .run
                 .cancel_requested_at_ms,
             Some(20)
         );
@@ -2224,9 +2262,43 @@ mod tests {
             .request_cancellation(&retrying.id, 200, |_| Ok(None))
             .await
             .expect("cancel retry");
-        assert_eq!(cancelled.state, RunState::Cancelled);
-        assert_eq!(cancelled.retry_due_at_ms, None);
+        assert_eq!(cancelled.run.state, RunState::Cancelled);
+        assert_eq!(cancelled.run.retry_due_at_ms, None);
         assert!(poll_optional(&store, 10_000).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_terminal_runs_does_not_mutate_history() {
+        for outcome in [
+            AttemptState::Succeeded,
+            AttemptState::Failed,
+            AttemptState::TimedOut,
+            AttemptState::Cancelled,
+        ] {
+            let store = Store::open_in_memory().await.expect("open");
+            store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
+            let run = store
+                .create_manual_run("demo", &format!("terminal-{outcome:?}"), 20, policy)
+                .await
+                .expect("run");
+            poll_at(&store, 30).await;
+            store
+                .apply_event(&run.id, 1, &terminal_event(outcome, 1), 40, |source, now| {
+                    Ok(decide(source, now))
+                })
+                .await
+                .expect("terminal event");
+            let before = store.get_run(&run.id).await.expect("get").expect("run");
+
+            let result = store
+                .request_cancellation(&run.id, 50, |_| Ok(Some(999)))
+                .await
+                .expect("terminal cancellation");
+
+            assert!(!result.newly_requested, "{outcome:?}");
+            assert_eq!(result.run, before, "{outcome:?}");
+            assert_eq!(store.get_run(&run.id).await.expect("get"), Some(before), "{outcome:?}");
+        }
     }
 
     #[tokio::test]
@@ -2240,7 +2312,7 @@ mod tests {
             .request_cancellation(&first_run.id, 40, |_| Ok(None))
             .await
             .expect("cancel");
-        assert_eq!(cancelled.state, RunState::Pending);
+        assert_eq!(cancelled.run.state, RunState::Pending);
 
         for now in [41, 42] {
             match poll_at(&store, now).await {

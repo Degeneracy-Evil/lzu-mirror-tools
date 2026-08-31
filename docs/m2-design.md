@@ -858,6 +858,10 @@ lmt_log_upload_failures_total
 
 Do not add per-Run labels.
 
+Semantic counters are transition counters, not request counters. In particular,
+`lmt_cancellations_total` increments only when a Run first accepts a cancellation
+intent; repeated requests and requests against terminal Runs do not increment it.
+
 ## 36. Summary table
 
 | Situation | M2 behavior |

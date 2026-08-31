@@ -4,7 +4,10 @@ use lmt_core::{
     AttemptEvent, AttemptNo, MirrorDocument, MirrorName, NodeName, RetryContext, RunId, RunSpecContext,
     compile_process_run_spec, decide_retry, evaluate_schedule_due, rearm_interval,
 };
-use lmt_store::{DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store, StoreError, TerminalDecision};
+use lmt_store::{
+    AttemptEventApplyResult, CancellationApplyResult, DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store,
+    StoreError, TerminalDecision,
+};
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc,
@@ -33,7 +36,11 @@ pub async fn create_manual_run(
     store.create_manual_run(mirror, request_id, now, compile_policy).await
 }
 
-pub async fn request_cancellation(store: &Store, run_id: &str, now: i64) -> Result<RunRecord, StoreError> {
+pub async fn request_cancellation(
+    store: &Store,
+    run_id: &str,
+    now: i64,
+) -> Result<CancellationApplyResult, StoreError> {
     store
         .request_cancellation(run_id, now, move |config_toml| {
             let document: MirrorDocument =
@@ -55,7 +62,7 @@ pub async fn apply_attempt_event(
     attempt_no: u32,
     event: &AttemptEvent,
     now: i64,
-) -> Result<u64, StoreError> {
+) -> Result<AttemptEventApplyResult, StoreError> {
     store
         .apply_event(run_id, attempt_no, event, now, |source, server_now_ms| {
             let retry = decide_retry(RetryContext {
