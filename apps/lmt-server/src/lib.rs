@@ -8,7 +8,7 @@ use axum::{
 };
 use lmt_core::{AttemptEvent, ConfigBundle, RunId, canonicalize_bundle};
 use lmt_protocol::v1alpha1::*;
-use lmt_store::{AttemptRecord, ChangeKind, ConfigPlan, RunRecord, Store, StoreError};
+use lmt_store::{AttemptRecord, ChangeKind, ConfigPlan, NodeObservation, RunRecord, Store, StoreError};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -88,9 +88,9 @@ pub async fn initialize(c: &ServerConfig) -> anyhow::Result<AppState> {
         fs::create_dir_all(p).await?;
     }
     fs::create_dir_all(&c.log_dir).await?;
-    let store = Store::open(&c.database_path)?;
+    let store = Store::open(&c.database_path).await?;
     for a in &c.agents {
-        store.upsert_credential(&a.node, &a.token)?;
+        store.upsert_credential(&a.node, &a.token, now_ms()).await?;
     }
     Ok(AppState::new(
         store,
@@ -125,12 +125,12 @@ pub fn build_router(s: AppState) -> Router {
         .with_state(s)
 }
 async fn ready(State(s): State<AppState>) -> Result<Json<HealthResponse>, Failure> {
-    s.store.current_revision()?;
+    s.store.current_revision().await?;
     Ok(Json(HealthResponse { status: "ready".into() }))
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, Failure> {
-    let runs = state.store.list_runs()?;
+    let runs = state.store.list_runs().await?;
     let pending = runs
         .iter()
         .filter(|run| run.state == lmt_core::RunState::Pending)
@@ -176,7 +176,7 @@ async fn plan(
 ) -> Result<Json<PlanResponse>, Failure> {
     operator(&h, &s)?;
     let b = canonicalize_bundle(&ConfigBundle { files: r.files }).map_err(config_error)?;
-    Ok(Json(plan_view(s.store.plan(&b)?)))
+    Ok(Json(plan_view(s.store.plan(&b).await?)))
 }
 async fn apply(
     State(s): State<AppState>,
@@ -185,13 +185,20 @@ async fn apply(
 ) -> Result<Json<ApplyResponse>, Failure> {
     operator(&h, &s)?;
     let b = canonicalize_bundle(&ConfigBundle { files: r.files }).map_err(config_error)?;
-    if s.store.plan(&b)?.changes.iter().any(|c| c.kind == ChangeKind::Move) && !r.acknowledge_moves {
+    if s.store
+        .plan(&b)
+        .await?
+        .changes
+        .iter()
+        .any(|c| c.kind == ChangeKind::Move)
+        && !r.acknowledge_moves
+    {
         return Err(Failure::conflict(
             "move_acknowledgement_required",
             "node move requires acknowledgement",
         ));
     }
-    let p = s.store.apply(&b, r.base_revision, "api")?;
+    let p = s.store.apply(&b, r.base_revision, "api", now_ms()).await?;
     Ok(Json(ApplyResponse {
         revision: p.base_revision,
         bundle_hash: p.bundle_hash,
@@ -202,7 +209,8 @@ async fn mirrors(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<Mir
     operator(&h, &s)?;
     Ok(Json(
         s.store
-            .list_mirrors()?
+            .list_mirrors()
+            .await?
             .into_iter()
             .map(|m| MirrorView {
                 name: m.name,
@@ -222,7 +230,8 @@ async fn mirror(
     operator(&h, &s)?;
     let m = s
         .store
-        .get_mirror(&name)?
+        .get_mirror(&name)
+        .await?
         .ok_or_else(|| Failure::not_found("mirror_not_found"))?;
     Ok(Json(MirrorView {
         name: m.name,
@@ -242,13 +251,13 @@ async fn manual(
     if r.trigger != "manual" || r.request_id.is_empty() {
         return Err(Failure::bad("invalid_request", "invalid manual request"));
     }
-    let result = run_view(s.store.create_manual_run(&name, &r.request_id)?);
+    let result = run_view(s.store.create_manual_run(&name, &r.request_id, now_ms()).await?);
     s.notify.notify_waiters();
     Ok(Json(result))
 }
 async fn runs(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<RunView>>, Failure> {
     operator(&h, &s)?;
-    Ok(Json(s.store.list_runs()?.into_iter().map(run_view).collect()))
+    Ok(Json(s.store.list_runs().await?.into_iter().map(run_view).collect()))
 }
 async fn run(
     State(s): State<AppState>,
@@ -258,11 +267,18 @@ async fn run(
     operator(&h, &s)?;
     let r = s
         .store
-        .get_run(&id)?
+        .get_run(&id)
+        .await?
         .ok_or_else(|| Failure::not_found("run_not_found"))?;
     Ok(Json(RunDetail {
         run: run_view(r),
-        attempts: s.store.list_attempts(&id)?.into_iter().map(attempt_view).collect(),
+        attempts: s
+            .store
+            .list_attempts(&id)
+            .await?
+            .into_iter()
+            .map(attempt_view)
+            .collect(),
     }))
 }
 async fn attempts(
@@ -272,7 +288,12 @@ async fn attempts(
 ) -> Result<Json<Vec<AttemptView>>, Failure> {
     operator(&h, &s)?;
     Ok(Json(
-        s.store.list_attempts(&id)?.into_iter().map(attempt_view).collect(),
+        s.store
+            .list_attempts(&id)
+            .await?
+            .into_iter()
+            .map(attempt_view)
+            .collect(),
     ))
 }
 async fn nodes(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<NodeView>>, Failure> {
@@ -280,7 +301,8 @@ async fn nodes(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<NodeV
     let now = now_ms();
     Ok(Json(
         s.store
-            .list_nodes()?
+            .list_nodes()
+            .await?
             .into_iter()
             .map(|n| node_view(n, now, s.offline_after))
             .collect(),
@@ -294,34 +316,38 @@ async fn node(
     operator(&h, &s)?;
     let n = s
         .store
-        .list_nodes()?
+        .list_nodes()
+        .await?
         .into_iter()
         .find(|n| n.name == name)
         .ok_or_else(|| Failure::not_found("node_not_found"))?;
     Ok(Json(node_view(n, now_ms(), s.offline_after)))
 }
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
-    let node = agent(&h, &s)?;
+    let node = agent(&h, &s).await?;
     if r.protocol_version != "v1alpha1" {
         return Err(Failure::bad(
             "unsupported_protocol_version",
             "only v1alpha1 is supported",
         ));
     }
-    s.store.observe_node(
-        &node,
-        &r.agent_version,
-        &r.agent_instance_id,
-        r.capacity.active_runs,
-        r.capacity.mirror_root_free_bytes,
-        &r.mirror_root,
-    )?;
+    s.store
+        .observe_node(NodeObservation {
+            node: node.clone(),
+            agent_version: r.agent_version.clone(),
+            agent_instance_id: r.agent_instance_id.clone(),
+            active_runs: r.capacity.active_runs,
+            mirror_root_free_bytes: r.capacity.mirror_root_free_bytes,
+            mirror_root: r.mirror_root.clone(),
+            observed_at_ms: now_ms(),
+        })
+        .await?;
     s.metrics.polls.fetch_add(1, Ordering::Relaxed);
-    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root)? {
+    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, now_ms()).await? {
         return Ok(action(a).into_response());
     }
     let _ = tokio::time::timeout(s.poll_wait, s.notify.notified()).await;
-    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root)? {
+    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, now_ms()).await? {
         return Ok(action(a).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -342,23 +368,27 @@ async fn event(
     AxumPath((id, no)): AxumPath<(String, u32)>,
     Json(r): Json<EventRequest>,
 ) -> Result<Json<EventResponse>, Failure> {
-    let node = agent(&h, &s)?;
-    attempt_auth(&s, &node, &id, no)?;
-    let accepted = s.store.apply_event(
-        &id,
-        no,
-        &AttemptEvent {
-            event_sequence: r.event_sequence,
-            state: r.state,
-            agent_instance_id: r.agent_instance_id,
-            accepted_at_ms: parse_time(r.accepted_at.as_deref())?,
-            started_at_ms: parse_time(r.started_at.as_deref())?,
-            finished_at_ms: parse_time(r.finished_at.as_deref())?,
-            exit_code: r.exit_code,
-            failure_kind: r.failure_kind,
-            failure_message: r.failure_message,
-        },
-    )?;
+    let node = agent(&h, &s).await?;
+    attempt_auth(&s, &node, &id, no).await?;
+    let accepted = s
+        .store
+        .apply_event(
+            &id,
+            no,
+            &AttemptEvent {
+                event_sequence: r.event_sequence,
+                state: r.state,
+                agent_instance_id: r.agent_instance_id,
+                accepted_at_ms: parse_time(r.accepted_at.as_deref())?,
+                started_at_ms: parse_time(r.started_at.as_deref())?,
+                finished_at_ms: parse_time(r.finished_at.as_deref())?,
+                exit_code: r.exit_code,
+                failure_kind: r.failure_kind,
+                failure_message: r.failure_message,
+            },
+            now_ms(),
+        )
+        .await?;
     s.metrics.events.fetch_add(1, Ordering::Relaxed);
     Ok(Json(EventResponse {
         accepted_event_sequence: accepted,
@@ -370,8 +400,8 @@ async fn upload_log(
     AxumPath((id, no)): AxumPath<(String, u32)>,
     body: Bytes,
 ) -> Result<Response, Failure> {
-    let node = agent(&h, &s)?;
-    attempt_auth(&s, &node, &id, no)?;
+    let node = agent(&h, &s).await?;
+    attempt_auth(&s, &node, &id, no).await?;
     if body.len() > 1_048_576 {
         return Err(Failure::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -418,7 +448,7 @@ async fn read_log(
         .to_string();
     let mut data = vec![];
     let mut complete = false;
-    if let Some((_, stored, c)) = s.store.log_metadata(&id, no)? {
+    if let Some((_, stored, c)) = s.store.log_metadata(&id, no).await? {
         complete = c;
         if q.offset < stored {
             let take = (stored - q.offset).min(q.limit.unwrap_or(65536).min(1_048_576));
@@ -488,7 +518,8 @@ async fn append_log(s: &AppState, id: &str, no: u32, offset: u64, body: &[u8], c
     }
     let next = stored + tail.len() as u64;
     s.store
-        .update_log_metadata(&id, no, &format!("{id}/{no}.log"), next, complete)?;
+        .update_log_metadata(&id, no, &format!("{id}/{no}.log"), next, complete, now_ms())
+        .await?;
     Ok(next)
 }
 fn log_path(root: &Path, id: &str, no: u32) -> PathBuf {
@@ -504,13 +535,14 @@ fn operator(h: &HeaderMap, s: &AppState) -> Result<(), Failure> {
         Err(Failure::unauthorized())
     }
 }
-fn agent(h: &HeaderMap, s: &AppState) -> Result<String, Failure> {
+async fn agent(h: &HeaderMap, s: &AppState) -> Result<String, Failure> {
     s.store
-        .authenticate_node(bearer(h).ok_or_else(Failure::unauthorized)?)?
+        .authenticate_node(bearer(h).ok_or_else(Failure::unauthorized)?)
+        .await?
         .ok_or_else(Failure::unauthorized)
 }
-fn attempt_auth(s: &AppState, node: &str, id: &str, no: u32) -> Result<(), Failure> {
-    if s.store.attempt_belongs_to_node(id, no, node)? {
+async fn attempt_auth(s: &AppState, node: &str, id: &str, no: u32) -> Result<(), Failure> {
+    if s.store.attempt_belongs_to_node(id, no, node).await? {
         Ok(())
     } else {
         Err(Failure::not_found("attempt_not_found"))
@@ -693,8 +725,11 @@ mod tests {
     async fn success_event_and_duplicate_log_survive_reopen() {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("lmt.db");
-        let store = Store::open(&database).expect("store");
-        store.upsert_credential("node-a", "secret").expect("credential");
+        let store = Store::open(&database).await.expect("store");
+        store
+            .upsert_credential("node-a", "secret", 1)
+            .await
+            .expect("credential");
         let bundle = canonicalize_bundle(&ConfigBundle {
             files: vec![BundleFile {
                 path: "nodes/node-a/mirrors/demo.toml".into(),
@@ -702,9 +737,10 @@ mod tests {
             }],
         })
         .expect("bundle");
-        store.apply(&bundle, 0, "test").expect("apply");
-        let run = store.create_manual_run("demo", "request").expect("run");
-        services::next_action(&store, "node-a", "/tmp/mirrors")
+        store.apply(&bundle, 0, "test", 2).await.expect("apply");
+        let run = store.create_manual_run("demo", "request", 3).await.expect("run");
+        services::next_action(&store, "node-a", "/tmp/mirrors", 4)
+            .await
             .expect("poll")
             .expect("action");
         let state = AppState::new(
@@ -740,13 +776,15 @@ mod tests {
                     failure_kind: None,
                     failure_message: None,
                 },
+                5,
             )
+            .await
             .expect("event");
         drop(state);
         drop(store);
-        let reopened = Store::open(database).expect("reopen");
+        let reopened = Store::open(database).await.expect("reopen");
         assert_eq!(
-            reopened.get_run(&run.id).expect("query").expect("run").state,
+            reopened.get_run(&run.id).await.expect("query").expect("run").state,
             RunState::Succeeded
         );
         assert_eq!(

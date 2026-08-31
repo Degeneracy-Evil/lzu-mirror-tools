@@ -4,8 +4,17 @@ use lmt_core::{AttemptNo, MirrorDocument, MirrorName, NodeName, RunId, RunSpecCo
 use lmt_store::{DispatchSource, PollAction, Store, StoreError};
 use sha2::{Digest, Sha256};
 
-pub fn next_action(store: &Store, node: &str, mirror_root: &str) -> Result<Option<PollAction>, StoreError> {
-    store.poll_action(node, |source| compile(source, node, mirror_root))
+pub async fn next_action(
+    store: &Store,
+    node: &str,
+    mirror_root: &str,
+    now: i64,
+) -> Result<Option<PollAction>, StoreError> {
+    let owned_node = node.to_owned();
+    let owned_root = mirror_root.to_owned();
+    store
+        .poll_action(node, now, move |source| compile(source, &owned_node, &owned_root))
+        .await
 }
 
 fn compile(
