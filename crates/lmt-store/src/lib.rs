@@ -164,7 +164,7 @@ pub struct DispatchSource {
     pub config_toml: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TerminalDecisionSource {
     pub outcome: AttemptState,
     pub attempt_no: u32,
@@ -173,6 +173,14 @@ pub struct TerminalDecisionSource {
     pub cancel_requested: bool,
     pub mirror_eligible: bool,
     pub owner_unchanged: bool,
+    pub mirror_name: String,
+    pub current_config_toml: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalDecision {
+    pub retry: RetryDecision,
+    pub interval_next_due_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -621,7 +629,7 @@ impl Store {
 
     pub async fn poll_action<F>(&self, node: &str, now: i64, compile: F) -> Result<Option<PollAction>, StoreError>
     where
-        F: FnOnce(&DispatchSource) -> Result<(ProcessRunSpec, String), StoreError> + Send + 'static,
+        F: FnOnce(&DispatchSource) -> Result<(ProcessRunSpec, String, RunPolicySnapshot), StoreError> + Send + 'static,
     {
         let node = node.to_owned();
         self.call(move |connection| {
@@ -642,17 +650,7 @@ impl Store {
                 )
                 .optional()?;
             if let Some(action) = redelivery {
-                let PollAction::StartAttempt {
-                    ref run_id, attempt_no, ..
-                } = action
-                else {
-                    unreachable!("StartAttempt query returned another action")
-                };
-                transaction.execute(
-                    "UPDATE attempts SET dispatch_count=dispatch_count+1,last_dispatch_at_ms=?3
-                     WHERE run_id=?1 AND attempt_no=?2",
-                    params![run_id, attempt_no, now],
-                )?;
+                mark_redelivery(&transaction, &action, now)?;
                 transaction.commit()?;
                 return Ok(Some(action));
             }
@@ -661,7 +659,8 @@ impl Store {
                 .query_row(
                     "SELECT r.id,r.mirror_name,r.mirror_generation,1
                      FROM runs r JOIN mirrors m ON m.name=r.mirror_name
-                     WHERE r.owner_node=?1 AND r.state='pending' AND m.managed=1 AND m.enabled=1
+                     WHERE r.owner_node=?1 AND r.state='pending' AND r.trigger='manual'
+                       AND m.managed=1 AND m.enabled=1
                        AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.run_id=r.id)
                      ORDER BY r.created_at_ms LIMIT 1",
                     [&node],
@@ -684,6 +683,11 @@ impl Store {
                     )
                     .optional()?
             };
+            let candidate = if candidate.is_some() {
+                candidate
+            } else {
+                materialize_scheduled_candidate(&transaction, &node, now)?
+            };
             let Some((run_id, mirror_name, generation, attempt_no)) = candidate else {
                 transaction.commit()?;
                 return Ok(None);
@@ -700,7 +704,11 @@ impl Store {
                 mirror_generation: generation,
                 config_toml,
             };
-            let (spec, spec_hash) = compile(&source)?;
+            let (spec, spec_hash, policy) = compile(&source)?;
+            transaction.execute(
+                "UPDATE runs SET max_attempts=?2,retry_delay_ms=?3 WHERE id=?1 AND trigger='scheduled'",
+                params![run_id, policy.max_attempts, policy.retry_delay_ms],
+            )?;
             let spec_json = serde_json::to_string(&spec)?;
             transaction.execute(
                 "INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,
@@ -723,7 +731,10 @@ impl Store {
         .await
     }
 
-    pub async fn request_cancellation(&self, run_id: &str, now: i64) -> Result<RunRecord, StoreError> {
+    pub async fn request_cancellation<F>(&self, run_id: &str, now: i64, rearm: F) -> Result<RunRecord, StoreError>
+    where
+        F: FnOnce(&str) -> Result<Option<i64>, StoreError> + Send + 'static,
+    {
         let run_id = run_id.to_owned();
         self.call(move |connection| {
             let transaction = connection.transaction()?;
@@ -760,6 +771,18 @@ impl Store {
                 |row| row.get(0),
             )?;
             if !active_dispatched {
+                let interval_next_due_at_ms = transaction
+                    .query_row(
+                        "SELECT g.config_toml FROM runs r JOIN mirrors m ON m.name=r.mirror_name
+                         JOIN mirror_generations g ON g.mirror_name=m.name AND g.generation=m.current_generation
+                         WHERE r.id=?1 AND m.managed=1 AND m.enabled=1 AND m.owner_node=r.owner_node",
+                        [&run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|config| rearm(&config))
+                    .transpose()?
+                    .flatten();
                 transaction.execute(
                     "UPDATE attempts SET state='cancelled',finished_at_ms=COALESCE(finished_at_ms,?2)
                      WHERE run_id=?1 AND dispatch_count=0
@@ -771,6 +794,14 @@ impl Store {
                        final_exit_code=NULL,failure_kind=NULL,failure_message=NULL WHERE id=?1",
                     params![run_id, now],
                 )?;
+                if let Some(next_due) = interval_next_due_at_ms {
+                    transaction.execute(
+                        "UPDATE mirror_schedule_state SET next_due_at_ms=?2,last_evaluated_at_ms=?3,
+                           catch_up_pending=0,catch_up_since_ms=NULL
+                         WHERE mirror_name=(SELECT mirror_name FROM runs WHERE id=?1)",
+                        params![run_id, next_due, now],
+                    )?;
+                }
             }
             let result = transaction.query_row(
                 "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,
@@ -794,7 +825,7 @@ impl Store {
         decide_terminal: F,
     ) -> Result<u64, StoreError>
     where
-        F: FnOnce(TerminalDecisionSource, i64) -> RetryDecision + Send + 'static,
+        F: FnOnce(TerminalDecisionSource, i64) -> Result<TerminalDecision, StoreError> + Send + 'static,
     {
         let run_id = run_id.to_owned();
         let event = event.clone();
@@ -843,24 +874,9 @@ impl Store {
                 params![run_id, projection.run_started_at_ms.unwrap_or(now)],
             )?;
         } else if projection.run_state.is_some() {
-            let source = transaction.query_row(
-                "SELECT r.max_attempts,r.retry_delay_ms,r.cancel_requested_at_ms IS NOT NULL,
-                   m.managed=1 AND m.enabled=1,m.owner_node=r.owner_node
-                 FROM runs r JOIN mirrors m ON m.name=r.mirror_name WHERE r.id=?1",
-                [&run_id],
-                |row| {
-                    Ok(TerminalDecisionSource {
-                        outcome: event.state,
-                        attempt_no,
-                        max_attempts: row.get(0)?,
-                        retry_delay_ms: row.get(1)?,
-                        cancel_requested: row.get(2)?,
-                        mirror_eligible: row.get(3)?,
-                        owner_unchanged: row.get(4)?,
-                    })
-                },
-            )?;
-            match decide_terminal(source, now) {
+            let source = terminal_source(&transaction, &run_id, attempt_no, event.state)?;
+            let decision = decide_terminal(source.clone(), now)?;
+            match decision.retry {
                 RetryDecision::Schedule { retry_due_at_ms } => {
                     transaction.execute(
                         "UPDATE runs SET state='running',started_at_ms=COALESCE(started_at_ms,?2),
@@ -884,6 +900,9 @@ impl Store {
                             event.failure_message,
                         ],
                     )?;
+                    if let Some(next_due) = decision.interval_next_due_at_ms {
+                        rearm_schedule(&transaction, &source.mirror_name, next_due, now)?;
+                    }
                 }
             }
         }
@@ -1164,6 +1183,90 @@ fn find_cancellation(transaction: &Transaction<'_>, node: &str) -> Result<Option
         .optional()?)
 }
 
+fn mark_redelivery(transaction: &Transaction<'_>, action: &PollAction, now: i64) -> Result<(), StoreError> {
+    let PollAction::StartAttempt { run_id, attempt_no, .. } = action else {
+        unreachable!("StartAttempt query returned another action")
+    };
+    transaction.execute(
+        "UPDATE attempts SET dispatch_count=dispatch_count+1,last_dispatch_at_ms=?3
+         WHERE run_id=?1 AND attempt_no=?2",
+        params![run_id, attempt_no, now],
+    )?;
+    Ok(())
+}
+
+fn rearm_schedule(transaction: &Transaction<'_>, mirror: &str, next_due: i64, now: i64) -> Result<(), StoreError> {
+    transaction.execute(
+        "UPDATE mirror_schedule_state SET next_due_at_ms=?2,last_evaluated_at_ms=?3,
+           catch_up_pending=0,catch_up_since_ms=NULL WHERE mirror_name=?1",
+        params![mirror, next_due, now],
+    )?;
+    Ok(())
+}
+
+fn terminal_source(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    attempt_no: u32,
+    outcome: AttemptState,
+) -> Result<TerminalDecisionSource, StoreError> {
+    Ok(transaction.query_row(
+        "SELECT r.max_attempts,r.retry_delay_ms,r.cancel_requested_at_ms IS NOT NULL,
+           m.managed=1 AND m.enabled=1,m.owner_node=r.owner_node,m.name,g.config_toml
+         FROM runs r JOIN mirrors m ON m.name=r.mirror_name
+         JOIN mirror_generations g ON g.mirror_name=m.name AND g.generation=m.current_generation
+         WHERE r.id=?1",
+        [run_id],
+        |row| {
+            Ok(TerminalDecisionSource {
+                outcome,
+                attempt_no,
+                max_attempts: row.get(0)?,
+                retry_delay_ms: row.get(1)?,
+                cancel_requested: row.get(2)?,
+                mirror_eligible: row.get(3)?,
+                owner_unchanged: row.get(4)?,
+                mirror_name: row.get(5)?,
+                current_config_toml: row.get(6)?,
+            })
+        },
+    )?)
+}
+
+fn materialize_scheduled_candidate(
+    transaction: &Transaction<'_>,
+    node: &str,
+    now: i64,
+) -> Result<Option<(String, String, u64, u32)>, StoreError> {
+    let due: Option<(String, u64, String, i64)> = transaction
+        .query_row(
+            "SELECT m.name,m.current_generation,m.owner_node,s.catch_up_since_ms
+             FROM mirror_schedule_state s JOIN mirrors m ON m.name=s.mirror_name
+             WHERE m.owner_node=?1 AND m.managed=1 AND m.enabled=1 AND s.catch_up_pending=1
+               AND s.catch_up_since_ms IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM runs r WHERE r.mirror_name=m.name AND r.state IN('pending','running'))
+             ORDER BY s.catch_up_since_ms,m.name LIMIT 1",
+            [node],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((mirror, generation, owner, scheduled_for)) = due else {
+        return Ok(None);
+    };
+    let run_id = RunId::new().to_string();
+    transaction.execute(
+        "INSERT INTO runs(id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,
+           max_attempts,retry_delay_ms,scheduled_for_at_ms)
+         VALUES(?1,?2,?3,?4,'scheduled','pending',?5,1,0,?6)",
+        params![run_id, mirror, generation, owner, now, scheduled_for],
+    )?;
+    transaction.execute(
+        "UPDATE mirror_schedule_state SET catch_up_pending=0,catch_up_since_ms=NULL WHERE mirror_name=?1",
+        [&mirror],
+    )?;
+    Ok(Some((run_id, mirror, generation, 1)))
+}
+
 fn finalize_ineligible_retries(transaction: &Transaction<'_>, mirror: &str, now: i64) -> Result<(), StoreError> {
     let waiting = {
         let mut statement = transaction.prepare(
@@ -1410,6 +1513,10 @@ mod tests {
                         target_dir: "/tmp/mirrors/demo".into(),
                     },
                     "sha256:test".into(),
+                    RunPolicySnapshot {
+                        max_attempts: 3,
+                        retry_delay_ms: 5_000,
+                    },
                 ))
             })
             .await
@@ -1438,17 +1545,20 @@ mod tests {
         })
     }
 
-    fn decide(source: TerminalDecisionSource, now: i64) -> RetryDecision {
-        lmt_core::decide_retry(lmt_core::RetryContext {
-            outcome: source.outcome,
-            attempt_no: source.attempt_no,
-            max_attempts: source.max_attempts,
-            retry_delay_seconds: source.retry_delay_ms / 1_000,
-            cancel_requested: source.cancel_requested,
-            mirror_eligible: source.mirror_eligible,
-            owner_unchanged: source.owner_unchanged,
-            server_now_ms: now,
-        })
+    fn decide(source: TerminalDecisionSource, now: i64) -> TerminalDecision {
+        TerminalDecision {
+            retry: lmt_core::decide_retry(lmt_core::RetryContext {
+                outcome: source.outcome,
+                attempt_no: source.attempt_no,
+                max_attempts: source.max_attempts,
+                retry_delay_seconds: source.retry_delay_ms / 1_000,
+                cancel_requested: source.cancel_requested,
+                mirror_eligible: source.mirror_eligible,
+                owner_unchanged: source.owner_unchanged,
+                server_now_ms: now,
+            }),
+            interval_next_due_at_ms: None,
+        }
     }
 
     #[tokio::test]
@@ -1600,6 +1710,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn due_marker_materializes_one_scheduled_run_and_interval_rearms_on_terminal() {
+        let store = Store::open_in_memory().await.expect("open");
+        store
+            .apply(&scheduled_bundle("/bin/true", "1h", 3), 0, "test", 0)
+            .await
+            .expect("apply");
+        store
+            .evaluate_due_schedules(3_600_000, |source| {
+                let document: MirrorDocument = toml::from_str(&source.config_toml)
+                    .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                Ok(lmt_core::evaluate_schedule_due(
+                    document.schedule.as_ref().expect("schedule"),
+                    source.runtime,
+                    3_600_000,
+                    source.has_active_run,
+                )
+                .expect("evaluate")
+                .runtime)
+            })
+            .await
+            .expect("tick");
+        let due = store.get_mirror("demo").await.expect("get").expect("mirror");
+        assert_eq!(due.next_due_at_ms, None);
+        assert_eq!(due.scheduled_due_since_ms, Some(3_600_000));
+        assert!(store.list_runs().await.expect("runs").is_empty());
+
+        let action = poll_at(&store, 3_600_100).await;
+        let (run_id, attempt_no, _) = start_fields(&action);
+        assert_eq!(attempt_no, 1);
+        let run = store.get_run(run_id).await.expect("get").expect("run");
+        assert_eq!(run.trigger, "scheduled");
+        assert_eq!(run.scheduled_for_at_ms, Some(3_600_000));
+        assert_eq!(run.max_attempts, 3);
+        assert_eq!(
+            store
+                .get_mirror("demo")
+                .await
+                .expect("get")
+                .expect("mirror")
+                .scheduled_due_since_ms,
+            None
+        );
+
+        store
+            .apply_event(
+                &run.id,
+                1,
+                &terminal_event(AttemptState::Succeeded, 3),
+                4_000_000,
+                |source, now| {
+                    Ok(TerminalDecision {
+                        retry: lmt_core::decide_retry(lmt_core::RetryContext {
+                            outcome: source.outcome,
+                            attempt_no: source.attempt_no,
+                            max_attempts: source.max_attempts,
+                            retry_delay_seconds: source.retry_delay_ms / 1_000,
+                            cancel_requested: source.cancel_requested,
+                            mirror_eligible: source.mirror_eligible,
+                            owner_unchanged: source.owner_unchanged,
+                            server_now_ms: now,
+                        }),
+                        interval_next_due_at_ms: Some(now + 3_600_000),
+                    })
+                },
+            )
+            .await
+            .expect("terminal");
+        assert_eq!(
+            store
+                .get_mirror("demo")
+                .await
+                .expect("get")
+                .expect("mirror")
+                .next_due_at_ms,
+            Some(7_600_000)
+        );
+    }
+
+    #[tokio::test]
     async fn manual_run_snapshots_generation_policy_and_clears_due_intent() {
         let store = Store::open_in_memory().await.expect("open");
         store
@@ -1685,7 +1874,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .apply_event(&run.id, 1, &terminal, 30, decide)
+                .apply_event(&run.id, 1, &terminal, 30, |source, now| Ok(decide(source, now)))
                 .await
                 .expect("event"),
             3
@@ -1697,7 +1886,7 @@ mod tests {
         };
         assert_eq!(
             store
-                .apply_event(&run.id, 1, &late, 40, decide)
+                .apply_event(&run.id, 1, &late, 40, |source, now| Ok(decide(source, now)))
                 .await
                 .expect("duplicate"),
             3
@@ -1736,7 +1925,9 @@ mod tests {
                 .expect("run");
             assert_eq!(start_fields(&poll(&store).await).1, 1);
             store
-                .apply_event(&run.id, 1, &terminal_event(outcome, 3), 100, decide)
+                .apply_event(&run.id, 1, &terminal_event(outcome, 3), 100, |source, now| {
+                    Ok(decide(source, now))
+                })
                 .await
                 .expect("terminal");
             let waiting = store.get_run(&run.id).await.expect("query").expect("run");
@@ -1751,7 +1942,13 @@ mod tests {
             );
             assert_eq!(start_fields(&poll_at(&store, 5_100).await).1, 2);
             store
-                .apply_event(&run.id, 2, &terminal_event(AttemptState::Succeeded, 3), 6_000, decide)
+                .apply_event(
+                    &run.id,
+                    2,
+                    &terminal_event(AttemptState::Succeeded, 3),
+                    6_000,
+                    |source, now| Ok(decide(source, now)),
+                )
                 .await
                 .expect("success");
             let complete = store.get_run(&run.id).await.expect("query").expect("run");
@@ -1776,7 +1973,13 @@ mod tests {
             .expect("run");
         poll(&store).await;
         store
-            .apply_event(&run.id, 1, &terminal_event(AttemptState::Failed, 3), 100, decide)
+            .apply_event(
+                &run.id,
+                1,
+                &terminal_event(AttemptState::Failed, 3),
+                100,
+                |source, now| Ok(decide(source, now)),
+            )
             .await
             .expect("failed");
         drop(store);
@@ -1811,7 +2014,13 @@ mod tests {
             .expect("run");
         poll(&store).await;
         store
-            .apply_event(&run.id, 1, &terminal_event(AttemptState::Rejected, 1), 100, decide)
+            .apply_event(
+                &run.id,
+                1,
+                &terminal_event(AttemptState::Rejected, 1),
+                100,
+                |source, now| Ok(decide(source, now)),
+            )
             .await
             .expect("rejected");
         let run = store.get_run(&run.id).await.expect("query").expect("run");
@@ -1830,12 +2039,15 @@ mod tests {
             .create_manual_run("demo", "pending-cancel", 10, policy)
             .await
             .expect("run");
-        let cancelled = store.request_cancellation(&pending.id, 20).await.expect("cancel");
+        let cancelled = store
+            .request_cancellation(&pending.id, 20, |_| Ok(None))
+            .await
+            .expect("cancel");
         assert_eq!(cancelled.state, RunState::Cancelled);
         assert_eq!(cancelled.cancel_requested_at_ms, Some(20));
         assert_eq!(
             store
-                .request_cancellation(&pending.id, 30)
+                .request_cancellation(&pending.id, 30, |_| Ok(None))
                 .await
                 .expect("duplicate")
                 .cancel_requested_at_ms,
@@ -1848,11 +2060,17 @@ mod tests {
             .expect("run");
         poll_at(&store, 50).await;
         store
-            .apply_event(&retrying.id, 1, &terminal_event(AttemptState::Failed, 3), 100, decide)
+            .apply_event(
+                &retrying.id,
+                1,
+                &terminal_event(AttemptState::Failed, 3),
+                100,
+                |source, now| Ok(decide(source, now)),
+            )
             .await
             .expect("failed");
         let cancelled = store
-            .request_cancellation(&retrying.id, 200)
+            .request_cancellation(&retrying.id, 200, |_| Ok(None))
             .await
             .expect("cancel retry");
         assert_eq!(cancelled.state, RunState::Cancelled);
@@ -1867,7 +2085,10 @@ mod tests {
         let first_run = store.create_manual_run("demo", "first", 20, policy).await.expect("run");
         let start = poll_at(&store, 30).await;
         let (_, _, hash) = start_fields(&start);
-        let cancelled = store.request_cancellation(&first_run.id, 40).await.expect("cancel");
+        let cancelled = store
+            .request_cancellation(&first_run.id, 40, |_| Ok(None))
+            .await
+            .expect("cancel");
         assert_eq!(cancelled.state, RunState::Pending);
 
         for now in [41, 42] {
@@ -1890,7 +2111,7 @@ mod tests {
                 1,
                 &terminal_event(AttemptState::Cancelled, 1),
                 50,
-                decide,
+                |source, now| Ok(decide(source, now)),
             )
             .await
             .expect("cancelled event");

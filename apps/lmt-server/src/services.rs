@@ -2,9 +2,9 @@ use std::path::Path;
 
 use lmt_core::{
     AttemptEvent, AttemptNo, MirrorDocument, MirrorName, NodeName, RetryContext, RunId, RunSpecContext,
-    compile_process_run_spec, decide_retry,
+    compile_process_run_spec, decide_retry, evaluate_schedule_due, rearm_interval,
 };
-use lmt_store::{DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store, StoreError};
+use lmt_store::{DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store, StoreError, TerminalDecision};
 use sha2::{Digest, Sha256};
 
 pub async fn next_action(
@@ -29,6 +29,22 @@ pub async fn create_manual_run(
     store.create_manual_run(mirror, request_id, now, compile_policy).await
 }
 
+pub async fn request_cancellation(store: &Store, run_id: &str, now: i64) -> Result<RunRecord, StoreError> {
+    store
+        .request_cancellation(run_id, now, move |config_toml| {
+            let document: MirrorDocument =
+                toml::from_str(config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+            document
+                .schedule
+                .as_ref()
+                .map(|schedule| rearm_interval(schedule, now))
+                .transpose()
+                .map_err(StoreError::InvalidConfig)
+                .map(Option::flatten)
+        })
+        .await
+}
+
 pub async fn apply_attempt_event(
     store: &Store,
     run_id: &str,
@@ -38,7 +54,7 @@ pub async fn apply_attempt_event(
 ) -> Result<u64, StoreError> {
     store
         .apply_event(run_id, attempt_no, event, now, |source, server_now_ms| {
-            decide_retry(RetryContext {
+            let retry = decide_retry(RetryContext {
                 outcome: source.outcome,
                 attempt_no: source.attempt_no,
                 max_attempts: source.max_attempts,
@@ -47,6 +63,23 @@ pub async fn apply_attempt_event(
                 mirror_eligible: source.mirror_eligible,
                 owner_unchanged: source.owner_unchanged,
                 server_now_ms,
+            });
+            let interval_next_due_at_ms = if source.mirror_eligible && source.owner_unchanged {
+                let document: MirrorDocument = toml::from_str(&source.current_config_toml)
+                    .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+                document
+                    .schedule
+                    .as_ref()
+                    .map(|schedule| rearm_interval(schedule, server_now_ms))
+                    .transpose()
+                    .map_err(StoreError::InvalidConfig)?
+                    .flatten()
+            } else {
+                None
+            };
+            Ok(TerminalDecision {
+                retry,
+                interval_next_due_at_ms,
             })
         })
         .await
@@ -65,7 +98,7 @@ fn compile(
     source: &DispatchSource,
     node: &str,
     mirror_root: &str,
-) -> Result<(lmt_core::ProcessRunSpec, String), StoreError> {
+) -> Result<(lmt_core::ProcessRunSpec, String, RunPolicySnapshot), StoreError> {
     let document: MirrorDocument =
         toml::from_str(&source.config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
     let mirror = MirrorName::new(&source.mirror_name).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
@@ -87,5 +120,25 @@ fn compile(
     );
     let bytes = serde_json::to_vec(&spec)?;
     let hash = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
-    Ok((spec, hash))
+    let policy = RunPolicySnapshot {
+        max_attempts: document.run.max_attempts,
+        retry_delay_ms: document.run.retry_delay_seconds.saturating_mul(1_000),
+    };
+    Ok((spec, hash, policy))
+}
+
+pub async fn evaluate_schedules(store: &Store, now: i64) -> Result<u64, StoreError> {
+    store
+        .evaluate_due_schedules(now, move |source| {
+            let document: MirrorDocument =
+                toml::from_str(&source.config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+            let schedule = document
+                .schedule
+                .as_ref()
+                .ok_or_else(|| StoreError::InvalidConfig("scheduled mirror has no schedule".into()))?;
+            evaluate_schedule_due(schedule, source.runtime, now, source.has_active_run)
+                .map(|evaluation| evaluation.runtime)
+                .map_err(StoreError::InvalidConfig)
+        })
+        .await
 }

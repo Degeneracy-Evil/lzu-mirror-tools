@@ -60,6 +60,19 @@ pub struct AppState {
     log_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     metrics: Arc<AppMetrics>,
     poll_wait: Duration,
+    clock: Arc<dyn Clock>,
+}
+
+trait Clock: Send + Sync {
+    fn now_ms(&self) -> i64;
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> i64 {
+        now_ms()
+    }
 }
 
 #[derive(Default)]
@@ -80,7 +93,12 @@ impl AppState {
             log_locks: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(AppMetrics::default()),
             poll_wait: Duration::from_secs(20),
+            clock: Arc::new(SystemClock),
         }
+    }
+
+    fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
     }
 }
 pub async fn initialize(c: &ServerConfig) -> anyhow::Result<AppState> {
@@ -92,12 +110,42 @@ pub async fn initialize(c: &ServerConfig) -> anyhow::Result<AppState> {
     for a in &c.agents {
         store.upsert_credential(&a.node, &a.token, now_ms()).await?;
     }
-    Ok(AppState::new(
+    let state = AppState::new(
         store,
         c.log_dir.clone(),
         c.operator_token.clone(),
         Duration::from_secs(c.offline_after_seconds),
-    ))
+    );
+    tokio::spawn(run_scheduler(state.clone()));
+    Ok(state)
+}
+
+async fn run_scheduler(state: AppState) {
+    loop {
+        let now = state.now_ms();
+        match services::evaluate_schedules(&state.store, now).await {
+            Ok(evaluated) => {
+                let earliest = state.store.earliest_wakeup().await.unwrap_or(None);
+                if evaluated > 0 || earliest.is_some_and(|deadline| deadline <= now) {
+                    state.notify.notify_waiters();
+                }
+                let wait = earliest
+                    .filter(|deadline| *deadline > now)
+                    .map_or(Duration::from_secs(30), |deadline| {
+                        Duration::from_millis(u64::try_from(deadline - now).unwrap_or(u64::MAX))
+                            .min(Duration::from_secs(30))
+                    });
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = state.notify.notified() => {}
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "scheduler evaluation failed");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 pub fn build_router(s: AppState) -> Router {
     Router::new()
@@ -199,7 +247,8 @@ async fn apply(
             "node move requires acknowledgement",
         ));
     }
-    let p = s.store.apply(&b, r.base_revision, "api", now_ms()).await?;
+    let p = s.store.apply(&b, r.base_revision, "api", s.now_ms()).await?;
+    s.notify.notify_waiters();
     Ok(Json(ApplyResponse {
         revision: p.base_revision,
         bundle_hash: p.bundle_hash,
@@ -252,7 +301,7 @@ async fn manual(
     if r.trigger != "manual" || r.request_id.is_empty() {
         return Err(Failure::bad("invalid_request", "invalid manual request"));
     }
-    let result = run_view(services::create_manual_run(&s.store, &name, &r.request_id, now_ms()).await?);
+    let result = run_view(services::create_manual_run(&s.store, &name, &r.request_id, s.now_ms()).await?);
     s.notify.notify_waiters();
     Ok(Json(result))
 }
@@ -288,7 +337,7 @@ async fn cancel_run(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<RunView>, Failure> {
     operator(&h, &s)?;
-    let run = s.store.request_cancellation(&id, now_ms()).await?;
+    let run = services::request_cancellation(&s.store, &id, s.now_ms()).await?;
     s.notify.notify_waiters();
     Ok(Json(run_view(run)))
 }
@@ -309,7 +358,7 @@ async fn attempts(
 }
 async fn nodes(State(s): State<AppState>, h: HeaderMap) -> Result<Json<Vec<NodeView>>, Failure> {
     operator(&h, &s)?;
-    let now = now_ms();
+    let now = s.now_ms();
     Ok(Json(
         s.store
             .list_nodes()
@@ -332,7 +381,7 @@ async fn node(
         .into_iter()
         .find(|n| n.name == name)
         .ok_or_else(|| Failure::not_found("node_not_found"))?;
-    Ok(Json(node_view(n, now_ms(), s.offline_after)))
+    Ok(Json(node_view(n, s.now_ms(), s.offline_after)))
 }
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
     let node = agent(&h, &s).await?;
@@ -350,15 +399,16 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
             active_runs: r.capacity.active_runs,
             mirror_root_free_bytes: r.capacity.mirror_root_free_bytes,
             mirror_root: r.mirror_root.clone(),
-            observed_at_ms: now_ms(),
+            observed_at_ms: s.now_ms(),
         })
         .await?;
     s.metrics.polls.fetch_add(1, Ordering::Relaxed);
-    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, now_ms()).await? {
+    s.notify.notify_waiters();
+    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, s.now_ms()).await? {
         return Ok(action(a).into_response());
     }
     let _ = tokio::time::timeout(s.poll_wait, s.notify.notified()).await;
-    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, now_ms()).await? {
+    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, s.now_ms()).await? {
         return Ok(action(a).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -412,9 +462,10 @@ async fn event(
             failure_kind: r.failure_kind,
             failure_message: r.failure_message,
         },
-        now_ms(),
+        s.now_ms(),
     )
     .await?;
+    s.notify.notify_waiters();
     s.metrics.events.fetch_add(1, Ordering::Relaxed);
     Ok(Json(EventResponse {
         accepted_event_sequence: accepted,
@@ -544,7 +595,7 @@ async fn append_log(s: &AppState, id: &str, no: u32, offset: u64, body: &[u8], c
     }
     let next = stored + tail.len() as u64;
     s.store
-        .update_log_metadata(&id, no, &format!("{id}/{no}.log"), next, complete, now_ms())
+        .update_log_metadata(&id, no, &format!("{id}/{no}.log"), next, complete, s.now_ms())
         .await?;
     Ok(next)
 }
@@ -746,6 +797,15 @@ impl IntoResponse for Failure {
 mod tests {
     use super::*;
     use lmt_core::{BundleFile, RunState};
+    use std::sync::atomic::AtomicI64;
+
+    struct FakeClock(AtomicI64);
+
+    impl Clock for FakeClock {
+        fn now_ms(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
 
     #[tokio::test]
     async fn success_event_and_duplicate_log_survive_reopen() {
@@ -820,6 +880,91 @@ mod tests {
                 .await
                 .expect("log"),
             b"[stdout] hello\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_server_clock_drives_durable_scheduled_run_and_interval_rearm() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("schedule.db");
+        let store = Store::open(&database).await.expect("store");
+        let bundle = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: "[mirror]\nname='demo'\ntarget='demo'\n[schedule]\ninterval='1m'\n[sync]\ntype='command'\nprogram='/bin/true'\n[run]\nmax_attempts=2\nretry_delay_seconds=5\n".into(),
+            }],
+        })
+        .expect("bundle");
+        let clock = Arc::new(FakeClock(AtomicI64::new(0)));
+        let mut state = AppState::new(
+            store.clone(),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.clock = clock.clone();
+        store.apply(&bundle, 0, "test", state.now_ms()).await.expect("apply");
+        clock.0.store(60_000, Ordering::SeqCst);
+        assert_eq!(
+            services::evaluate_schedules(&store, state.now_ms())
+                .await
+                .expect("tick"),
+            1
+        );
+        assert_eq!(
+            store
+                .get_mirror("demo")
+                .await
+                .expect("get")
+                .expect("mirror")
+                .scheduled_due_since_ms,
+            Some(60_000)
+        );
+        drop(store);
+
+        let reopened = Store::open(&database).await.expect("reopen");
+        let action = services::next_action(&reopened, "node-a", "/tmp/mirrors", state.now_ms())
+            .await
+            .expect("poll")
+            .expect("scheduled action");
+        let run_id = match action {
+            lmt_store::PollAction::StartAttempt { run_id, .. } => run_id,
+            lmt_store::PollAction::CancelAttempt { .. } => panic!("unexpected cancellation"),
+        };
+        let run = reopened.get_run(&run_id).await.expect("get").expect("run");
+        assert_eq!(run.trigger, "scheduled");
+        assert_eq!(run.scheduled_for_at_ms, Some(60_000));
+        assert_eq!(run.max_attempts, 2);
+        assert_eq!(reopened.list_runs().await.expect("runs").len(), 1);
+
+        clock.0.store(70_000, Ordering::SeqCst);
+        services::apply_attempt_event(
+            &reopened,
+            &run_id,
+            1,
+            &AttemptEvent {
+                event_sequence: 1,
+                state: lmt_core::AttemptState::Succeeded,
+                agent_instance_id: "instance".into(),
+                accepted_at_ms: None,
+                started_at_ms: None,
+                finished_at_ms: Some(70_000),
+                exit_code: Some(0),
+                failure_kind: None,
+                failure_message: None,
+            },
+            state.now_ms(),
+        )
+        .await
+        .expect("terminal");
+        assert_eq!(
+            reopened
+                .get_mirror("demo")
+                .await
+                .expect("get")
+                .expect("mirror")
+                .next_due_at_ms,
+            Some(130_000)
         );
     }
 }
