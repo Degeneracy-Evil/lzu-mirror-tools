@@ -51,15 +51,7 @@ pub async fn execute(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            record.terminal(
-                AttemptState::Failed,
-                None,
-                Some(FailureKind::Process),
-                Some(error.to_string()),
-                now(),
-            );
-            let _guard = spool_lock.lock().await;
-            let _ = write(path, record).await;
+            persist_spawn_failure(path, record, error, &spool_lock).await;
             return;
         }
     };
@@ -128,6 +120,25 @@ pub async fn execute(
             now(),
         ),
         Outcome::Cancelled => record.terminal(AttemptState::Cancelled, None, None, None, now()),
+    }
+    let _ = write(path, record).await;
+}
+
+async fn persist_spawn_failure(path: &Path, record: &mut SpoolRecord, error: std::io::Error, spool_lock: &Mutex<()>) {
+    let _guard = spool_lock.lock().await;
+    if let Ok(latest) = read(path).await {
+        record.cancel_requested |= latest.cancel_requested;
+    }
+    if record.cancel_requested {
+        record.terminal(AttemptState::Cancelled, None, None, None, now());
+    } else {
+        record.terminal(
+            AttemptState::Failed,
+            None,
+            Some(FailureKind::Process),
+            Some(error.to_string()),
+            now(),
+        );
     }
     let _ = write(path, record).await;
 }
