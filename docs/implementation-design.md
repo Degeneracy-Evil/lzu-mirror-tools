@@ -527,3 +527,14 @@ Only core/Server understands sync.type=rsync.
 Agent continues to execute ordinary ProcessRunSpec.
 
 No rsync-specific Agent module or execution path is allowed.
+
+
+## 24. Attempt process-group closure
+
+Attempt ownership does not end merely because the direct child process has exited.
+
+Before recording a normal Succeeded or Failed terminal result, the executor must ensure that no ordinary descendants remain alive in the Attempt's supervised process group.
+
+A background descendant must not outlive a terminal Run and overlap a future synchronization.
+
+Timeout, cancellation, shutdown, and normal direct-child completion all have to close the Attempt process ownership boundary safely.

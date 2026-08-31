@@ -6,11 +6,11 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1 accepted; M2 design complete and ready for implementation.**
+**Current phase: M1 accepted; M2 implementation candidate is under hardening review.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
-M2 scheduling, retry, cancellation, persistence preflight, and built-in rsync behavior are frozen in:
+M2 implementation landed at `68d56837454f5902d97fe012508b32e282556df0`, but M2 is not accepted until the release blockers in [the M2 code review](docs/reviews/m2-review-2026-08-31.md) are resolved. The frozen M2 behavior remains defined in:
 
 1. [M2 Design](docs/m2-design.md)
 2. [M2 Implementation Plan](docs/m2-implementation-plan.md)

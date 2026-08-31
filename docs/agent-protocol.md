@@ -401,3 +401,17 @@ The database remains the durable action source. Long-poll memory state is never 
 The Agent never calculates retry deadlines and never creates retry Attempts.
 
 Retry remains entirely a Server decision. The Agent only executes immutable Attempt RunSpecs and reports results.
+
+
+## 20. Cancellation tombstone retirement
+
+A Cancel-before-Start tombstone is durable recovery state, not permanent history.
+
+It must remain until both:
+
+- the Server has acknowledged the terminal Cancelled Attempt event;
+- the empty or remaining Run log completion has been acknowledged.
+
+After both acknowledgements, the Agent may retire the tombstone because the authoritative Server Attempt is terminal and StartAttempt will no longer be dispatched.
+
+The tombstone must still survive Agent restart before that acknowledgement boundary.

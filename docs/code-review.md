@@ -215,3 +215,10 @@ For M2 changes, additionally check the following.
 - tests use local resources only.
 
 The authoritative M2 reference for these checks is docs/m2-design.md.
+
+
+## 14. Idempotent observability
+
+Because Agent event delivery is at-least-once, semantic metrics must be updated from newly applied state transitions rather than HTTP request count unless a metric is explicitly named and documented as a request counter.
+
+In particular, retransmitted terminal Attempt events after a lost acknowledgement must not double-count Attempt outcomes or newly scheduled retries.
