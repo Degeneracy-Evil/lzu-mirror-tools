@@ -1,4 +1,4 @@
-# Rust Implementation Design v0.1
+# Rust Implementation Design v0.2
 
 This document translates the frozen LMT architecture into an implementation structure without defining application code.
 
@@ -472,7 +472,7 @@ Mirror configuration itself normally lives in an operator-managed Git repository
 
 A proposed change should be questioned if it causes any of these:
 
-- `lmt-core` imports Axum/Tokio/SQLx;
+- `lmt-core` imports Axum/Tokio/SQLite infrastructure;
 - Agent imports central SQLite code;
 - CLI contains scheduler/business logic;
 - server HTTP handler performs direct ad-hoc state updates;
@@ -482,3 +482,48 @@ A proposed change should be questioned if it causes any of these:
 - configuration is mutated outside the authoritative apply model.
 
 These are architecture regressions unless accompanied by an explicit design decision update.
+
+
+## 19. M2 persistence execution
+
+M2 keeps the same six-crate workspace.
+
+The central Store changes from a synchronous connection called on async workers to an async handle backed by one dedicated SQLite thread.
+
+The preferred current implementation is tokio-rusqlite.
+
+Do not add a pool or new database.
+
+## 20. M2 domain libraries
+
+lmt-core may add small value-level dependencies for strict cron evaluation, IANA timezones, and human duration parsing.
+
+The current intended choices are Croner, chrono-tz, and humantime.
+
+LMT must wrap and restrict dependency syntax so dependency features do not silently expand the public TOML contract.
+
+## 21. M2 scheduler module
+
+Server gets one explicit scheduler module/task.
+
+It owns wakeup orchestration only.
+
+Pure due/retry decisions live in lmt-core; persistence and transactional invariants live in lmt-store.
+
+No in-memory correctness-critical job queue is introduced.
+
+## 22. M2 Agent cancellation control
+
+The active Agent registry needs per-Attempt cancellation control handles, not only execution keys.
+
+Durable spool state remains the crash-recovery authority.
+
+Cancel-before-Start requires a durable tombstone representation.
+
+## 23. M2 rsync boundary
+
+Only core/Server understands sync.type=rsync.
+
+Agent continues to execute ordinary ProcessRunSpec.
+
+No rsync-specific Agent module or execution path is allowed.

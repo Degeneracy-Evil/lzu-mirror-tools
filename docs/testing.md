@@ -1,4 +1,4 @@
-# Testing Strategy v0.1
+# Testing Strategy v0.2
 
 LMT is small enough that correctness should be established primarily through deterministic tests rather than a large staging framework.
 
@@ -339,3 +339,38 @@ Before a release is considered production-usable, CI should demonstrate:
 - no process leak after cancellation/timeout/restart.
 
 Correctness and recovery tests are release blockers.
+
+
+## 21. M2 release-gating additions
+
+M2 keeps every accepted M1 fault test and adds deterministic coverage for:
+
+- interval activation and completion-relative re-arm;
+- manual Run interaction with interval;
+- timezone-aware five-field cron;
+- spring-forward and fall-back DST behavior;
+- cron occurrence skip while a Run is active;
+- many missed occurrences coalescing to one due intent;
+- Server restart recovery of due state;
+- latest generation used when delayed Scheduled work materializes;
+- Failed, TimedOut, and Interrupted retry;
+- Rejected no-retry;
+- multi-Attempt same-Run identity;
+- retry deadline across Server restart;
+- disable/remove/move retry suppression;
+- cancel before dispatch;
+- active process-group cancellation including descendants;
+- duplicate cancellation;
+- Cancel-before-delayed-Start tombstone;
+- Agent restart with cancellation tombstone;
+- Agent capacity;
+- populated M1 database migration to M2;
+- local built-in rsync without internet.
+
+Scheduler tests must use injected/manual time. Real minute/hour sleeps are not acceptable.
+
+## 22. M2 persistence sanity
+
+Add a lightweight schedule-row scale test to ensure earliest-deadline queries are indexed and scheduler ticks do not scan full Run history.
+
+This is a regression sanity check, not a reason to replace SQLite.
