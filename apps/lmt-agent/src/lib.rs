@@ -761,4 +761,38 @@ mod tests {
         assert!(!path.exists());
         assert!(!log_path(&path).exists());
     }
+
+    #[tokio::test]
+    async fn acknowledged_cancel_before_start_tombstone_is_retired() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let observed = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route("/api/v1alpha1/agent/attempts/{run}/{attempt}/events", post(mock_event))
+            .route("/api/v1alpha1/agent/attempts/{run}/{attempt}/log", put(mock_log))
+            .with_state(MockState {
+                saw_empty_complete: observed.clone(),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, url);
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        let path = state_path(&agent.config.storage.spool_dir, "01K00000000000000000000004", 1);
+        let mut record =
+            SpoolRecord::cancellation_tombstone("01K00000000000000000000004".into(), 1, "hash".into(), now());
+        write(&path, &record).await.expect("write");
+
+        agent.reconcile(&path, &mut record).await.expect("reconcile");
+
+        assert!(observed.load(Ordering::SeqCst));
+        assert_eq!(record.acknowledged_sequence, record.sequence);
+        assert!(record.log_complete_acknowledged);
+        assert!(!path.exists());
+        assert!(!log_path(&path).exists());
+    }
 }

@@ -86,10 +86,7 @@ impl SpoolRecord {
     }
 
     pub fn ready_for_cleanup(&self) -> bool {
-        self.spec.is_some()
-            && self.state.is_terminal()
-            && self.acknowledged_sequence >= self.sequence
-            && self.log_complete_acknowledged
+        self.state.is_terminal() && self.acknowledged_sequence >= self.sequence && self.log_complete_acknowledged
     }
 }
 
