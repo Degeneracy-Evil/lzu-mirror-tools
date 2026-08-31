@@ -398,6 +398,10 @@ mod tests {
         http::{HeaderMap, HeaderValue, StatusCode},
         routing::{post, put},
     };
+    use lmt_core::{
+        AttemptNo, BundleFile, ConfigBundle, MirrorName, RunId, RunSpecContext, canonicalize_bundle,
+        compile_process_run_spec,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_agent(root: &Path, shutdown: watch::Receiver<bool>, server_url: String) -> Agent {
@@ -624,6 +628,84 @@ mod tests {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err(),
             "descendant remained alive"
         );
+    }
+
+    #[tokio::test]
+    async fn local_rsync_uses_the_native_executor_for_success_and_failure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mirror_root = directory.path().join("mirrors");
+        let source = directory.path().join("source");
+        fs::create_dir_all(&mirror_root).await.expect("mirror root");
+        fs::create_dir_all(&source).await.expect("source");
+        fs::write(source.join("hello.txt"), b"hello\n").await.expect("fixture");
+        let bundle = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: format!(
+                    "[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='rsync'\nsource='{}/'\nargs=['--archive']\n",
+                    source.display()
+                ),
+            }],
+        })
+        .expect("bundle");
+        let mirror = MirrorName::new("demo").expect("mirror");
+        let node = NodeName::new("node-a").expect("node");
+        let document = &bundle.mirrors[&mirror].document;
+        let compiled = compile_process_run_spec(
+            document,
+            &RunSpecContext {
+                mirror_name: &mirror,
+                run_id: RunId::new(),
+                attempt_no: AttemptNo::new(1).expect("attempt"),
+                node_name: &node,
+                mirror_root: &mirror_root,
+            },
+        );
+        assert_eq!(compiled.program, "rsync");
+        assert_eq!(compiled.args[compiled.args.len() - 2], format!("{}/", source.display()));
+
+        let state = directory.path().join("rsync-success.json");
+        let mut record = SpoolRecord::accepted("01K00000000000000000000003".into(), 1, "hash".into(), compiled, now());
+        write(&state, &record).await.expect("write");
+        let (_shutdown, shutdown_receiver) = watch::channel(false);
+        let (_cancel, cancel_receiver) = watch::channel(false);
+        executor::execute(
+            &state,
+            &mut record,
+            shutdown_receiver,
+            cancel_receiver,
+            Arc::new(Mutex::new(())),
+        )
+        .await;
+        assert_eq!(record.state, AttemptState::Succeeded);
+        assert_eq!(
+            fs::read(mirror_root.join("demo/hello.txt")).await.expect("copied"),
+            b"hello\n"
+        );
+
+        let mut failed_spec = record.spec.clone().expect("spec");
+        let source_index = failed_spec.args.len() - 2;
+        failed_spec.args[source_index] = directory.path().join("missing/").to_string_lossy().into_owned();
+        let failed_state = directory.path().join("rsync-failed.json");
+        let mut failed = SpoolRecord::accepted(
+            "01K00000000000000000000004".into(),
+            1,
+            "hash-failed".into(),
+            failed_spec,
+            now(),
+        );
+        write(&failed_state, &failed).await.expect("write failed");
+        let (_shutdown, shutdown_receiver) = watch::channel(false);
+        let (_cancel, cancel_receiver) = watch::channel(false);
+        executor::execute(
+            &failed_state,
+            &mut failed,
+            shutdown_receiver,
+            cancel_receiver,
+            Arc::new(Mutex::new(())),
+        )
+        .await;
+        assert_eq!(failed.state, AttemptState::Failed);
     }
 
     #[derive(Clone)]
