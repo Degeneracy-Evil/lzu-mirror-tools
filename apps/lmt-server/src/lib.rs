@@ -397,6 +397,7 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
             agent_version: r.agent_version.clone(),
             agent_instance_id: r.agent_instance_id.clone(),
             active_runs: r.capacity.active_runs,
+            max_concurrent_runs: r.capacity.max_concurrent_runs,
             mirror_root_free_bytes: r.capacity.mirror_root_free_bytes,
             mirror_root: r.mirror_root.clone(),
             observed_at_ms: s.now_ms(),

@@ -69,6 +69,7 @@ impl Agent {
                 capacity: Capacity {
                     mirror_root_free_bytes: None,
                     active_runs: u32::try_from(self.active.lock().await.len()).unwrap_or(u32::MAX),
+                    max_concurrent_runs: self.config.execution.max_concurrent_runs,
                 },
                 mirror_root: self.config.storage.mirror_root.to_string_lossy().into_owned(),
             };

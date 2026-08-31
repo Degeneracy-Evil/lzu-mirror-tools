@@ -153,6 +153,7 @@ pub struct NodeView {
 pub struct Capacity {
     pub mirror_root_free_bytes: Option<u64>,
     pub active_runs: u32,
+    pub max_concurrent_runs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -279,7 +280,7 @@ mod tests {
 
     #[test]
     fn unknown_poll_fields_are_rejected() {
-        let json = r#"{"protocol_version":"v1alpha1","agent_version":"x","agent_instance_id":"i","poll_sequence":1,"running":[],"capacity":{"mirror_root_free_bytes":null,"active_runs":0},"mirror_root":"/x","node":"spoof"}"#;
+        let json = r#"{"protocol_version":"v1alpha1","agent_version":"x","agent_instance_id":"i","poll_sequence":1,"running":[],"capacity":{"mirror_root_free_bytes":null,"active_runs":0,"max_concurrent_runs":1},"mirror_root":"/x","node":"spoof"}"#;
         assert!(serde_json::from_str::<PollRequest>(json).is_err());
     }
 }

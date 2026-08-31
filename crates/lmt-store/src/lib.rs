@@ -98,6 +98,7 @@ pub struct NodeObservation {
     pub agent_version: String,
     pub agent_instance_id: String,
     pub active_runs: u32,
+    pub max_concurrent_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
     pub mirror_root: String,
     pub observed_at_ms: i64,
@@ -453,7 +454,7 @@ impl Store {
         self.call(move |connection| {
             connection.execute(
                 "UPDATE nodes SET agent_version=?2,agent_instance_id=?3,last_seen_at_ms=?4,active_runs=?5,
-             mirror_root_free_bytes=?6,capabilities_json=?7 WHERE name=?1",
+             mirror_root_free_bytes=?6,max_concurrent_runs=?7,capabilities_json=?8 WHERE name=?1",
                 params![
                     observation.node,
                     observation.agent_version,
@@ -461,6 +462,7 @@ impl Store {
                     observation.observed_at_ms,
                     observation.active_runs,
                     observation.mirror_root_free_bytes,
+                    observation.max_concurrent_runs,
                     capabilities
                 ],
             )?;
@@ -654,6 +656,10 @@ impl Store {
                 transaction.commit()?;
                 return Ok(Some(action));
             }
+            if !node_has_capacity(&transaction, &node)? {
+                transaction.commit()?;
+                return Ok(None);
+            }
 
             let initial: Option<(String, String, u64, u32)> = transaction
                 .query_row(
@@ -692,11 +698,7 @@ impl Store {
                 transaction.commit()?;
                 return Ok(None);
             };
-            let config_toml: String = transaction.query_row(
-                "SELECT config_toml FROM mirror_generations WHERE mirror_name=?1 AND generation=?2",
-                params![mirror_name, generation],
-                |row| row.get(0),
-            )?;
+            let config_toml = generation_config(&transaction, &mirror_name, generation)?;
             let source = DispatchSource {
                 run_id: run_id.clone(),
                 attempt_no,
@@ -1193,6 +1195,22 @@ fn mark_redelivery(transaction: &Transaction<'_>, action: &PollAction, now: i64)
         params![run_id, attempt_no, now],
     )?;
     Ok(())
+}
+
+fn node_has_capacity(transaction: &Transaction<'_>, node: &str) -> Result<bool, StoreError> {
+    Ok(transaction.query_row(
+        "SELECT COALESCE((SELECT active_runs < max_concurrent_runs FROM nodes WHERE name=?1),1)",
+        [node],
+        |row| row.get(0),
+    )?)
+}
+
+fn generation_config(transaction: &Transaction<'_>, mirror: &str, generation: u64) -> Result<String, StoreError> {
+    Ok(transaction.query_row(
+        "SELECT config_toml FROM mirror_generations WHERE mirror_name=?1 AND generation=?2",
+        params![mirror, generation],
+        |row| row.get(0),
+    )?)
 }
 
 fn rearm_schedule(transaction: &Transaction<'_>, mirror: &str, next_due: i64, now: i64) -> Result<(), StoreError> {
@@ -2120,6 +2138,38 @@ mod tests {
             RunState::Cancelled
         );
         assert!(poll_optional(&store, 60).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn full_agent_blocks_new_start_but_not_cancellation() {
+        let store = Store::open_in_memory().await.expect("open");
+        store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
+        store.upsert_credential("node-a", "secret", 10).await.expect("node");
+        let observe = |active_runs| NodeObservation {
+            node: "node-a".into(),
+            agent_version: "test".into(),
+            agent_instance_id: "instance".into(),
+            active_runs,
+            max_concurrent_runs: 1,
+            mirror_root_free_bytes: None,
+            mirror_root: "/tmp/mirrors".into(),
+            observed_at_ms: 20,
+        };
+        store.observe_node(observe(1)).await.expect("full");
+        let run = store
+            .create_manual_run("demo", "capacity", 30, policy)
+            .await
+            .expect("run");
+        assert!(poll_optional(&store, 40).await.is_none());
+
+        store.observe_node(observe(0)).await.expect("free");
+        assert!(matches!(poll_at(&store, 50).await, PollAction::StartAttempt { .. }));
+        store.observe_node(observe(1)).await.expect("full again");
+        store
+            .request_cancellation(&run.id, 60, |_| Ok(None))
+            .await
+            .expect("cancel");
+        assert!(matches!(poll_at(&store, 61).await, PollAction::CancelAttempt { .. }));
     }
 
     #[tokio::test]
