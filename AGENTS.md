@@ -28,13 +28,16 @@ M1 is an accepted baseline. For M2-specific semantics, **`docs/m2-design.md` is 
 
 Implement the current milestone only.
 
-The current development target is **M2**, defined in:
+M1 and M2 are accepted implementation baselines.
 
-- `docs/m2-design.md`
-- `docs/m2-implementation-plan.md`
-- `docs/roadmap.md`
+**There is currently no authorized M3 implementation target.** M3 must be designed and documented before code work begins.
 
-The accepted M1 safety/idempotency/fault-recovery tests are regression gates and must remain green.
+Until M3 design is frozen:
+
+- preserve all M1/M2 behavior and release-gating tests;
+- do not introduce M3 features opportunistically;
+- documentation/review work may prepare the M3 design;
+- any maintenance fix must remain compatible with the accepted M2 contracts.
 
 Do not implement deferred features such as:
 

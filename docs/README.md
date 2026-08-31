@@ -29,3 +29,5 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 - [M1 Code Review Round 2 — 2026-08-30](reviews/m1-review-round2-2026-08-30.md) — acceptance review of hardening commit `e2c27dbdc573dc374c94902255265adc81b2ae10`; M1 accepted.
 
 - [M2 Code Review — 2026-08-31](reviews/m2-review-2026-08-31.md) — blocking review of implementation commit `68d56837454f5902d97fe012508b32e282556df0`; M2 hardening required before acceptance.
+
+- [M2 Code Review Round 2 — 2026-08-31](reviews/m2-review-round2-2026-08-31.md) — acceptance review of hardening commit `7ad3886c1c11d011ae6fd76df2fa6ecc1b87bdaf`; M2 accepted.

@@ -73,7 +73,7 @@ apply TOML
 
 ## M2 - Mirror scheduling and reliable retries
 
-Status: **implementation candidate landed; hardening review in progress** at design commit `76e0a0065c655373ab7aa26fded03c0e4138f71b`.
+Status: **accepted** at implementation baseline `7ad3886c1c11d011ae6fd76df2fa6ecc1b87bdaf`. at design commit `76e0a0065c655373ab7aa26fded03c0e4138f71b`.
 
 Authoritative design: `docs/m2-design.md`.
 

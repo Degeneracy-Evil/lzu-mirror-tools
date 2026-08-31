@@ -1,6 +1,6 @@
 # M2 Implementation Plan
 
-Status: design-ready; implementation not started.
+Status: **complete and accepted** at implementation baseline `7ad3886c1c11d011ae6fd76df2fa6ecc1b87bdaf`.
 
 This plan implements the frozen M2 behavior in docs/m2-design.md.
 
