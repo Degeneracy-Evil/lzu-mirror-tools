@@ -17,18 +17,24 @@ Before making implementation changes, read at minimum:
 9. `docs/implementation-design.md`
 10. `docs/testing.md`
 11. `docs/m1-implementation-plan.md`
-12. `docs/code-review.md`
+12. `docs/m2-design.md`
+13. `docs/m2-implementation-plan.md`
+14. `docs/code-review.md`
+15. `docs/decisions.md`
 
-`docs/decisions.md` records accepted architecture decisions.
+M1 is an accepted baseline. For M2-specific semantics, **`docs/m2-design.md` is authoritative** if an older generic document still contains M1-era wording that conflicts with it. Do not resolve such conflicts by guessing; preserve M2 Design behavior and update the narrower document when appropriate.
 
 ## 2. Scope
 
 Implement the current milestone only.
 
-The initial development target is **M1**, defined in:
+The current development target is **M2**, defined in:
 
+- `docs/m2-design.md`
+- `docs/m2-implementation-plan.md`
 - `docs/roadmap.md`
-- `docs/m1-implementation-plan.md`
+
+The accepted M1 safety/idempotency/fault-recovery tests are regression gates and must remain green.
 
 Do not implement deferred features such as:
 
@@ -48,12 +54,13 @@ unless the design documents are explicitly changed first.
 
 Preserve these dependency rules:
 
-- `lmt-core` must not depend on Axum, SQLx, Reqwest, or Tokio infrastructure.
+- `lmt-core` must not depend on Axum, SQLite, Reqwest, or Tokio infrastructure.
 - `lmt-protocol` defines wire contracts, not HTTP framework code.
 - `lmt-store` is the only library crate that knows the central SQLite schema.
 - `lmt-agent` never directly accesses the central database.
 - repository-specific synchronization semantics must stay out of Agent execution code.
 - CLI/API handlers must not duplicate domain state-machine logic.
+- M2 must not introduce an in-memory correctness-critical job queue.
 
 ## 4. Correctness rules
 
@@ -67,7 +74,10 @@ Treat the following as hard invariants:
 - config pruning never deletes mirror data;
 - all authoritative/queryable state is centralized on `lmt-server`;
 - Run stdout/stderr is centralized but not stored as SQLite BLOBs;
-- Agent local policy cannot be bypassed by Server requests.
+- Agent local policy cannot be bypassed by Server requests;
+- scheduler/retry correctness survives Server restart from SQLite alone;
+- retries remain Attempts inside the same Run;
+- cancellation is safe under duplicate delivery and Cancel-before-Start reordering.
 
 ## 5. Configuration
 
@@ -79,6 +89,8 @@ Do not introduce hidden LMT-specific environment variables. Runtime values must 
 
 Git is only version control; LMT itself has no Git integration.
 
+M2 config apply must not implicitly execute a new/changed/moved scheduled Mirror.
+
 ## 6. Implementation style
 
 Prefer:
@@ -89,8 +101,9 @@ Prefer:
 - direct argv process execution;
 - bounded queues;
 - small modules with clear ownership;
-- deterministic/fake-clock tests for scheduler logic;
-- transactional persistence.
+- deterministic/manual-clock scheduler tests;
+- transactional persistence;
+- one dedicated SQLite background-thread execution boundary.
 
 Avoid:
 
@@ -99,23 +112,26 @@ Avoid:
 - shell interpolation by default;
 - correctness that depends on in-memory HTTP sessions;
 - unbounded channels;
-- duplicating configuration models in the database.
+- duplicating configuration models in the database;
+- real minute/hour sleeps in scheduler tests.
 
 ## 7. Testing
 
 A feature is not complete without its failure/idempotency tests.
 
-M1 must cover at least:
+M2 must preserve the entire M1 fault matrix and additionally cover:
 
-- config apply;
-- manual Run;
-- Agent poll/dispatch;
-- process success/failure;
-- centralized logs;
-- Server restart recovery;
-- Agent crash/interruption recovery;
-- duplicate StartAttempt behavior;
-- duplicate event/log upload behavior.
+- deterministic interval scheduling;
+- timezone-aware cron and DST semantics;
+- coalesced scheduled due intent;
+- scheduler recovery after Server restart;
+- multi-Attempt retry deadlines;
+- retry suppression after disable/remove/move;
+- explicit cancellation;
+- Cancel-before-delayed-Start tombstones;
+- Agent capacity;
+- M1-to-M2 schema migration;
+- local built-in rsync integration without internet.
 
 Use local helper processes/directories. Normal CI must not require public mirror servers or internet access.
 
@@ -136,7 +152,9 @@ Do not allow design documents and implementation to intentionally drift.
 
 ## 9. Development workflow
 
-Work in small vertical slices.
+Follow the M2 implementation order rather than implementing all scheduler features at once.
+
+Work in small vertical slices and logical commits.
 
 Keep the workspace buildable and tests runnable after each logical step.
 

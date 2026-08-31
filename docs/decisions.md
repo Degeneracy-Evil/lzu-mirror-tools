@@ -10,7 +10,7 @@ Status: accepted.
 
 `lmt-server`, `lmt-agent`, and `lmt` are implemented in Rust.
 
-Expected foundational crates include Tokio, Axum, Serde, SQLx, Clap, and tracing.
+Expected foundational crates include Tokio, Axum, Serde, rusqlite/tokio-rusqlite, Clap, and tracing.
 
 Rationale:
 
@@ -221,16 +221,108 @@ Once an Attempt has been dispatched, it is treated as potentially executing unti
 
 This rule is about configuration reconciliation only; it does not weaken operator-requested cancellation.
 
+### D024 - M2 scheduler persists due intent and materializes Scheduled Runs on Agent poll
+
+Status: accepted.
+
+A wall-clock schedule occurrence becomes one coalesced durable due marker rather than immediately creating a Run.
+
+The Scheduled Run and its first Attempt are materialized atomically only when the owning Agent polls with free execution capacity.
+
+This makes offline/capacity misses naturally coalesce and lets delayed scheduled work use the latest Mirror generation.
+
+### D025 - SQLite remains single-connection behind an asynchronous background-thread boundary
+
+Status: accepted.
+
+M2 keeps one authoritative SQLite connection. It does not add a pool, PostgreSQL, or a second source of truth.
+
+SQLite operations move behind an async Store handle backed by a dedicated database thread so synchronous SQLite work does not block Tokio/Axum worker threads.
+
+The current preferred implementation is tokio-rusqlite because it matches the project's single-connection architecture and current rusqlite line.
+
+### D026 - M2 introduces ordered forward-only schema migrations
+
+Status: accepted.
+
+The accepted M1 schema becomes migration 0001 and M2 schema changes are migration 0002.
+
+Missing migrations apply transactionally in ascending order. The Server refuses to open a database whose schema version is newer than the running binary.
+
+Downgrade migrations are not required.
+
+### D027 - Server clock owns schedule and retry deadlines
+
+Status: accepted.
+
+Scheduler and retry deadlines are derived from Server time, not Agent timestamps.
+
+Domain calculations receive explicit time and are tested deterministically. Agent timestamps remain execution observations only.
+
+### D028 - M2 cron is a strict five-field timezone-aware Vixie/POSIX subset
+
+Status: accepted.
+
+Cron uses exactly five minute-granularity fields and requires an explicit IANA timezone.
+
+M2 accepts the normal wildcard/list/range/step/name subset and rejects aliases plus extended L/W/#/+/? syntax even if an underlying parser supports it.
+
+DST behavior is explicitly documented and release-gated by tests.
+
+### D029 - Retry is a persisted Run deadline, not another job queue
+
+Status: accepted.
+
+A retryable terminal Attempt leaves its Run in Running state and stores `retry_due_at`.
+
+The next Attempt is created only after the deadline when the owner Agent polls with free capacity.
+
+Retries never create a second Run and do not require an in-memory retry queue.
+
+### D030 - CancelAttempt carries spec hash and supports Cancel-before-Start tombstones
+
+Status: accepted.
+
+For dispatched work, cancellation is at-least-once and idempotent.
+
+CancelAttempt includes the immutable spec hash. An Agent receiving Cancel before the corresponding Start durably records a cancellation tombstone so a delayed Start cannot execute later.
+
+### D031 - Built-in rsync is explicit configuration sugar
+
+Status: accepted.
+
+Rsync options remain visible in TOML.
+
+The Server compiles rsync configuration into the same normal ProcessRunSpec used by command Mirrors. The Agent has no rsync-specific path.
+
+LMT preserves the configured rsync source string, including trailing-slash semantics, and supplies the Mirror target directory as the destination.
+
+### D032 - Config apply does not implicitly execute newly scheduled Mirrors
+
+Status: accepted.
+
+Adding, re-enabling, changing, or moving a schedule initializes its next future due time.
+
+Configuration reconciliation does not immediately run synchronization merely because config was applied.
+
+Operators can request immediate synchronization explicitly with the CLI.
+
+### D033 - Creation needs request identity; cancellation is intrinsically idempotent
+
+Status: accepted.
+
+Operations that create a new durable resource or intent, such as manual Run creation, use a client request ID.
+
+Cancellation targets an existing Run and is idempotent by Run identity. Repeated cancel requests preserve one persistent cancellation intent and do not require a separate request ID.
+
 ## Current open questions
 
-The following points should be resolved before or during the first implementation milestone:
+The remaining open questions are intentionally deferred beyond M2 unless implementation evidence requires earlier resolution:
 
-1. Exact TOML schema additions needed by M2 scheduling/rsync.
-2. Exact Run log retention/rotation/compression policy.
-3. Whether rsync statistics should be parsed into structured Run metrics.
-4. Agent enrollment/token provisioning UX.
-5. Database migration/versioning strategy beyond schema v1.
-6. Stable API versioning rules before the first public release.
+1. Exact Run log retention/rotation/compression policy (M3).
+2. Agent enrollment/token provisioning UX (M3).
+3. Stable API versioning rules before the first public release.
+4. Whether a future release should parse rsync statistics into structured metrics; M2 explicitly does not.
 
 ## Development principle
 

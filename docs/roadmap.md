@@ -73,6 +73,12 @@ apply TOML
 
 ## M2 - Mirror scheduling and reliable retries
 
+Status: **design complete; implementation next** at design commit `76e0a0065c655373ab7aa26fded03c0e4138f71b`.
+
+Authoritative design: `docs/m2-design.md`.
+
+Implementation sequence: `docs/m2-implementation-plan.md`.
+
 Goal:
 
 > make LMT usable as a real unattended mirror synchronization manager.

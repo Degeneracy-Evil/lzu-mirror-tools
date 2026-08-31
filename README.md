@@ -6,9 +6,14 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1 accepted; M2 design refinement is next.**
+**Current phase: M1 accepted; M2 design complete and ready for implementation.**
 
-The M1 vertical slice and hardening pass are accepted at implementation commit `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [second M1 review](docs/reviews/m1-review-round2-2026-08-30.md) for the acceptance record and remaining non-blocking engineering debt.
+The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
+
+M2 scheduling, retry, cancellation, persistence preflight, and built-in rsync behavior are frozen in:
+
+1. [M2 Design](docs/m2-design.md)
+2. [M2 Implementation Plan](docs/m2-implementation-plan.md)
 
 ## What LMT does
 
@@ -62,7 +67,7 @@ client -> nginx -> mirror files
 
 The core implementation is Rust.
 
-Planned initial workspace:
+Workspace:
 
 ```text
 libraries:
@@ -82,7 +87,8 @@ Start with:
 
 1. [Design Summary](docs/design-summary.md)
 2. [Documentation Index](docs/README.md)
-3. [M1 Implementation Plan](docs/m1-implementation-plan.md)
+3. [M2 Design](docs/m2-design.md)
+4. [M2 Implementation Plan](docs/m2-implementation-plan.md)
 
 All architecture, state-machine, protocol, database, scheduler, API, testing, and code-review contracts live under `docs/`.
 
