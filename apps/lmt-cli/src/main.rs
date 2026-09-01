@@ -416,15 +416,8 @@ async fn execute_run(
         }
         RunCommand::Show { id } => get(c, token, format!("{base}/runs/{id}")).await.map(Into::into),
         RunCommand::Logs { id, attempt, follow } => {
-            if follow {
-                follow_logs(c, token, base, &id, attempt, output).await?;
-                Ok(CommandResult::Printed)
-            } else {
-                let suffix = attempt.map_or_else(String::new, |attempt| format!("?attempt={attempt}"));
-                get(c, token, format!("{base}/runs/{id}/logs{suffix}"))
-                    .await
-                    .map(Into::into)
-            }
+            stream_logs(c, token, base, &id, attempt, follow, output).await?;
+            Ok(CommandResult::Printed)
         }
         RunCommand::Cancel { id } => post_empty(c, token, format!("{base}/runs/{id}/cancel"))
             .await
@@ -432,16 +425,59 @@ async fn execute_run(
     }
 }
 
-async fn follow_logs(
+async fn stream_logs(
     client: &Client,
     token: &str,
     base: &str,
     id: &str,
     attempt: Option<u32>,
+    follow: bool,
     output: OutputMode,
 ) -> Result<(), CliError> {
+    read_log_chunks(
+        client,
+        token,
+        base,
+        id,
+        attempt,
+        follow,
+        |offset, next, complete, bytes| {
+            let mut stdout = std::io::stdout().lock();
+            match output {
+                OutputMode::Human => stdout.write_all(bytes)?,
+                OutputMode::Json => {
+                    serde_json::to_writer(
+                        &mut stdout,
+                        &serde_json::json!({
+                            "offset": offset,
+                            "next_offset": next,
+                            "complete": complete,
+                            "data": String::from_utf8_lossy(bytes),
+                        }),
+                    )?;
+                    stdout.write_all(b"\n")?;
+                }
+            }
+            stdout.flush()?;
+            Ok(())
+        },
+    )
+    .await
+}
+
+async fn read_log_chunks<F>(
+    client: &Client,
+    token: &str,
+    base: &str,
+    id: &str,
+    attempt: Option<u32>,
+    follow: bool,
+    mut emit: F,
+) -> Result<(), CliError>
+where
+    F: FnMut(u64, u64, bool, &[u8]) -> Result<(), CliError>,
+{
     let mut offset = 0_u64;
-    let mut collected = Vec::new();
     loop {
         let mut url = reqwest::Url::parse(&format!("{base}/runs/{id}/logs"))
             .map_err(|error| CliError::local(error.to_string()))?;
@@ -449,7 +485,9 @@ async fn follow_logs(
             let mut query = url.query_pairs_mut();
             query.append_pair("offset", &offset.to_string());
             query.append_pair("limit", "65536");
-            query.append_pair("wait", "20s");
+            if follow {
+                query.append_pair("wait", "20s");
+            }
             if let Some(attempt) = attempt {
                 query.append_pair("attempt", &attempt.to_string());
             }
@@ -465,25 +503,19 @@ async fn follow_logs(
             .get("x-lmt-log-next-offset")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok())
-            .unwrap_or(offset);
+            .ok_or_else(|| CliError::local("log response omitted a valid next offset"))?;
         let bytes = response.bytes().await?;
-        match output {
-            OutputMode::Human => {
-                print!("{}", String::from_utf8_lossy(&bytes));
-                std::io::stdout().flush()?;
-            }
-            OutputMode::Json => collected.extend_from_slice(&bytes),
+        if next != offset.saturating_add(bytes.len() as u64) {
+            return Err(CliError::local("log response offset did not match its chunk length"));
         }
+        emit(offset, next, complete, &bytes)?;
         offset = next;
         if complete {
             break;
         }
-    }
-    if matches!(output, OutputMode::Json) {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&String::from_utf8_lossy(&collected))?
-        );
+        if !follow && bytes.is_empty() {
+            break;
+        }
     }
     Ok(())
 }
@@ -775,6 +807,70 @@ mod tests {
             assert_eq!(error.message.contains("manually revoke"), !cleanup_confirmed);
             assert_eq!(fs::read_to_string(path).expect("existing file"), "racing existing file");
         }
+    }
+
+    #[tokio::test]
+    async fn completed_logs_stream_every_chunk_with_bounded_callback_memory() {
+        use axum::{
+            Router,
+            body::Bytes,
+            extract::{Query, State},
+            http::{HeaderMap, HeaderValue},
+            routing::get,
+        };
+        use serde::Deserialize;
+        use std::sync::Arc;
+
+        #[derive(Deserialize)]
+        struct ChunkQuery {
+            offset: u64,
+            limit: usize,
+        }
+        async fn chunk(State(log): State<Arc<Vec<u8>>>, Query(query): Query<ChunkQuery>) -> (HeaderMap, Bytes) {
+            let start = usize::try_from(query.offset).expect("offset").min(log.len());
+            let end = start.saturating_add(query.limit).min(log.len());
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-lmt-log-next-offset",
+                HeaderValue::from_str(&end.to_string()).expect("next offset"),
+            );
+            headers.insert(
+                "x-lmt-log-complete",
+                HeaderValue::from_static(if end == log.len() { "true" } else { "false" }),
+            );
+            (headers, Bytes::copy_from_slice(&log[start..end]))
+        }
+
+        let log = Arc::new(vec![b'x'; 1024 * 1024 + 17]);
+        let expected = log.len();
+        let app = Router::new()
+            .route("/api/v1alpha1/runs/run-a/logs", get(chunk))
+            .with_state(log);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}/api/v1alpha1", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let mut total = 0_usize;
+        let mut max_chunk = 0_usize;
+        let mut chunks = 0_u32;
+        read_log_chunks(
+            &Client::new(),
+            "operator",
+            &base,
+            "run-a",
+            None,
+            false,
+            |_, _, _, bytes| {
+                total += bytes.len();
+                max_chunk = max_chunk.max(bytes.len());
+                chunks += 1;
+                Ok(())
+            },
+        )
+        .await
+        .expect("stream complete log");
+        assert_eq!(total, expected);
+        assert!(chunks > 1);
+        assert!(max_chunk <= 65_536);
     }
 
     #[test]
