@@ -45,6 +45,70 @@ pub struct BackupVerifyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct StatusResponse {
+    pub version: String,
+    pub schema_version: u32,
+    pub config_revision: u64,
+    pub runs_pending: u64,
+    pub runs_running: u64,
+    pub mirrors_due: u64,
+    pub run_logs_stored_bytes: u64,
+    pub mirrors: Vec<MirrorStatusView>,
+    pub nodes: Vec<NodeStatusView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorStatusView {
+    pub name: String,
+    pub node: String,
+    pub enabled: bool,
+    pub current_run_state: Option<RunState>,
+    pub current_run_created_at_ms: Option<i64>,
+    pub last_run_state: Option<RunState>,
+    pub last_terminal_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub next_due_at_ms: Option<i64>,
+    pub due_since_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NodeStatusView {
+    pub name: String,
+    pub online: bool,
+    pub bound: bool,
+    pub last_seen_at_ms: Option<i64>,
+    pub active_runs: u32,
+    pub max_concurrent_runs: u32,
+    pub mirror_root_free_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorCheckStatus {
+    Ok,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DoctorCheck {
+    pub id: String,
+    pub status: DoctorCheckStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DoctorResponse {
+    pub healthy: bool,
+    pub checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct BundleRequest {
     pub files: Vec<BundleFile>,
 }

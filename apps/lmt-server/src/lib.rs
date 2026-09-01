@@ -52,11 +52,19 @@ pub struct ServerConfig {
     pub run_logs: Option<RunLogsConfig>,
     #[serde(default)]
     pub backup: Option<BackupConfig>,
+    #[serde(default)]
+    pub status: Option<StatusConfig>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackupConfig {
     pub directory: PathBuf,
+}
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StatusConfig {
+    #[serde(default)]
+    pub public: bool,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +102,8 @@ pub struct AppState {
     database_path: PathBuf,
     backup_dir: Option<PathBuf>,
     backup_lock: Arc<Mutex<()>>,
+    public_status: bool,
+    deprecated_inline_credentials: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +145,9 @@ struct AppMetrics {
     cancellations_immediate: AtomicU64,
     cancellations_dispatched: AtomicU64,
     logs_expired: AtomicU64,
+    backup_last_success_seconds: AtomicU64,
+    backup_failures: AtomicU64,
+    auth_failures: AtomicU64,
 }
 impl AppState {
     pub fn new(store: Store, log_dir: PathBuf, token: String, offline_after: Duration) -> Self {
@@ -153,6 +166,8 @@ impl AppState {
             database_path: PathBuf::new(),
             backup_dir: None,
             backup_lock: Arc::new(Mutex::new(())),
+            public_status: false,
+            deprecated_inline_credentials: false,
         }
     }
 
@@ -217,6 +232,8 @@ pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> a
     state.run_log_policy = c.run_logs.as_ref().map(parse_run_log_policy).transpose()?.flatten();
     state.database_path.clone_from(&c.database_path);
     state.backup_dir = c.backup.as_ref().map(|value| value.directory.clone());
+    state.public_status = c.status.as_ref().is_some_and(|status| status.public);
+    state.deprecated_inline_credentials = !c.agents.is_empty() || c.operator_token.is_some();
     tokio::spawn(run_scheduler(state.clone()));
     if state.run_log_policy.is_some() {
         tokio::spawn(run_log_maintenance(state.clone()));
@@ -454,6 +471,8 @@ pub fn build_router(s: AppState) -> Router {
         .route("/api/v1alpha1/maintenance/logs/run", post(log_maintenance_run))
         .route("/api/v1alpha1/backups", get(backups).post(create_backup))
         .route("/api/v1alpha1/backups/{id}/verify", post(verify_backup))
+        .route("/api/v1alpha1/status", get(status))
+        .route("/api/v1alpha1/doctor", get(doctor))
         .route("/api/v1alpha1/agent/poll", post(poll))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/events", post(event))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/log", put(upload_log))
@@ -465,22 +484,12 @@ async fn ready(State(s): State<AppState>) -> Result<Json<HealthResponse>, Failur
 }
 
 async fn metrics(State(state): State<AppState>) -> Result<Response, Failure> {
-    let runs = state.store.list_runs().await?;
-    let mirrors = state.store.list_mirrors().await?;
+    use std::fmt::Write as _;
+
+    let counts = state.store.operational_counts().await?;
+    let mirrors = state.store.mirror_operational_status().await?;
     let now = state.now_ms();
     let nodes = state.store.list_nodes().await?;
-    let pending = runs
-        .iter()
-        .filter(|run| run.state == lmt_core::RunState::Pending)
-        .count();
-    let running = runs
-        .iter()
-        .filter(|run| run.state == lmt_core::RunState::Running)
-        .count();
-    let mirrors_due = mirrors
-        .iter()
-        .filter(|mirror| mirror.scheduled_due_since_ms.is_some())
-        .count();
     let nodes_online = nodes
         .iter()
         .filter(|node| {
@@ -488,7 +497,7 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, Failure> {
                 .is_some_and(|seen| now - seen <= i64::try_from(state.offline_after.as_millis()).unwrap_or(i64::MAX))
         })
         .count();
-    let body = format!(
+    let mut body = format!(
         "lmt_up 1\nlmt_runs_pending {}\nlmt_runs_running {}\nlmt_mirrors_due {}\nlmt_nodes_online {}\n\
 lmt_scheduler_occurrences_total{{kind=\"interval\",outcome=\"due\"}} {}\n\
 lmt_scheduler_occurrences_total{{kind=\"interval\",outcome=\"skipped\"}} {}\n\
@@ -504,9 +513,9 @@ lmt_attempts_terminal_total{{state=\"interrupted\"}} {}\n\
 lmt_cancellations_total{{outcome=\"immediate\"}} {}\n\
 lmt_cancellations_total{{outcome=\"dispatched\"}} {}\n\
 lmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_total {}\nlmt_log_upload_failures_total {}\n",
-        pending,
-        running,
-        mirrors_due,
+        counts.pending_runs,
+        counts.running_runs,
+        counts.due_mirrors,
         nodes_online,
         state.metrics.scheduler_interval_due.load(Ordering::Relaxed),
         state.metrics.scheduler_interval_skipped.load(Ordering::Relaxed),
@@ -526,7 +535,79 @@ lmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_to
         state.metrics.uploaded_bytes.load(Ordering::Relaxed),
         state.metrics.log_failures.load(Ordering::Relaxed)
     );
+    writeln!(body, "lmt_run_logs_stored_bytes {}", counts.stored_log_bytes).expect("String write");
+    writeln!(
+        body,
+        "lmt_backup_last_success_timestamp_seconds {}",
+        state.metrics.backup_last_success_seconds.load(Ordering::Relaxed)
+    )
+    .expect("String write");
+    writeln!(
+        body,
+        "lmt_backup_failures_total {}\nlmt_log_expired_total {}\nlmt_auth_failures_total {}",
+        state.metrics.backup_failures.load(Ordering::Relaxed),
+        state.metrics.logs_expired.load(Ordering::Relaxed),
+        state.metrics.auth_failures.load(Ordering::Relaxed)
+    )
+    .expect("String write");
+    append_entity_metrics(&mut body, mirrors, nodes, now, state.offline_after);
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
+}
+
+fn append_entity_metrics(
+    body: &mut String,
+    mirrors: Vec<lmt_store::MirrorOperationalRecord>,
+    nodes: Vec<lmt_store::NodeRecord>,
+    now: i64,
+    offline_after: Duration,
+) {
+    use std::fmt::Write as _;
+
+    for mirror in mirrors {
+        let name = prometheus_label(&mirror.name);
+        let node = prometheus_label(&mirror.owner_node);
+        writeln!(
+            *body,
+            "lmt_mirror_due{{mirror=\"{name}\"}} {}",
+            u8::from(mirror.due_since_ms.is_some())
+        )
+        .expect("String write");
+        writeln!(
+            *body,
+            "lmt_mirror_last_success_timestamp_seconds{{mirror=\"{name}\",node=\"{node}\"}} {}",
+            mirror.last_success_at_ms.unwrap_or(0) / 1000
+        )
+        .expect("String write");
+        writeln!(
+            *body,
+            "lmt_mirror_last_terminal_timestamp_seconds{{mirror=\"{name}\",node=\"{node}\"}} {}",
+            mirror.last_terminal_at_ms.unwrap_or(0) / 1000
+        )
+        .expect("String write");
+    }
+    for node in nodes {
+        let name = prometheus_label(&node.name);
+        let online = node.last_seen_at_ms.is_some_and(|seen| {
+            now.saturating_sub(seen) <= i64::try_from(offline_after.as_millis()).unwrap_or(i64::MAX)
+        });
+        writeln!(*body, "lmt_node_online{{node=\"{name}\"}} {}", u8::from(online)).expect("String write");
+        writeln!(
+            *body,
+            "lmt_node_last_seen_timestamp_seconds{{node=\"{name}\"}} {}",
+            node.last_seen_at_ms.unwrap_or(0) / 1000
+        )
+        .expect("String write");
+        writeln!(
+            *body,
+            "lmt_node_mirror_root_free_bytes{{node=\"{name}\"}} {}",
+            node.mirror_root_free_bytes.unwrap_or(0)
+        )
+        .expect("String write");
+    }
+}
+
+fn prometheus_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
 }
 async fn validate(
     State(s): State<AppState>,
@@ -873,11 +954,30 @@ async fn create_backup(State(s): State<AppState>, h: HeaderMap) -> Result<Json<B
         .try_lock_owned()
         .map_err(|_| Failure::conflict("backup_busy", "another backup is in progress"))?;
     let source = s.database_path.clone();
-    let manifest = tokio::task::spawn_blocking(move || backup::create(&source, &directory))
-        .await
-        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?
-        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?;
+    let result = tokio::task::spawn_blocking(move || backup::create(&source, &directory)).await;
     drop(guard);
+    let manifest = match result {
+        Ok(Ok(manifest)) => manifest,
+        Ok(Err(error)) => {
+            s.metrics.backup_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(Failure::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backup_invalid",
+                error.to_string(),
+            ));
+        }
+        Err(error) => {
+            s.metrics.backup_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(Failure::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "backup_invalid",
+                error.to_string(),
+            ));
+        }
+    };
+    s.metrics
+        .backup_last_success_seconds
+        .store(u64::try_from(s.now_ms() / 1000).unwrap_or(0), Ordering::Relaxed);
     Ok(Json(manifest))
 }
 
@@ -906,6 +1006,242 @@ async fn verify_backup(
         backup: manifest,
         valid: true,
     }))
+}
+
+async fn operational_status(state: &AppState) -> Result<StatusResponse, Failure> {
+    let counts = state.store.operational_counts().await?;
+    let mirrors = state
+        .store
+        .mirror_operational_status()
+        .await?
+        .into_iter()
+        .map(|mirror| MirrorStatusView {
+            name: mirror.name,
+            node: mirror.owner_node,
+            enabled: mirror.enabled,
+            current_run_state: mirror.current_run_state,
+            current_run_created_at_ms: mirror.current_run_created_at_ms,
+            last_run_state: mirror.last_run_state,
+            last_terminal_at_ms: mirror.last_terminal_at_ms,
+            last_success_at_ms: mirror.last_success_at_ms,
+            next_due_at_ms: mirror.next_due_at_ms,
+            due_since_ms: mirror.due_since_ms,
+        })
+        .collect();
+    let now = state.now_ms();
+    let offline_after = i64::try_from(state.offline_after.as_millis()).unwrap_or(i64::MAX);
+    let nodes = state
+        .store
+        .list_nodes()
+        .await?
+        .into_iter()
+        .map(|node| NodeStatusView {
+            name: node.name,
+            online: node
+                .last_seen_at_ms
+                .is_some_and(|seen| now.saturating_sub(seen) <= offline_after),
+            bound: node.bound_agent_id.is_some(),
+            last_seen_at_ms: node.last_seen_at_ms,
+            active_runs: node.active_runs,
+            max_concurrent_runs: node.max_concurrent_runs,
+            mirror_root_free_bytes: node.mirror_root_free_bytes,
+        })
+        .collect();
+    let (schema_version, _) = state.store.database_diagnostics().await?;
+    Ok(StatusResponse {
+        version: env!("CARGO_PKG_VERSION").into(),
+        schema_version,
+        config_revision: state.store.current_revision().await?,
+        runs_pending: counts.pending_runs,
+        runs_running: counts.running_runs,
+        mirrors_due: counts.due_mirrors,
+        run_logs_stored_bytes: counts.stored_log_bytes,
+        mirrors,
+        nodes,
+    })
+}
+
+async fn status(State(s): State<AppState>, h: HeaderMap) -> Result<Json<StatusResponse>, Failure> {
+    if !s.public_status {
+        operator(&h, &s)?;
+    }
+    Ok(Json(operational_status(&s).await?))
+}
+
+fn doctor_check(id: &str, status: DoctorCheckStatus, message: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        id: id.into(),
+        status,
+        message: message.into(),
+    }
+}
+
+fn filesystem_check(id: &str, path: &Path) -> DoctorCheck {
+    match nix::sys::statvfs::statvfs(path) {
+        Ok(stat) => doctor_check(
+            id,
+            DoctorCheckStatus::Ok,
+            format!(
+                "{} bytes available",
+                stat.blocks_available().saturating_mul(stat.fragment_size())
+            ),
+        ),
+        Err(error) => doctor_check(id, DoctorCheckStatus::Critical, format!("{}: {error}", path.display())),
+    }
+}
+
+async fn doctor(State(s): State<AppState>, h: HeaderMap) -> Result<Json<DoctorResponse>, Failure> {
+    operator(&h, &s)?;
+    let status = operational_status(&s).await?;
+    let (_, database_ok) = s.store.database_diagnostics().await?;
+    let mut checks = vec![
+        doctor_check(
+            "server.version",
+            DoctorCheckStatus::Ok,
+            format!("LMT {} schema {}", status.version, status.schema_version),
+        ),
+        doctor_check(
+            "database.quick_check",
+            if database_ok {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Critical
+            },
+            if database_ok {
+                "SQLite quick_check passed"
+            } else {
+                "SQLite quick_check failed"
+            },
+        ),
+        doctor_check(
+            "config.revision",
+            DoctorCheckStatus::Ok,
+            format!("configuration revision {}", status.config_revision),
+        ),
+    ];
+    if let Some(parent) = s.database_path.parent() {
+        checks.push(filesystem_check("filesystem.database", parent));
+    }
+    checks.push(filesystem_check("filesystem.logs", &s.log_dir));
+    if let Some(directory) = &s.backup_dir {
+        checks.push(filesystem_check("filesystem.backups", directory));
+    }
+    checks.extend(doctor_operational_checks(&s, &status).await?);
+    let healthy = checks.iter().all(|check| check.status == DoctorCheckStatus::Ok);
+    Ok(Json(DoctorResponse { healthy, checks }))
+}
+
+async fn doctor_operational_checks(s: &AppState, status: &StatusResponse) -> Result<Vec<DoctorCheck>, Failure> {
+    let offline = status.nodes.iter().filter(|node| !node.online).count();
+    let mut checks = Vec::new();
+    checks.push(doctor_check(
+        "nodes.online",
+        if offline == 0 {
+            DoctorCheckStatus::Ok
+        } else {
+            DoctorCheckStatus::Critical
+        },
+        format!("{offline} offline Node(s)"),
+    ));
+    let unbound = status.nodes.iter().filter(|node| !node.bound).count();
+    checks.push(doctor_check(
+        "agents.binding",
+        if unbound == 0 {
+            DoctorCheckStatus::Ok
+        } else {
+            DoctorCheckStatus::Warning
+        },
+        format!("{unbound} unbound Node(s)"),
+    ));
+    checks.push(doctor_check(
+        "mirrors.due",
+        if status.mirrors_due == 0 {
+            DoctorCheckStatus::Ok
+        } else {
+            DoctorCheckStatus::Warning
+        },
+        format!("{} due Mirror(s)", status.mirrors_due),
+    ));
+    let stale_threshold = i64::try_from(s.offline_after.as_millis())
+        .unwrap_or(i64::MAX)
+        .saturating_mul(2);
+    let stale = status
+        .mirrors
+        .iter()
+        .filter(|mirror| {
+            mirror
+                .current_run_created_at_ms
+                .is_some_and(|created| s.now_ms().saturating_sub(created) > stale_threshold)
+        })
+        .count();
+    checks.push(doctor_check(
+        "runs.stale_nonterminal",
+        if stale == 0 {
+            DoctorCheckStatus::Ok
+        } else {
+            DoctorCheckStatus::Warning
+        },
+        format!("{stale} suspicious stale Run(s)"),
+    ));
+    let mut missing_logs = 0_u64;
+    for entry in s.store.log_retention_entries().await? {
+        if entry.expired_at_ms.is_none()
+            && entry.stored_bytes > 0
+            && fs::metadata(log_path(&s.log_dir, &entry.run_id, entry.attempt_no))
+                .await
+                .is_err()
+        {
+            missing_logs += 1;
+        }
+    }
+    checks.push(doctor_check(
+        "logs.files",
+        if missing_logs == 0 {
+            DoctorCheckStatus::Ok
+        } else {
+            DoctorCheckStatus::Critical
+        },
+        format!("{missing_logs} unexpected missing Run-log file(s)"),
+    ));
+    if let Some(check) = backup_doctor_check(s).await? {
+        checks.push(check);
+    }
+    checks.push(doctor_check(
+        "credentials.inline_deprecated",
+        if s.deprecated_inline_credentials {
+            DoctorCheckStatus::Warning
+        } else {
+            DoctorCheckStatus::Ok
+        },
+        if s.deprecated_inline_credentials {
+            "deprecated inline credentials are configured"
+        } else {
+            "no deprecated inline credentials configured"
+        },
+    ));
+    Ok(checks)
+}
+
+async fn backup_doctor_check(s: &AppState) -> Result<Option<DoctorCheck>, Failure> {
+    let Some(directory) = s.backup_dir.clone() else {
+        return Ok(None);
+    };
+    let backups = tokio::task::spawn_blocking(move || backup::list(&directory))
+        .await
+        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?
+        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?;
+    Ok(Some(doctor_check(
+        "backup.latest",
+        if backups.is_empty() {
+            DoctorCheckStatus::Warning
+        } else {
+            DoctorCheckStatus::Ok
+        },
+        backups.first().map_or_else(
+            || "no completed backup".into(),
+            |backup| format!("latest backup {}", backup.created_at),
+        ),
+    )))
 }
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
     let credential = agent(&h, &s).await?;
@@ -1212,14 +1548,21 @@ fn operator(h: &HeaderMap, s: &AppState) -> Result<(), Failure> {
     if bearer(h) == Some(s.operator_token.read().expect("operator token lock poisoned").as_str()) {
         Ok(())
     } else {
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         Err(Failure::unauthorized())
     }
 }
 async fn agent(h: &HeaderMap, s: &AppState) -> Result<lmt_store::AuthenticatedCredential, Failure> {
-    s.store
-        .authenticate_credential(bearer(h).ok_or_else(Failure::unauthorized)?)
-        .await?
-        .ok_or_else(Failure::unauthorized)
+    let Some(token) = bearer(h) else {
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        return Err(Failure::unauthorized());
+    };
+    if let Some(credential) = s.store.authenticate_credential(token).await? {
+        Ok(credential)
+    } else {
+        s.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+        Err(Failure::unauthorized())
+    }
 }
 async fn attempt_auth(s: &AppState, node: &str, id: &str, no: u32) -> Result<(), Failure> {
     if s.store.attempt_belongs_to_node(id, no, node).await? {
@@ -1448,6 +1791,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("lmt.db");
         let store = Store::open(&database).await.expect("store");
+        fs::create_dir_all(directory.path().join("logs")).await.expect("logs");
         store
             .upsert_credential("node-a", "secret", 1)
             .await
@@ -1912,5 +2256,80 @@ mod tests {
         let replacement = attempt_log_lock(&state, "transient-b", 1).await;
         assert!(state.log_locks.lock().await.len() <= 1);
         drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn metrics_and_public_status_are_bounded_and_sanitized_with_large_history() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("lmt.db");
+        drop(Store::open(&database).await.expect("schema"));
+        let mut connection = rusqlite::Connection::open(&database).expect("seed connection");
+        let transaction = connection.transaction().expect("transaction");
+        transaction
+            .execute_batch(
+                "INSERT INTO config_revisions(revision,bundle_hash,applied_at_ms,summary_json) VALUES(1,'h',1,'{}');
+                 INSERT INTO nodes(name,registered_at_ms,last_seen_at_ms,active_runs,capabilities_json,bound_agent_id)
+                   VALUES('node-a',1,1000,0,'{}','installation-a');
+                 INSERT INTO mirrors(name,managed,enabled,owner_node,current_generation) VALUES('demo',1,1,'node-a',1);
+                 INSERT INTO mirror_generations(mirror_name,generation,config_revision,owner_node,config_hash,config_toml,created_at_ms)
+                   VALUES('demo',1,1,'node-a','h','source_url=\"https://secret@example.invalid/private\"\nmirror_root=\"/secret/path\"',1);
+                 INSERT INTO mirror_schedule_state(mirror_name,next_due_at_ms,last_evaluated_at_ms,catch_up_pending,catch_up_since_ms)
+                   VALUES('demo',2000,1000,1,1500);",
+            )
+            .expect("seed entities");
+        {
+            let mut insert = transaction
+                .prepare("INSERT INTO runs(id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,finished_at_ms,max_attempts,retry_delay_ms) VALUES(?1,'demo',1,'node-a','manual','succeeded',?2,?2,1,0)")
+                .expect("prepare runs");
+            for index in 0..10_000_i64 {
+                insert
+                    .execute(rusqlite::params![format!("run-{index:05}"), index + 1])
+                    .expect("historical Run");
+            }
+        }
+        transaction.commit().expect("commit history");
+        drop(connection);
+        let store = Store::open(&database).await.expect("store");
+        let mut state = AppState::new(
+            store,
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.public_status = true;
+        state.clock = Arc::new(FakeClock(AtomicI64::new(1_000)));
+        let metrics_response = metrics(State(state.clone())).await.expect("metrics");
+        let metrics_body = axum::body::to_bytes(metrics_response.into_body(), 128 * 1024)
+            .await
+            .expect("metrics body");
+        let metrics_text = std::str::from_utf8(&metrics_body).expect("utf8");
+        assert!(metrics_text.contains("lmt_runs_pending 0"));
+        assert!(metrics_text.contains("lmt_mirrors_due 1"));
+
+        let projection = status(State(state), HeaderMap::new()).await.expect("public status").0;
+        let json = serde_json::to_string(&projection).expect("status JSON");
+        for forbidden in ["secret@example", "/secret/path", "source_url", "token"] {
+            assert!(!json.contains(forbidden), "status leaked {forbidden}: {json}");
+        }
+        assert_eq!(projection.mirrors.len(), 1);
+        assert_eq!(projection.nodes.len(), 1);
+
+        let mut private_state = state_for_doctor(&database, directory.path().join("logs")).await;
+        private_state.public_status = false;
+        assert!(status(State(private_state.clone()), HeaderMap::new()).await.is_err());
+        let before = private_state.store.operational_counts().await.expect("before doctor");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
+        let diagnostic = doctor(State(private_state.clone()), headers).await.expect("doctor").0;
+        assert!(diagnostic.checks.iter().all(|check| !check.id.is_empty()));
+        assert_eq!(
+            before,
+            private_state.store.operational_counts().await.expect("after doctor")
+        );
+    }
+
+    async fn state_for_doctor(database: &Path, logs: PathBuf) -> AppState {
+        let store = Store::open(database).await.expect("doctor store");
+        AppState::new(store, logs, "operator".into(), Duration::from_secs(90))
     }
 }

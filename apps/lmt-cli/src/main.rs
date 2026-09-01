@@ -7,7 +7,7 @@ use config::{ClientSettings, OutputMode};
 use lmt_core::{BundleFile, RunTrigger};
 use lmt_protocol::v1alpha1::{
     ApplyRequest, BindingReplaceRequest, BundleRequest, CredentialIssueRequest, CredentialIssueResponse,
-    ManualRunRequest, PlanResponse,
+    DoctorResponse, ManualRunRequest, PlanResponse,
 };
 use reqwest::{Client, Response};
 use serde::Serialize;
@@ -111,6 +111,8 @@ enum Command {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    Status,
+    Doctor,
 }
 #[derive(Subcommand)]
 enum BackupCommand {
@@ -313,13 +315,9 @@ async fn run() -> Result<(), CliError> {
                 .await?
                 .into(),
         },
-        Command::Backup { command } => match command {
-            BackupCommand::Create => post_empty(&client, &token, format!("{base}/backups")).await?.into(),
-            BackupCommand::List => get(&client, &token, format!("{base}/backups")).await?.into(),
-            BackupCommand::Verify { id } => post_empty(&client, &token, format!("{base}/backups/{id}/verify"))
-                .await?
-                .into(),
-        },
+        Command::Backup { command } => execute_backup(&client, &token, &base, command).await?,
+        Command::Status => get(&client, &token, format!("{base}/status")).await?.into(),
+        Command::Doctor => execute_doctor(&client, &token, &base, settings.output).await?,
     };
     let bytes = match result {
         CommandResult::Response(response) => checked(response).await?.bytes().await?.to_vec(),
@@ -336,6 +334,49 @@ impl From<Response> for CommandResult {
     fn from(response: Response) -> Self {
         Self::Response(response)
     }
+}
+
+fn doctor_exit_code(response: &DoctorResponse) -> i32 {
+    if response.healthy { 0 } else { 8 }
+}
+
+async fn execute_backup(
+    c: &Client,
+    token: &str,
+    base: &str,
+    command: BackupCommand,
+) -> Result<CommandResult, CliError> {
+    match command {
+        BackupCommand::Create => post_empty(c, token, format!("{base}/backups")).await.map(Into::into),
+        BackupCommand::List => get(c, token, format!("{base}/backups")).await.map(Into::into),
+        BackupCommand::Verify { id } => post_empty(c, token, format!("{base}/backups/{id}/verify"))
+            .await
+            .map(Into::into),
+    }
+}
+
+async fn execute_doctor(
+    client: &Client,
+    token: &str,
+    base: &str,
+    output_mode: OutputMode,
+) -> Result<CommandResult, CliError> {
+    let bytes = checked(get(client, token, format!("{base}/doctor")).await?)
+        .await?
+        .bytes()
+        .await?;
+    let diagnostic: DoctorResponse = serde_json::from_slice(&bytes)?;
+    let rendered = output::render(&bytes, output_mode)?;
+    if !rendered.is_empty() {
+        println!("{rendered}");
+    }
+    if doctor_exit_code(&diagnostic) != 0 {
+        return Err(CliError {
+            exit_code: doctor_exit_code(&diagnostic),
+            message: "doctor found unhealthy conditions".into(),
+        });
+    }
+    Ok(CommandResult::Printed)
 }
 async fn execute_run(
     c: &Client,
@@ -601,6 +642,24 @@ mod tests {
         assert!(
             write_secret(&path, "replacement").is_err(),
             "existing secret was overwritten"
+        );
+    }
+
+    #[test]
+    fn unhealthy_doctor_has_documented_exit_code() {
+        assert_eq!(
+            doctor_exit_code(&DoctorResponse {
+                healthy: false,
+                checks: vec![],
+            }),
+            8
+        );
+        assert_eq!(
+            doctor_exit_code(&DoctorResponse {
+                healthy: true,
+                checks: vec![],
+            }),
+            0
         );
     }
 }

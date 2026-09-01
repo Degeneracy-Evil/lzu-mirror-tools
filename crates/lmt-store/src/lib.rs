@@ -182,6 +182,28 @@ pub struct RunQuery {
     pub before: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct OperationalCounts {
+    pub pending_runs: u64,
+    pub running_runs: u64,
+    pub due_mirrors: u64,
+    pub stored_log_bytes: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MirrorOperationalRecord {
+    pub name: String,
+    pub owner_node: String,
+    pub enabled: bool,
+    pub current_run_state: Option<RunState>,
+    pub current_run_created_at_ms: Option<i64>,
+    pub last_run_state: Option<RunState>,
+    pub last_terminal_at_ms: Option<i64>,
+    pub last_success_at_ms: Option<i64>,
+    pub next_due_at_ms: Option<i64>,
+    pub due_since_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttemptRecord {
     pub run_id: String,
@@ -1234,6 +1256,81 @@ impl Store {
             .query_map([], map_run)?
             .collect::<Result<_, _>>()
             .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn operational_counts(&self) -> Result<OperationalCounts, StoreError> {
+        self.call(|connection| {
+            connection
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM runs WHERE state='pending'),
+                       (SELECT COUNT(*) FROM runs WHERE state='running'),
+                       (SELECT COUNT(*) FROM mirror_schedule_state WHERE catch_up_pending=1),
+                       (SELECT COALESCE(SUM(stored_bytes),0) FROM attempt_logs WHERE expired_at_ms IS NULL)",
+                    [],
+                    |row| {
+                        Ok(OperationalCounts {
+                            pending_runs: row.get(0)?,
+                            running_runs: row.get(1)?,
+                            due_mirrors: row.get(2)?,
+                            stored_log_bytes: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn mirror_operational_status(&self) -> Result<Vec<MirrorOperationalRecord>, StoreError> {
+        self.call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT m.name,m.owner_node,m.enabled,
+                   (SELECT state FROM runs WHERE mirror_name=m.name AND state IN('pending','running')
+                     ORDER BY created_at_ms DESC,id DESC LIMIT 1),
+                   (SELECT created_at_ms FROM runs WHERE mirror_name=m.name AND state IN('pending','running')
+                     ORDER BY created_at_ms DESC,id DESC LIMIT 1),
+                   (SELECT state FROM runs WHERE mirror_name=m.name AND state NOT IN('pending','running')
+                     ORDER BY created_at_ms DESC,id DESC LIMIT 1),
+                   (SELECT finished_at_ms FROM runs WHERE mirror_name=m.name AND state NOT IN('pending','running')
+                     ORDER BY created_at_ms DESC,id DESC LIMIT 1),
+                   (SELECT MAX(finished_at_ms) FROM runs WHERE mirror_name=m.name AND state='succeeded'),
+                   s.next_due_at_ms,s.catch_up_since_ms
+                 FROM mirrors m LEFT JOIN mirror_schedule_state s ON s.mirror_name=m.name
+                 WHERE m.managed=1 ORDER BY m.name",
+            )?;
+            statement
+                .query_map([], |row| {
+                    let current: Option<String> = row.get(3)?;
+                    let last: Option<String> = row.get(5)?;
+                    Ok(MirrorOperationalRecord {
+                        name: row.get(0)?,
+                        owner_node: row.get(1)?,
+                        enabled: row.get(2)?,
+                        current_run_state: current.as_deref().map(parse_run_state).transpose()?,
+                        current_run_created_at_ms: row.get(4)?,
+                        last_run_state: last.as_deref().map(parse_run_state).transpose()?,
+                        last_terminal_at_ms: row.get(6)?,
+                        last_success_at_ms: row.get(7)?,
+                        next_due_at_ms: row.get(8)?,
+                        due_since_ms: row.get(9)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn database_diagnostics(&self) -> Result<(u32, bool), StoreError> {
+        self.call(|connection| {
+            let schema = connection.query_row("SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })?;
+            let quick: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            Ok((schema, quick == "ok"))
         })
         .await
     }
