@@ -20,6 +20,31 @@ pub struct ApiError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct BackupManifest {
+    pub id: String,
+    pub created_at: String,
+    pub lmt_version: String,
+    pub schema_version: u32,
+    pub config_revision: u64,
+    pub database_size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BackupListResponse {
+    pub backups: Vec<BackupManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BackupVerifyResponse {
+    pub backup: BackupManifest,
+    pub valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct BundleRequest {
     pub files: Vec<BundleFile>,
 }

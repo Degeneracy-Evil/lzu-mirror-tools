@@ -107,6 +107,16 @@ enum Command {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+}
+#[derive(Subcommand)]
+enum BackupCommand {
+    Create,
+    List,
+    Verify { id: String },
 }
 #[derive(Subcommand)]
 enum MaintenanceCommand {
@@ -300,6 +310,13 @@ async fn run() -> Result<(), CliError> {
                 .await?
                 .into(),
             LogMaintenanceCommand::Run => post_empty(&client, &token, format!("{base}/maintenance/logs/run"))
+                .await?
+                .into(),
+        },
+        Command::Backup { command } => match command {
+            BackupCommand::Create => post_empty(&client, &token, format!("{base}/backups")).await?.into(),
+            BackupCommand::List => get(&client, &token, format!("{base}/backups")).await?.into(),
+            BackupCommand::Verify { id } => post_empty(&client, &token, format!("{base}/backups/{id}/verify"))
                 .await?
                 .into(),
         },

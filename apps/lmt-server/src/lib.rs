@@ -28,6 +28,7 @@ use tokio::{
     sync::{Mutex, Notify},
 };
 
+pub mod backup;
 mod process_lock;
 mod services;
 
@@ -49,6 +50,13 @@ pub struct ServerConfig {
     pub agents: Vec<AgentCredential>,
     #[serde(default)]
     pub run_logs: Option<RunLogsConfig>,
+    #[serde(default)]
+    pub backup: Option<BackupConfig>,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupConfig {
+    pub directory: PathBuf,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,6 +91,9 @@ pub struct AppState {
     poll_wait: Duration,
     clock: Arc<dyn Clock>,
     run_log_policy: Option<RunLogPolicy>,
+    database_path: PathBuf,
+    backup_dir: Option<PathBuf>,
+    backup_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -139,6 +150,9 @@ impl AppState {
             poll_wait: Duration::from_secs(20),
             clock: Arc::new(SystemClock),
             run_log_policy: None,
+            database_path: PathBuf::new(),
+            backup_dir: None,
+            backup_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -201,6 +215,8 @@ pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> a
     state.clock = clock;
     state.operator_token_file.clone_from(&c.operator_token_file);
     state.run_log_policy = c.run_logs.as_ref().map(parse_run_log_policy).transpose()?.flatten();
+    state.database_path.clone_from(&c.database_path);
+    state.backup_dir = c.backup.as_ref().map(|value| value.directory.clone());
     tokio::spawn(run_scheduler(state.clone()));
     if state.run_log_policy.is_some() {
         tokio::spawn(run_log_maintenance(state.clone()));
@@ -436,6 +452,8 @@ pub fn build_router(s: AppState) -> Router {
         )
         .route("/api/v1alpha1/maintenance/logs/plan", get(log_maintenance_plan))
         .route("/api/v1alpha1/maintenance/logs/run", post(log_maintenance_run))
+        .route("/api/v1alpha1/backups", get(backups).post(create_backup))
+        .route("/api/v1alpha1/backups/{id}/verify", post(verify_backup))
         .route("/api/v1alpha1/agent/poll", post(poll))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/events", post(event))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/log", put(upload_log))
@@ -834,6 +852,60 @@ async fn log_maintenance_plan(State(s): State<AppState>, h: HeaderMap) -> Result
 async fn log_maintenance_run(State(s): State<AppState>, h: HeaderMap) -> Result<Json<LogMaintenancePlan>, Failure> {
     operator(&h, &s)?;
     Ok(Json(execute_log_maintenance(&s).await?))
+}
+
+fn backup_directory(state: &AppState) -> Result<PathBuf, Failure> {
+    state.backup_dir.clone().ok_or_else(|| {
+        Failure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backup_not_configured",
+            "backup directory is not configured",
+        )
+    })
+}
+
+async fn create_backup(State(s): State<AppState>, h: HeaderMap) -> Result<Json<BackupManifest>, Failure> {
+    operator(&h, &s)?;
+    let directory = backup_directory(&s)?;
+    let guard = s
+        .backup_lock
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| Failure::conflict("backup_busy", "another backup is in progress"))?;
+    let source = s.database_path.clone();
+    let manifest = tokio::task::spawn_blocking(move || backup::create(&source, &directory))
+        .await
+        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?
+        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?;
+    drop(guard);
+    Ok(Json(manifest))
+}
+
+async fn backups(State(s): State<AppState>, h: HeaderMap) -> Result<Json<BackupListResponse>, Failure> {
+    operator(&h, &s)?;
+    let directory = backup_directory(&s)?;
+    let backups = tokio::task::spawn_blocking(move || backup::list(&directory))
+        .await
+        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?
+        .map_err(|error| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "backup_invalid", error.to_string()))?;
+    Ok(Json(BackupListResponse { backups }))
+}
+
+async fn verify_backup(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<BackupVerifyResponse>, Failure> {
+    operator(&h, &s)?;
+    let directory = backup_directory(&s)?;
+    let manifest = tokio::task::spawn_blocking(move || backup::verify(&directory, &id))
+        .await
+        .map_err(|error| Failure::bad("backup_invalid", error.to_string()))?
+        .map_err(|error| Failure::bad("backup_invalid", error.to_string()))?;
+    Ok(Json(BackupVerifyResponse {
+        backup: manifest,
+        valid: true,
+    }))
 }
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
     let credential = agent(&h, &s).await?;

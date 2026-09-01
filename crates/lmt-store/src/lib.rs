@@ -1425,6 +1425,45 @@ impl Store {
     }
 }
 
+/// Normalizes a verified, offline restored snapshot before it can dispatch work.
+/// The caller must hold the Server process lock.
+pub fn normalize_restored_database(path: &Path, restored_at_ms: i64) -> Result<(), StoreError> {
+    let mut connection = Connection::open(path)?;
+    configure_and_migrate(&mut connection, restored_at_ms)?;
+    let transaction = connection.transaction()?;
+    let message = "interrupted by offline control-plane restore";
+    transaction.execute(
+        "UPDATE attempts SET state='interrupted',finished_at_ms=?1,exit_code=NULL,
+           failure_kind='interrupted',failure_message=?2
+         WHERE state IN('queued','accepted','running')",
+        params![restored_at_ms, message],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET state='cancelled',finished_at_ms=?1,retry_due_at_ms=NULL,
+           final_exit_code=NULL,failure_kind=NULL,failure_message=?2
+         WHERE state='pending' AND NOT EXISTS(
+           SELECT 1 FROM attempts WHERE attempts.run_id=runs.id AND attempts.dispatch_count > 0
+         )",
+        params![
+            restored_at_ms,
+            "cancelled by offline control-plane restore before dispatch"
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET state='failed',finished_at_ms=?1,retry_due_at_ms=NULL,
+           final_exit_code=NULL,failure_kind='interrupted',failure_message=?2
+         WHERE state IN('pending','running')",
+        params![restored_at_ms, message],
+    )?;
+    transaction.execute(
+        "UPDATE nodes SET active_runs=0,agent_instance_id=NULL,agent_boot_id=NULL",
+        [],
+    )?;
+    transaction.commit()?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
+
 fn reconcile_schedule(
     transaction: &Transaction<'_>,
     change: &ConfigChange,
@@ -1904,6 +1943,79 @@ mod tests {
             }],
         })
         .expect("valid")
+    }
+
+    #[tokio::test]
+    async fn offline_restore_normalizes_execution_without_erasing_schedule_state() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("restored.db");
+        drop(Store::open(&path).await.expect("initialize schema"));
+        let connection = Connection::open(&path).expect("open seed database");
+        connection
+            .execute_batch(
+                "INSERT INTO config_revisions(revision,bundle_hash,applied_at_ms,summary_json) VALUES(1,'h',1,'{}');
+                 INSERT INTO nodes(name,registered_at_ms,agent_instance_id,agent_boot_id,active_runs,capabilities_json)
+                   VALUES('node-a',1,'instance','boot',2,'{}');
+                 INSERT INTO mirrors(name,managed,enabled,owner_node,current_generation) VALUES
+                   ('undispatched',1,1,'node-a',1),('active',1,1,'node-a',1);
+                 INSERT INTO mirror_generations(mirror_name,generation,config_revision,owner_node,config_hash,config_toml,created_at_ms) VALUES
+                   ('undispatched',1,1,'node-a','h1','x',1),('active',1,1,'node-a','h2','x',1);
+                 INSERT INTO mirror_schedule_state(mirror_name,next_due_at_ms,last_evaluated_at_ms,catch_up_pending,catch_up_since_ms)
+                   VALUES('active',9000,8000,1,7000);
+                 INSERT INTO runs(id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,max_attempts,retry_delay_ms,retry_due_at_ms) VALUES
+                   ('run-undispatched','undispatched',1,'node-a','manual','pending',1,1,0,5000),
+                   ('run-active','active',1,'node-a','scheduled','running',2,2,100,5000);
+                 INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,dispatch_count)
+                   VALUES('run-active',1,'running','spec','{}',2,1);",
+            )
+            .expect("seed recovery state");
+        drop(connection);
+
+        normalize_restored_database(&path, 10_000).expect("normalize restored database");
+        let connection = Connection::open(&path).expect("inspect");
+        let pending: (String, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT state,retry_due_at_ms,failure_message FROM runs WHERE id='run-undispatched'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("undispatched");
+        assert_eq!(pending.0, "cancelled");
+        assert_eq!(pending.1, None);
+        assert!(pending.2.expect("message").contains("restore"));
+        let active: (String, String) = connection
+            .query_row("SELECT state,failure_kind FROM runs WHERE id='run-active'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("active Run");
+        assert_eq!(active, ("failed".into(), "interrupted".into()));
+        assert_eq!(
+            connection
+                .query_row("SELECT state FROM attempts WHERE run_id='run-active'", [], |row| row
+                    .get::<_, String>(
+                    0
+                ))
+                .expect("Attempt"),
+            "interrupted"
+        );
+        let node: (u32, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT active_runs,agent_instance_id,agent_boot_id FROM nodes WHERE name='node-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("Node");
+        assert_eq!(node, (0, None, None));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT next_due_at_ms FROM mirror_schedule_state WHERE mirror_name='active'",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .expect("schedule state"),
+            9000
+        );
     }
 
     fn scheduled_bundle(program: &str, interval: &str, max_attempts: u32) -> CanonicalBundle {

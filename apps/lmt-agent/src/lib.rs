@@ -26,6 +26,27 @@ use spool::{SpoolRecord, log_path, read, retire, state_path, write};
 
 const INSTALLATION_ID_FILE: &str = "agent-id";
 
+pub async fn reset_spool(config: &Config, acknowledged: bool) -> anyhow::Result<u64> {
+    if !acknowledged {
+        bail!("reset-spool requires --acknowledge-control-plane-restore");
+    }
+    fs::create_dir_all(&config.storage.spool_dir).await?;
+    let _lock = process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))?;
+    let mut removed = 0;
+    let mut entries = fs::read_dir(&config.storage.spool_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json" | "log" | "retired")
+        ) {
+            fs::remove_file(path).await?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 #[derive(Clone)]
 pub struct Agent {
     config: Config,
@@ -566,6 +587,51 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_spool_reset_requires_lock_and_preserves_identity_and_mirror_data() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        let config = agent.config.clone();
+        fs::create_dir_all(&config.storage.spool_dir).await.expect("spool");
+        fs::create_dir_all(&config.storage.mirror_root)
+            .await
+            .expect("mirror root");
+        fs::write(config.storage.spool_dir.join(INSTALLATION_ID_FILE), "installation-a\n")
+            .await
+            .expect("identity");
+        fs::write(config.storage.spool_dir.join("run-1.json"), "{}")
+            .await
+            .expect("state");
+        fs::write(config.storage.spool_dir.join("run-1.log"), "output")
+            .await
+            .expect("log");
+        fs::write(config.storage.spool_dir.join("run-2.retired"), "{}")
+            .await
+            .expect("retired");
+        fs::write(config.storage.mirror_root.join("content"), "authoritative mirror data")
+            .await
+            .expect("mirror content");
+        let held = process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))
+            .expect("held Agent lock");
+        assert!(reset_spool(&config, true).await.is_err());
+        drop(held);
+        assert!(reset_spool(&config, false).await.is_err());
+        assert_eq!(reset_spool(&config, true).await.expect("reset"), 3);
+        assert_eq!(
+            fs::read_to_string(config.storage.spool_dir.join(INSTALLATION_ID_FILE))
+                .await
+                .expect("preserved identity"),
+            "installation-a\n"
+        );
+        assert_eq!(
+            fs::read_to_string(config.storage.mirror_root.join("content"))
+                .await
+                .expect("preserved mirror"),
+            "authoritative mirror data"
         );
     }
 

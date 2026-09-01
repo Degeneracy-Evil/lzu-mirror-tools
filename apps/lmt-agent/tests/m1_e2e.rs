@@ -102,6 +102,7 @@ impl Harness {
                 token: AGENT_TOKEN.into(),
             }],
             run_logs: None,
+            backup: None,
         };
         let (server_task, server_state) = start_server(&server_config, server_address, clock.clone()).await;
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
