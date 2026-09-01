@@ -457,7 +457,12 @@ async fn manual(
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RunListQuery {
+    mirror: Option<String>,
+    node: Option<String>,
+    state: Option<lmt_core::RunState>,
     trigger: Option<lmt_core::RunTrigger>,
+    limit: Option<u32>,
+    before: Option<String>,
 }
 
 async fn runs(
@@ -468,10 +473,16 @@ async fn runs(
     operator(&h, &s)?;
     Ok(Json(
         s.store
-            .list_runs()
+            .query_runs(lmt_store::RunQuery {
+                mirror: query.mirror,
+                node: query.node,
+                state: query.state,
+                trigger: query.trigger,
+                limit: query.limit.unwrap_or(50),
+                before: query.before,
+            })
             .await?
             .into_iter()
-            .filter(|run| query.trigger.is_none_or(|trigger| run.trigger == trigger))
             .map(run_view)
             .collect(),
     ))

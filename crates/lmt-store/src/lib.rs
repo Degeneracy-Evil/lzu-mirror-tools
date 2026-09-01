@@ -153,6 +153,16 @@ pub struct RunRecord {
     pub cancel_requested_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RunQuery {
+    pub mirror: Option<String>,
+    pub node: Option<String>,
+    pub state: Option<RunState>,
+    pub trigger: Option<lmt_core::RunTrigger>,
+    pub limit: u32,
+    pub before: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AttemptRecord {
     pub run_id: String,
@@ -1205,6 +1215,65 @@ impl Store {
             .query_map([], map_run)?
             .collect::<Result<_, _>>()
             .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn query_runs(&self, query: RunQuery) -> Result<Vec<RunRecord>, StoreError> {
+        if query.limit == 0 || query.limit > 500 {
+            return Err(StoreError::InvalidConfig(
+                "Run query limit must be between 1 and 500".into(),
+            ));
+        }
+        self.call(move |connection| {
+            let cursor = query
+                .before
+                .as_ref()
+                .map(|id| {
+                    connection
+                        .query_row("SELECT created_at_ms,id FROM runs WHERE id=?1", [id], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })
+                        .optional()
+                })
+                .transpose()?
+                .flatten();
+            if query.before.is_some() && cursor.is_none() {
+                return Err(StoreError::AttemptNotFound);
+            }
+            let (cursor_created, cursor_id) = cursor.map_or((None, None), |(created, id)| (Some(created), Some(id)));
+            let state = query.state.map(|state| run_state_str(state).to_owned());
+            let trigger = query.trigger.map(|trigger| match trigger {
+                lmt_core::RunTrigger::Manual => "manual".to_owned(),
+                lmt_core::RunTrigger::Scheduled => "scheduled".to_owned(),
+            });
+            let mut statement = connection.prepare(
+                "SELECT id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,started_at_ms,
+                 finished_at_ms,final_exit_code,failure_kind,failure_message,max_attempts,retry_delay_ms,
+                 scheduled_for_at_ms,retry_due_at_ms,cancel_requested_at_ms
+                 FROM runs
+                 WHERE (?1 IS NULL OR mirror_name=?1)
+                   AND (?2 IS NULL OR owner_node=?2)
+                   AND (?3 IS NULL OR state=?3)
+                   AND (?4 IS NULL OR trigger=?4)
+                   AND (?5 IS NULL OR created_at_ms<?5 OR (created_at_ms=?5 AND id<?6))
+                 ORDER BY created_at_ms DESC,id DESC LIMIT ?7",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        query.mirror,
+                        query.node,
+                        state,
+                        trigger,
+                        cursor_created,
+                        cursor_id,
+                        query.limit
+                    ],
+                    map_run,
+                )?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
         })
         .await
     }
@@ -2304,6 +2373,66 @@ mod tests {
         assert!(matches!(
             store.create_manual_run("demo", "request-2", 40, policy).await,
             Err(StoreError::MirrorBusy { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_run_keyset_pagination_has_no_duplicates_or_skips() {
+        let store = Store::open_in_memory().await.expect("open");
+        store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
+        for index in 0..6 {
+            let run = store
+                .create_manual_run("demo", &format!("page-{index}"), 100 + i64::from(index / 2), policy)
+                .await
+                .expect("run");
+            poll_at(&store, 200 + i64::from(index)).await;
+            store
+                .apply_event(
+                    &run.id,
+                    1,
+                    &terminal_event(AttemptState::Succeeded, 1),
+                    300 + i64::from(index),
+                    |source, now| Ok(decide(source, now)),
+                )
+                .await
+                .expect("terminal");
+        }
+        let expected = store
+            .query_runs(RunQuery {
+                limit: 6,
+                ..RunQuery::default()
+            })
+            .await
+            .expect("all")
+            .into_iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>();
+        let mut actual = Vec::new();
+        let mut before = None;
+        loop {
+            let page = store
+                .query_runs(RunQuery {
+                    limit: 2,
+                    before,
+                    ..RunQuery::default()
+                })
+                .await
+                .expect("page");
+            if page.is_empty() {
+                break;
+            }
+            before = page.last().map(|run| run.id.clone());
+            actual.extend(page.into_iter().map(|run| run.id));
+        }
+        assert_eq!(actual, expected);
+        assert!(matches!(
+            store
+                .query_runs(RunQuery {
+                    limit: 501,
+                    ..RunQuery::default()
+                })
+                .await,
+            Err(StoreError::InvalidConfig(_))
         ));
     }
 
