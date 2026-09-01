@@ -323,21 +323,19 @@ Not part of the initial architecture:
 
 These can be reconsidered after LZU and community deployments establish real requirements.
 
-## 16. Design status
+## 16. Current milestone status
 
-The design is sufficiently complete to begin implementation.
+M1 and M2 are accepted implementation baselines.
 
-Future implementation should be reviewed against:
+M3 production-operations design is frozen and is the current implementation target.
 
-- `architecture.md`;
-- `core-model.md`;
-- `scheduler.md`;
-- `state-machines.md`;
-- `database.md`;
-- `agent-protocol.md`;
-- `api.md`;
-- `implementation-design.md`;
-- `testing.md`;
-- `code-review.md`.
+For M3 work, read:
 
-When implementation experience exposes a bad assumption, update the design explicitly rather than silently working around it in code.
+- `m3-design.md` as the authoritative behavioral specification;
+- `m3-implementation-plan.md` for M3.0 through M3.9 development order;
+- `operations/` for production-trial runbooks;
+- `code-review.md` for release-review gates.
+
+M3 deliberately preserves the accepted scheduler/execution model and adds operational safety: credential lifecycle, Agent fencing, backup/restore, log lifecycle, bounded observability, CLI ergonomics, diagnostics, and service hardening.
+
+When implementation evidence exposes a bad assumption, update the design and Architecture Decisions explicitly before changing the contract in code.

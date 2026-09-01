@@ -451,12 +451,14 @@ Operational CLI convenience must not create config drift.
 
 ## Current open questions
 
-The remaining open questions are intentionally deferred beyond M3 unless production-trial evidence requires earlier resolution:
+The remaining questions are intentionally deferred beyond M3 unless production-trial evidence requires earlier resolution:
 
-1. Exact Run log retention/rotation/compression policy (M3).
-2. Agent enrollment/token provisioning UX (M3).
-3. Stable API versioning rules before the first public release.
-4. Whether a future release should parse rsync statistics into structured metrics; M2 explicitly does not.
+1. Stable API/version compatibility policy before the first public release.
+2. Final distribution/package/release artifact strategy.
+3. Whether the stable release should introduce multi-user operator identity/RBAC or retain one root operator credential.
+4. Whether a future release should parse rsync statistics into structured metrics; M3 explicitly does not.
+5. Whether measured real workloads justify stronger per-Attempt cgroup containment beyond the accepted Linux process-group contract.
+6. Whether measured Run-log storage behavior justifies application-level compression beyond transparent filesystem compression.
 
 ## Development principle
 

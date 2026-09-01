@@ -19,11 +19,10 @@ Before making implementation changes, read at minimum:
 11. `docs/m1-implementation-plan.md`
 12. `docs/m2-design.md`
 13. `docs/m2-implementation-plan.md`
-14. `docs/code-review.md`
-15. `docs/m3-design.md`
-16. `docs/m3-implementation-plan.md`
-17. `docs/code-review.md`
-18. `docs/decisions.md`
+14. `docs/m3-design.md`
+15. `docs/m3-implementation-plan.md`
+16. `docs/code-review.md`
+17. `docs/decisions.md`
 
 M1 is an accepted baseline. For M2-specific semantics, **`docs/m2-design.md` is authoritative** if an older generic document still contains M1-era wording that conflicts with it. Do not resolve such conflicts by guessing; preserve M2 Design behavior and update the narrower document when appropriate.
 
@@ -124,19 +123,16 @@ Avoid:
 
 A feature is not complete without its failure/idempotency tests.
 
-M2 must preserve the entire M1 fault matrix and additionally cover:
+M3 must preserve the complete accepted M1/M2 fault matrices and additionally cover the release gates in `docs/m3-design.md`, especially:
 
-- deterministic interval scheduling;
-- timezone-aware cron and DST semantics;
-- coalesced scheduled due intent;
-- scheduler recovery after Server restart;
-- multi-Attempt retry deadlines;
-- retry suppression after disable/remove/move;
-- explicit cancellation;
-- Cancel-before-delayed-Start tombstones;
-- Agent capacity;
-- M1-to-M2 schema migration;
-- local built-in rsync integration without internet.
+- schema-v2 to schema-v3 migration from a frozen historical fixture;
+- Server/Agent single-instance locks and durable Agent binding;
+- credential issue/rotation/revocation and reload;
+- bounded Run queries and CLI output/exit semantics;
+- Run-log follow, retention, expiration, and lock lifetime;
+- online backup and offline restore normalization;
+- bounded metrics, sanitized public status, and doctor diagnostics;
+- production systemd/permission assumptions.
 
 Use local helper processes/directories. Normal CI must not require public mirror servers or internet access.
 

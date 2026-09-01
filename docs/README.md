@@ -21,7 +21,7 @@ Recommended reading order:
 17. [Code Review Guide](code-review.md) — invariants to enforce during review.
 18. [Architecture Decisions](decisions.md) — accepted decisions and remaining questions.
 
-During M2, `m2-design.md` takes precedence over older M1-era wording in narrower generic documents where a conflict exists.
+For the current milestone, `m3-design.md` is authoritative for M3-specific behavior. Accepted M1/M2 contracts remain regression baselines unless an explicit newer Architecture Decision changes them.
 
 The documentation is intentionally detailed. LMT is a long-lived infrastructure project, so behavior should be designed and testable before implementation complexity accumulates.
 
