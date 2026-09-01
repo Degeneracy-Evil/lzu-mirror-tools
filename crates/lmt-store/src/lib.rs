@@ -1479,6 +1479,7 @@ const fn failure_kind_str(kind: FailureKind) -> &'static str {
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_m1.sql")),
     (2, include_str!("../migrations/0002_m2.sql")),
+    (3, include_str!("../migrations/0003_m3.sql")),
 ];
 
 fn configure_and_migrate(connection: &mut Connection, migration_time_ms: i64) -> Result<(), StoreError> {
@@ -1648,7 +1649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn populated_m1_database_upgrades_to_m2() {
+    async fn populated_m1_database_upgrades_through_m3() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("m1.db");
         {
@@ -1678,7 +1679,54 @@ mod tests {
             })
             .await
             .expect("query upgraded state");
-        assert_eq!((version, node_count, capacity), (2, 1, 1));
+        assert_eq!((version, node_count, capacity), (3, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn frozen_populated_v2_fixture_upgrades_to_v3_without_reconstruction() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("accepted-v2.db");
+        Connection::open(&path)
+            .expect("open fixture")
+            .execute_batch(include_str!("../tests/fixtures/accepted_v2.sql"))
+            .expect("load immutable v2 fixture");
+
+        let store = Store::open(&path).await.expect("upgrade fixture");
+        let migrated: (u32, Option<String>, Option<String>, Option<String>, Option<i64>) = store
+            .call(|connection| {
+                Ok((
+                    connection.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0))?,
+                    connection.query_row("SELECT bound_agent_id FROM nodes WHERE name='node-a'", [], |row| {
+                        row.get(0)
+                    })?,
+                    connection.query_row("SELECT agent_boot_id FROM nodes WHERE name='node-a'", [], |row| {
+                        row.get(0)
+                    })?,
+                    connection.query_row(
+                        "SELECT label FROM node_credentials WHERE node_name='node-a' AND credential_id='bootstrap'",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                    connection.query_row(
+                        "SELECT expired_at_ms FROM attempt_logs WHERE run_id='01K000000000000000000000V2' AND attempt_no=1",
+                        [],
+                        |row| row.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .expect("query v3 columns");
+        assert_eq!(migrated, (3, None, None, None, None));
+        assert_eq!(store.list_mirrors().await.expect("mirrors").len(), 1);
+        assert_eq!(store.list_runs().await.expect("runs").len(), 1);
+        assert_eq!(
+            store
+                .list_attempts("01K000000000000000000000V2")
+                .await
+                .expect("attempts")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1696,7 +1744,7 @@ mod tests {
             Store::open(path).await,
             Err(StoreError::FutureSchema {
                 found: 99,
-                supported: 2
+                supported: 3
             })
         ));
     }
