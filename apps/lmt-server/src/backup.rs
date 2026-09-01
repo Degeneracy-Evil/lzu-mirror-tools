@@ -210,7 +210,12 @@ mod tests {
     async fn online_backup_is_consistent_during_concurrent_writes() {
         let directory = tempfile::tempdir().expect("tempdir");
         let source = directory.path().join("live.db");
-        let _store = lmt_store::Store::open(&source).await.expect("store");
+        let store = lmt_store::Store::open(&source).await.expect("store");
+        let raw_token = "lmt_a_release_gate_secret_must_not_enter_backup";
+        store
+            .upsert_credential("node-a", raw_token, 1)
+            .await
+            .expect("credential");
         Connection::open(&source)
             .expect("writer setup")
             .execute_batch("CREATE TABLE backup_probe(value INTEGER NOT NULL) STRICT;")
@@ -234,6 +239,12 @@ mod tests {
         writer.join().expect("writer thread");
         verify(&backup_dir, &manifest.id).expect("valid consistent backup");
         let (database, _) = paths(&backup_dir, &manifest.id);
+        let database_bytes = fs::read(&database).expect("backup bytes");
+        assert!(
+            !database_bytes
+                .windows(raw_token.len())
+                .any(|window| window == raw_token.as_bytes())
+        );
         let count: i64 = Connection::open(database)
             .expect("backup")
             .query_row("SELECT COUNT(*) FROM backup_probe", [], |row| row.get(0))

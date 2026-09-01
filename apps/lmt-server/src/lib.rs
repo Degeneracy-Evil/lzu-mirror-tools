@@ -2264,7 +2264,7 @@ mod tests {
 
         state.run_log_policy = Some(RunLogPolicy {
             retention: None,
-            max_total_bytes: Some(8),
+            max_total_bytes: Some(14),
             maintenance_interval: Duration::from_secs(1),
         });
         let size_plan = plan_log_maintenance(&state).await.expect("size plan");
@@ -2282,6 +2282,17 @@ mod tests {
         execute_log_maintenance(&state).await.expect("restart cleanup");
         assert!(!log_path(&state.log_dir, &terminal_ids[3], 1).exists());
         assert!(log_path(&state.log_dir, &active.id, 1).exists());
+
+        fs::remove_file(log_path(&state.log_dir, &active.id, 1))
+            .await
+            .expect("inject unexpected missing log");
+        let status = operational_status(&state).await.expect("status");
+        let checks = doctor_operational_checks(&state, &status).await.expect("doctor checks");
+        assert!(
+            checks
+                .iter()
+                .any(|check| { check.id == "logs.files" && check.status == DoctorCheckStatus::Critical })
+        );
 
         let transient = attempt_log_lock(&state, "transient-a", 1).await;
         drop(transient);
@@ -2358,6 +2369,27 @@ mod tests {
             before,
             private_state.store.operational_counts().await.expect("after doctor")
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_online_backup_is_rejected_as_busy() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("lmt.db");
+        let store = Store::open(&database).await.expect("store");
+        let mut state = AppState::new(
+            store,
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.database_path = database;
+        state.backup_dir = Some(directory.path().join("backups"));
+        let _in_progress = state.backup_lock.clone().lock_owned().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
+        let failure = create_backup(State(state), headers).await.expect_err("backup busy");
+        assert_eq!(failure.status, StatusCode::CONFLICT);
+        assert_eq!(failure.code, "backup_busy");
     }
 
     async fn state_for_doctor(database: &Path, logs: PathBuf) -> AppState {

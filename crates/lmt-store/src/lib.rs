@@ -1458,10 +1458,9 @@ impl Store {
         self.call(|connection| {
             let mut statement = connection.prepare(
                 "SELECT l.run_id,l.attempt_no,l.stored_bytes,l.updated_at_ms,
-                    CASE WHEN a.state IN('succeeded','failed','timed_out','cancelled','interrupted','rejected')
+                    CASE WHEN l.complete=1 AND a.state IN('succeeded','failed','timed_out','cancelled','interrupted','rejected')
                          THEN 1 ELSE 0 END,l.expired_at_ms
                  FROM attempt_logs l JOIN attempts a ON a.run_id=l.run_id AND a.attempt_no=l.attempt_no
-                 WHERE l.complete=1
                  ORDER BY l.updated_at_ms,l.run_id,l.attempt_no",
             )?;
             statement

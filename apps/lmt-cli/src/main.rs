@@ -662,4 +662,17 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn json_output_is_machine_readable_and_human_output_is_compact() {
+        let input = br#"{"runs_pending":2,"healthy":true}"#;
+        let json = output::render(input, OutputMode::Json).expect("JSON rendering");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).expect("machine JSON")["runs_pending"],
+            2
+        );
+        let human = output::render(input, OutputMode::Human).expect("human rendering");
+        assert!(human.contains("runs_pending\t2"));
+        assert!(human.contains("healthy\ttrue"));
+    }
 }
