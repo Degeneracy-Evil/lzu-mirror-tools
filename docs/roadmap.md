@@ -102,6 +102,8 @@ M2 completion means a small mirror site can replace a collection of cron jobs.
 
 ## M3 - Operational hardening
 
+Status: **design complete; implementation next**. See `docs/m3-design.md` and `docs/m3-implementation-plan.md`.
+
 Goal:
 
 > make everyday administration and incident diagnosis comfortable.

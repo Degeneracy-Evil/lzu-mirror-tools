@@ -20,7 +20,10 @@ Before making implementation changes, read at minimum:
 12. `docs/m2-design.md`
 13. `docs/m2-implementation-plan.md`
 14. `docs/code-review.md`
-15. `docs/decisions.md`
+15. `docs/m3-design.md`
+16. `docs/m3-implementation-plan.md`
+17. `docs/code-review.md`
+18. `docs/decisions.md`
 
 M1 is an accepted baseline. For M2-specific semantics, **`docs/m2-design.md` is authoritative** if an older generic document still contains M1-era wording that conflicts with it. Do not resolve such conflicts by guessing; preserve M2 Design behavior and update the narrower document when appropriate.
 
@@ -30,14 +33,13 @@ Implement the current milestone only.
 
 M1 and M2 are accepted implementation baselines.
 
-**There is currently no authorized M3 implementation target.** M3 must be designed and documented before code work begins.
+The current authorized development target is **M3 only**, defined by:
 
-Until M3 design is frozen:
+- `docs/m3-design.md`;
+- `docs/m3-implementation-plan.md`;
+- the M3 operational runbooks under `docs/operations/`.
 
-- preserve all M1/M2 behavior and release-gating tests;
-- do not introduce M3 features opportunistically;
-- documentation/review work may prepare the M3 design;
-- any maintenance fix must remain compatible with the accepted M2 contracts.
+For M3 behavior, `docs/m3-design.md` is authoritative. Preserve all M1/M2 release-gating tests. Do not start M4/M5 work.
 
 Do not implement deferred features such as:
 
@@ -155,7 +157,7 @@ Do not allow design documents and implementation to intentionally drift.
 
 ## 9. Development workflow
 
-Follow the M2 implementation order rather than implementing all scheduler features at once.
+Follow the M3.0 through M3.9 implementation order. M3 is an operations/hardening milestone; do not redesign the accepted M2 scheduler/execution model.
 
 Work in small vertical slices and logical commits.
 

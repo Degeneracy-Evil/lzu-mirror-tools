@@ -315,9 +315,143 @@ Operations that create a new durable resource or intent, such as manual Run crea
 
 Cancellation targets an existing Run and is idempotent by Run identity. Repeated cancel requests preserve one persistent cancellation intent and do not require a separate request ID.
 
+
+### D034 - M3 is an operations milestone, not a new scheduler milestone
+
+Status: accepted.
+
+M3 preserves the accepted M2 execution/scheduler model and focuses on production administration, credential lifecycle, backup/recovery, logs, metrics, diagnostics, and service hardening.
+
+M4/M5 features must not be pulled into M3 for convenience.
+
+### D035 - M3 does not add application-level Run-log compression
+
+Status: accepted.
+
+Run logs retain simple append/range/follow semantics.
+
+M3 implements retention by age/size only. Storage compression should use transparent filesystem compression where desired.
+
+This avoids adding compressed-offset indexes, dual-format crash recovery, and repeated decompression complexity without measured need.
+
+### D036 - Production operator secret is file-based; Agent credentials are centrally managed
+
+Status: accepted.
+
+Production server.toml references operator_token_file rather than embedding the raw operator secret.
+
+Agent raw tokens remain in per-Agent token files, while Server stores only digests and credential metadata.
+
+M3 does not introduce multi-user operator roles/OIDC.
+
+### D037 - Nodes are fenced to a durable Agent installation identity
+
+Status: accepted.
+
+A valid Node credential is not sufficient to authorize two independent Agent installations.
+
+The first M3 Agent installation binds the Node to a durable Agent ID. A different installation receives agent_binding_conflict and no execution action.
+
+Replacement is explicit; there is no automatic takeover.
+
+### D038 - Server and Agent enforce local single-instance locks
+
+Status: accepted.
+
+lmt-server refuses a second process owning the same control plane.
+
+lmt-agent refuses a second process owning the same spool/install state.
+
+Correctness must not rely solely on systemd convention.
+
+### D039 - Agent/operator credential reload must not interrupt active Runs
+
+Status: accepted.
+
+SIGHUP/systemd reload may re-read bearer-token files.
+
+It does not reload arbitrary scheduler/storage/execution configuration.
+
+A failed credential reload preserves the previous valid secret.
+
+### D040 - Run history is durable while Run-log files may expire
+
+Status: accepted.
+
+M3 retention may delete only eligible terminal complete Run-log files.
+
+Runs/Attempts and failure metadata remain in SQLite.
+
+Intentional log expiration is represented explicitly and returns log_expired rather than masquerading as missing data.
+
+### D041 - SQLite Online Backup API is the live database-backup mechanism
+
+Status: accepted.
+
+M3 does not copy the bare WAL-mode database file while lmt-server is live.
+
+Online backups are consistent SQLite snapshots with integrity/checksum verification and atomic publication.
+
+Run-log files are excluded from the database backup.
+
+### D042 - Control-plane restore is offline and quiesced
+
+Status: accepted.
+
+There is no remote HTTP restore.
+
+Server and related Agents are stopped, Agent Attempt spools are reset/archived while preserving Agent identity, and restored non-terminal execution state is normalized before service resumes.
+
+Mirror data is never rolled back by LMT restore.
+
+### D043 - Operational queries and metrics must have bounded history cost
+
+Status: accepted.
+
+Run history is paginated with bounded limits/keyset cursors.
+
+Prometheus scrapes use aggregate/indexed Store queries rather than loading all historical Runs.
+
+Per-Mirror/Node labels are allowed; Run/Attempt/credential IDs are not metric labels.
+
+### D044 - Public status is an explicit sanitized opt-in
+
+Status: accepted.
+
+Administrative API remains authenticated.
+
+A small read-only status projection may be unauthenticated only when public status is explicitly enabled, and it must omit source URLs, paths, RunSpecs, logs, and secrets.
+
+### D045 - Legacy inline Agent credentials are import-once compatibility only
+
+Status: accepted.
+
+M3 may bridge M2 [[agents]] config only when the Node has no credential history.
+
+A revoked credential must never be resurrected by stale legacy config.
+
+The bridge is temporary before stable v1.
+
+### D046 - M3 CLI configuration remains file/flag based with no environment overrides
+
+Status: accepted.
+
+The operator client may use a visible client TOML plus explicit CLI flags.
+
+Normal LMT behavior is not configured through hidden environment-variable overrides.
+
+### D047 - Mirror enable/disable remains TOML desired state
+
+Status: accepted.
+
+M3 does not add imperative CLI commands that mutate Mirror enabled state outside the authoritative config bundle.
+
+Operational CLI convenience must not create config drift.
+
+
 ## Current open questions
 
-The remaining open questions are intentionally deferred beyond M2 unless implementation evidence requires earlier resolution:
+The remaining open questions are intentionally deferred beyond M3 unless production-trial evidence requires earlier resolution:
 
 1. Exact Run log retention/rotation/compression policy (M3).
 2. Agent enrollment/token provisioning UX (M3).

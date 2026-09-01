@@ -6,7 +6,7 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1 and M2 accepted; M3 design is next.**
+**Current phase: M1 and M2 accepted; M3 production-operations design is complete and ready for implementation.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
@@ -14,6 +14,11 @@ M2 is accepted at implementation baseline `7ad3886c1c11d011ae6fd76df2fa6ecc1b87b
 
 1. [M2 Design](docs/m2-design.md)
 2. [M2 Implementation Plan](docs/m2-implementation-plan.md)
+
+M3 is frozen in:
+
+1. [M3 Design](docs/m3-design.md)
+2. [M3 Implementation Plan](docs/m3-implementation-plan.md)
 
 ## What LMT does
 
@@ -87,8 +92,8 @@ Start with:
 
 1. [Design Summary](docs/design-summary.md)
 2. [Documentation Index](docs/README.md)
-3. [M2 Design](docs/m2-design.md)
-4. [M2 Implementation Plan](docs/m2-implementation-plan.md)
+3. [M3 Design](docs/m3-design.md)
+4. [M3 Implementation Plan](docs/m3-implementation-plan.md)
 
 All architecture, state-machine, protocol, database, scheduler, API, testing, and code-review contracts live under `docs/`.
 
