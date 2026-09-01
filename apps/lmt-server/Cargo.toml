@@ -16,6 +16,7 @@ hex.workspace = true
 lmt-core = { path = "../../crates/lmt-core" }
 lmt-protocol = { path = "../../crates/lmt-protocol" }
 lmt-store = { path = "../../crates/lmt-store" }
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

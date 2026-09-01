@@ -1,5 +1,6 @@
 pub mod config;
 mod executor;
+mod process_lock;
 mod spool;
 
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
@@ -18,15 +19,49 @@ use tokio::{
 
 use spool::{SpoolRecord, log_path, read, retire, state_path, write};
 
+const INSTALLATION_ID_FILE: &str = "agent-id";
+
 #[derive(Clone)]
 pub struct Agent {
     config: Config,
     token: Arc<str>,
     instance: Arc<str>,
+    boot_id: Arc<str>,
+    _process_lock: Arc<process_lock::ProcessLock>,
     client: Client,
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     acceptance: Arc<Mutex<()>>,
     shutdown: watch::Receiver<bool>,
+}
+
+async fn load_or_create_installation_id(spool_dir: &Path) -> anyhow::Result<String> {
+    let path = spool_dir.join(INSTALLATION_ID_FILE);
+    match fs::read_to_string(&path).await {
+        Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_owned()),
+        Ok(_) => bail!("durable Agent installation ID is empty"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let installation_id = ulid::Ulid::new().to_string();
+    let persisted_id = installation_id.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(persisted_id.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        std::fs::File::open(path.parent().expect("Agent ID has parent"))?.sync_all()?;
+        Ok(())
+    })
+    .await??;
+    Ok(installation_id)
 }
 
 impl Agent {
@@ -36,11 +71,18 @@ impl Agent {
             bail!("max_concurrent_runs must be positive");
         }
         fs::create_dir_all(&config.storage.spool_dir).await?;
+        let process_lock = process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))?;
         let token = fs::read_to_string(&config.server.token_file).await?.trim().to_owned();
+        if token.is_empty() {
+            bail!("Agent token file is empty");
+        }
+        let instance = load_or_create_installation_id(&config.storage.spool_dir).await?;
         Ok(Self {
             config,
             token: token.into(),
-            instance: ulid::Ulid::new().to_string().into(),
+            instance: instance.into(),
+            boot_id: ulid::Ulid::new().to_string().into(),
+            _process_lock: Arc::new(process_lock),
             client: Client::builder().timeout(Duration::from_secs(35)).build()?,
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
@@ -64,6 +106,7 @@ impl Agent {
                 protocol_version: "v1alpha1".into(),
                 agent_version: env!("CARGO_PKG_VERSION").into(),
                 agent_instance_id: self.instance.to_string(),
+                agent_boot_id: self.boot_id.to_string(),
                 poll_sequence: sequence,
                 running: self.owned().await,
                 capacity: Capacity {
@@ -405,6 +448,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_agent(root: &Path, shutdown: watch::Receiver<bool>, server_url: String) -> Agent {
+        std::fs::create_dir_all(root).expect("test root");
+        let process_lock = process_lock::ProcessLock::acquire(&root.join(format!("{}.lock", ulid::Ulid::new())))
+            .expect("test process lock");
         Agent {
             config: Config {
                 node: config::Node { name: "node-a".into() },
@@ -423,6 +469,8 @@ mod tests {
             },
             token: "token".into(),
             instance: "instance".into(),
+            boot_id: "boot".into(),
+            _process_lock: Arc::new(process_lock),
             client: Client::new(),
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
@@ -446,6 +494,49 @@ mod tests {
     fn nested_config_rejects_unknown_fields() {
         let source = "[node]\nname='n'\ntypo=true\n[server]\nurl='http://x'\ntoken_file='/x'\n[storage]\nmirror_root='/x'\nspool_dir='/y'\n[execution]\nmax_concurrent_runs=1\n[runner.process]\nenabled=true\n";
         assert!(toml::from_str::<Config>(source).is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_lock_is_exclusive_and_installation_identity_survives_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let token_file = directory.path().join("token");
+        fs::write(&token_file, "secret\n").await.expect("token");
+        let config = Config {
+            node: config::Node { name: "node-a".into() },
+            server: config::Server {
+                url: "http://127.0.0.1:1".into(),
+                token_file,
+            },
+            storage: config::Storage {
+                mirror_root: directory.path().join("mirrors"),
+                spool_dir: directory.path().join("spool"),
+            },
+            execution: config::Execution { max_concurrent_runs: 1 },
+            runner: config::Runner {
+                process: config::ProcessPolicy { enabled: true },
+            },
+        };
+        let (_shutdown, receiver) = watch::channel(false);
+        let first = Agent::new(config.clone(), receiver.clone()).await.expect("first Agent");
+        assert!(Agent::new(config.clone(), receiver.clone()).await.is_err());
+        let installation_id = first.instance.clone();
+        let first_boot = first.boot_id.clone();
+        drop(first);
+
+        let restarted = Agent::new(config.clone(), receiver).await.expect("restart");
+        assert_eq!(restarted.instance, installation_id);
+        assert_ne!(restarted.boot_id, first_boot);
+        assert_eq!(
+            fs::metadata(config.storage.spool_dir.join(INSTALLATION_ID_FILE))
+                .await
+                .expect("identity metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[tokio::test]

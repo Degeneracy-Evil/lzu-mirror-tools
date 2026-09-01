@@ -40,6 +40,13 @@ pub enum StoreError {
     RequestConflict,
     #[error("run or attempt not found")]
     AttemptNotFound,
+    #[error("Agent binding conflict: Node is bound to {bound_agent_id}, presented {presented_agent_id}")]
+    AgentBindingConflict {
+        bound_agent_id: String,
+        presented_agent_id: String,
+    },
+    #[error("Node binding replacement may overlap dispatched work")]
+    BindingReplacementUnsafe,
     #[error("illegal state transition from {from:?} to {to:?}")]
     IllegalTransition { from: AttemptState, to: AttemptState },
     #[error("spec serialization failed: {0}")]
@@ -87,6 +94,8 @@ pub struct NodeRecord {
     pub name: String,
     pub agent_version: Option<String>,
     pub agent_instance_id: Option<String>,
+    pub bound_agent_id: Option<String>,
+    pub agent_boot_id: Option<String>,
     pub last_seen_at_ms: Option<i64>,
     pub active_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
@@ -97,6 +106,7 @@ pub struct NodeObservation {
     pub node: String,
     pub agent_version: String,
     pub agent_instance_id: String,
+    pub agent_boot_id: String,
     pub active_runs: u32,
     pub max_concurrent_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
@@ -465,13 +475,29 @@ impl Store {
     pub async fn observe_node(&self, observation: NodeObservation) -> Result<(), StoreError> {
         let capabilities = serde_json::json!({"mirror_root": observation.mirror_root}).to_string();
         self.call(move |connection| {
-            connection.execute(
-                "UPDATE nodes SET agent_version=?2,agent_instance_id=?3,last_seen_at_ms=?4,active_runs=?5,
-             mirror_root_free_bytes=?6,max_concurrent_runs=?7,capabilities_json=?8 WHERE name=?1",
+            let transaction = connection.transaction()?;
+            let bound: Option<String> = transaction.query_row(
+                "SELECT bound_agent_id FROM nodes WHERE name=?1",
+                [&observation.node],
+                |row| row.get(0),
+            )?;
+            if let Some(bound_agent_id) = bound
+                && bound_agent_id != observation.agent_instance_id
+            {
+                return Err(StoreError::AgentBindingConflict {
+                    bound_agent_id,
+                    presented_agent_id: observation.agent_instance_id,
+                });
+            }
+            transaction.execute(
+                "UPDATE nodes SET agent_version=?2,agent_instance_id=?3,bound_agent_id=COALESCE(bound_agent_id,?3),
+             agent_boot_id=?4,last_seen_at_ms=?5,active_runs=?6,mirror_root_free_bytes=?7,
+             max_concurrent_runs=?8,capabilities_json=?9 WHERE name=?1",
                 params![
                     observation.node,
                     observation.agent_version,
                     observation.agent_instance_id,
+                    observation.agent_boot_id,
                     observation.observed_at_ms,
                     observation.active_runs,
                     observation.mirror_root_free_bytes,
@@ -479,6 +505,47 @@ impl Store {
                     capabilities
                 ],
             )?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn replace_agent_binding(
+        &self,
+        node: &str,
+        agent_id: &str,
+        acknowledge_execution_risk: bool,
+    ) -> Result<(), StoreError> {
+        let node = node.to_owned();
+        let agent_id = agent_id.to_owned();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let exists: bool =
+                transaction.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE name=?1)", [&node], |row| {
+                    row.get(0)
+                })?;
+            if !exists {
+                return Err(StoreError::AttemptNotFound);
+            }
+            let potentially_executing: bool = transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM attempts a JOIN runs r ON r.id=a.run_id
+                    WHERE r.owner_node=?1 AND r.state IN('pending','running')
+                      AND a.dispatch_count>0
+                      AND a.state IN('queued','accepted','running')
+                )",
+                [&node],
+                |row| row.get(0),
+            )?;
+            if potentially_executing && !acknowledge_execution_risk {
+                return Err(StoreError::BindingReplacementUnsafe);
+            }
+            transaction.execute(
+                "UPDATE nodes SET bound_agent_id=?2,agent_instance_id=NULL,agent_boot_id=NULL WHERE name=?1",
+                params![node, agent_id],
+            )?;
+            transaction.commit()?;
             Ok(())
         })
         .await
@@ -487,18 +554,20 @@ impl Store {
     pub async fn list_nodes(&self) -> Result<Vec<NodeRecord>, StoreError> {
         self.call(|connection| {
             let mut statement = connection.prepare(
-                "SELECT name,agent_version,agent_instance_id,last_seen_at_ms,active_runs,mirror_root_free_bytes,
-                 max_concurrent_runs FROM nodes ORDER BY name",
+                "SELECT name,agent_version,agent_instance_id,bound_agent_id,agent_boot_id,last_seen_at_ms,
+                 active_runs,mirror_root_free_bytes,max_concurrent_runs FROM nodes ORDER BY name",
             )?;
             let rows = statement.query_map([], |row| {
                 Ok(NodeRecord {
                     name: row.get(0)?,
                     agent_version: row.get(1)?,
                     agent_instance_id: row.get(2)?,
-                    last_seen_at_ms: row.get(3)?,
-                    active_runs: row.get(4)?,
-                    mirror_root_free_bytes: row.get(5)?,
-                    max_concurrent_runs: row.get(6)?,
+                    bound_agent_id: row.get(3)?,
+                    agent_boot_id: row.get(4)?,
+                    last_seen_at_ms: row.get(5)?,
+                    active_runs: row.get(6)?,
+                    mirror_root_free_bytes: row.get(7)?,
+                    max_concurrent_runs: row.get(8)?,
                 })
             })?;
             rows.collect::<Result<_, _>>().map_err(StoreError::from)
@@ -1908,6 +1977,7 @@ mod tests {
                 node: "node-a".into(),
                 agent_version: "test".into(),
                 agent_instance_id: "instance".into(),
+                agent_boot_id: "boot".into(),
                 active_runs: 1,
                 max_concurrent_runs: 1,
                 mirror_root_free_bytes: None,
@@ -2402,6 +2472,7 @@ mod tests {
             node: "node-a".into(),
             agent_version: "test".into(),
             agent_instance_id: "instance".into(),
+            agent_boot_id: "boot".into(),
             active_runs,
             max_concurrent_runs: 1,
             mirror_root_free_bytes: None,
@@ -2423,6 +2494,65 @@ mod tests {
             .await
             .expect("cancel");
         assert!(matches!(poll_at(&store, 61).await, PollAction::CancelAttempt { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_agent_binding_fences_conflicts_and_replacement_is_safety_gated() {
+        let store = Store::open_in_memory().await.expect("open");
+        store.apply(&bundle("/bin/true"), 0, "test", 10).await.expect("apply");
+        store.upsert_credential("node-a", "secret", 10).await.expect("node");
+        let observation = |agent: &str, boot: &str, now| NodeObservation {
+            node: "node-a".into(),
+            agent_version: "test".into(),
+            agent_instance_id: agent.into(),
+            agent_boot_id: boot.into(),
+            active_runs: 0,
+            max_concurrent_runs: 1,
+            mirror_root_free_bytes: None,
+            mirror_root: "/tmp/mirrors".into(),
+            observed_at_ms: now,
+        };
+        store
+            .observe_node(observation("installation-a", "boot-a", 20))
+            .await
+            .expect("first bind");
+        assert!(matches!(
+            store.observe_node(observation("installation-b", "boot-b", 30)).await,
+            Err(StoreError::AgentBindingConflict { .. })
+        ));
+        let bound = store.list_nodes().await.expect("nodes").pop().expect("node");
+        assert_eq!(bound.bound_agent_id.as_deref(), Some("installation-a"));
+        assert_eq!(bound.agent_boot_id.as_deref(), Some("boot-a"));
+        assert_eq!(bound.last_seen_at_ms, Some(20));
+
+        let run = store
+            .create_manual_run("demo", "binding", 40, policy)
+            .await
+            .expect("run");
+        assert!(matches!(poll_at(&store, 50).await, PollAction::StartAttempt { .. }));
+        assert!(matches!(
+            store.replace_agent_binding("node-a", "installation-b", false).await,
+            Err(StoreError::BindingReplacementUnsafe)
+        ));
+        store
+            .replace_agent_binding("node-a", "installation-b", true)
+            .await
+            .expect("acknowledged replacement");
+        assert_eq!(
+            store
+                .list_nodes()
+                .await
+                .expect("nodes")
+                .pop()
+                .expect("node")
+                .bound_agent_id
+                .as_deref(),
+            Some("installation-b")
+        );
+        assert_eq!(
+            store.get_run(&run.id).await.expect("run").expect("run").state,
+            RunState::Pending
+        );
     }
 
     #[tokio::test]

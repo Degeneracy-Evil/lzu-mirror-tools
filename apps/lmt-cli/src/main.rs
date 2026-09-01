@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use lmt_core::{BundleFile, RunTrigger};
-use lmt_protocol::v1alpha1::{ApplyRequest, BundleRequest, ManualRunRequest, PlanResponse};
+use lmt_protocol::v1alpha1::{ApplyRequest, BindingReplaceRequest, BundleRequest, ManualRunRequest, PlanResponse};
 use reqwest::{Client, Response};
 use serde::Serialize;
 use std::{
@@ -30,7 +30,7 @@ enum Command {
     },
     Node {
         #[command(subcommand)]
-        command: ShowCommand,
+        command: NodeCommand,
     },
     Run {
         #[command(subcommand)]
@@ -58,9 +58,28 @@ enum MirrorCommand {
     Sync { name: String },
 }
 #[derive(Subcommand)]
-enum ShowCommand {
+enum NodeCommand {
     List,
-    Show { name: String },
+    Show {
+        name: String,
+    },
+    Binding {
+        #[command(subcommand)]
+        command: BindingCommand,
+    },
+}
+#[derive(Subcommand)]
+enum BindingCommand {
+    Show {
+        name: String,
+    },
+    Replace {
+        name: String,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        acknowledge_execution_risk: bool,
+    },
 }
 #[derive(Subcommand)]
 enum RunCommand {
@@ -147,10 +166,7 @@ async fn main() -> anyhow::Result<()> {
                 .await?
             }
         },
-        Command::Node { command } => match command {
-            ShowCommand::List => get(&client, &token, format!("{base}/nodes")).await?,
-            ShowCommand::Show { name } => get(&client, &token, format!("{base}/nodes/{name}")).await?,
-        },
+        Command::Node { command } => execute_node(&client, &token, &base, command).await?,
         Command::Run { command } => match command {
             RunCommand::List => get(&client, &token, format!("{base}/runs")).await?,
             RunCommand::Show { id } => get(&client, &token, format!("{base}/runs/{id}")).await?,
@@ -168,6 +184,34 @@ async fn main() -> anyhow::Result<()> {
         print!("{}", String::from_utf8_lossy(&bytes));
     }
     Ok(())
+}
+async fn execute_node(c: &Client, token: &str, base: &str, command: NodeCommand) -> anyhow::Result<Response> {
+    match command {
+        NodeCommand::List => get(c, token, format!("{base}/nodes")).await,
+        NodeCommand::Show { name }
+        | NodeCommand::Binding {
+            command: BindingCommand::Show { name },
+        } => get(c, token, format!("{base}/nodes/{name}")).await,
+        NodeCommand::Binding {
+            command:
+                BindingCommand::Replace {
+                    name,
+                    agent_id,
+                    acknowledge_execution_risk,
+                },
+        } => {
+            post(
+                c,
+                token,
+                format!("{base}/nodes/{name}/binding"),
+                &BindingReplaceRequest {
+                    agent_id,
+                    acknowledge_execution_risk,
+                },
+            )
+            .await
+        }
+    }
 }
 async fn get(c: &Client, t: &str, u: String) -> anyhow::Result<Response> {
     Ok(c.get(u).bearer_auth(t).send().await?)

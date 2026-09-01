@@ -1004,6 +1004,7 @@ dependencies = [
  "lmt-core",
  "lmt-protocol",
  "lmt-store",
+ "nix",
  "serde",
  "serde_json",
  "sha2",

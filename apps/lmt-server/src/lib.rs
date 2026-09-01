@@ -27,7 +27,10 @@ use tokio::{
     sync::{Mutex, Notify},
 };
 
+mod process_lock;
 mod services;
+
+pub use process_lock::ProcessLock;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +125,15 @@ pub async fn initialize(c: &ServerConfig) -> anyhow::Result<AppState> {
     initialize_with_clock(c, Arc::new(SystemClock)).await
 }
 
+pub fn acquire_server_lock(c: &ServerConfig) -> anyhow::Result<ProcessLock> {
+    let parent = c
+        .database_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("database path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    ProcessLock::acquire(&parent.join("lmt-server.lock"))
+}
+
 pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> anyhow::Result<AppState> {
     if let Some(p) = c.database_path.parent() {
         fs::create_dir_all(p).await?;
@@ -206,6 +218,7 @@ pub fn build_router(s: AppState) -> Router {
         .route("/api/v1alpha1/runs/{id}/logs", get(read_log))
         .route("/api/v1alpha1/nodes", get(nodes))
         .route("/api/v1alpha1/nodes/{name}", get(node))
+        .route("/api/v1alpha1/nodes/{name}/binding", post(replace_binding))
         .route("/api/v1alpha1/agent/poll", post(poll))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/events", post(event))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/log", put(upload_log))
@@ -498,6 +511,28 @@ async fn node(
         .ok_or_else(|| Failure::not_found("node_not_found"))?;
     Ok(Json(node_view(n, s.now_ms(), s.offline_after)))
 }
+async fn replace_binding(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<BindingReplaceRequest>,
+) -> Result<Json<NodeView>, Failure> {
+    operator(&h, &s)?;
+    if !s.store.list_nodes().await?.iter().any(|node| node.name == name) {
+        return Err(Failure::not_found("node_not_found"));
+    }
+    s.store
+        .replace_agent_binding(&name, &request.agent_id, request.acknowledge_execution_risk)
+        .await?;
+    let node = s
+        .store
+        .list_nodes()
+        .await?
+        .into_iter()
+        .find(|node| node.name == name)
+        .ok_or_else(|| Failure::not_found("node_not_found"))?;
+    Ok(Json(node_view(node, s.now_ms(), s.offline_after)))
+}
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
     let node = agent(&h, &s).await?;
     if r.protocol_version != "v1alpha1" {
@@ -511,6 +546,7 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
             node: node.clone(),
             agent_version: r.agent_version.clone(),
             agent_instance_id: r.agent_instance_id.clone(),
+            agent_boot_id: r.agent_boot_id.clone(),
             active_runs: r.capacity.active_runs,
             max_concurrent_runs: r.capacity.max_concurrent_runs,
             mirror_root_free_bytes: r.capacity.mirror_root_free_bytes,
@@ -822,6 +858,8 @@ fn node_view(n: lmt_store::NodeRecord, now: i64, d: Duration) -> NodeView {
         name: n.name,
         agent_version: n.agent_version,
         agent_instance_id: n.agent_instance_id,
+        bound_agent_id: n.bound_agent_id,
+        agent_boot_id: n.agent_boot_id,
         last_seen_at: n.last_seen_at_ms.map(timestamp),
         active_runs: n.active_runs,
         mirror_root_free_bytes: n.mirror_root_free_bytes,
@@ -906,6 +944,19 @@ impl From<StoreError> for Failure {
             }
             StoreError::MirrorNotFound => Self::not_found("mirror_not_found"),
             StoreError::MirrorIneligible => Self::conflict("mirror_ineligible", e.to_string()),
+            StoreError::AgentBindingConflict {
+                bound_agent_id,
+                presented_agent_id,
+            } => {
+                let mut failure =
+                    Self::conflict("agent_binding_conflict", "Node is bound to another Agent installation");
+                failure.details.insert("bound_agent_id".into(), bound_agent_id.into());
+                failure
+                    .details
+                    .insert("presented_agent_id".into(), presented_agent_id.into());
+                failure
+            }
+            StoreError::BindingReplacementUnsafe => Self::conflict("binding_replacement_unsafe", e.to_string()),
             StoreError::AttemptNotFound => Self::not_found("attempt_not_found"),
             StoreError::RequestConflict | StoreError::IllegalTransition { .. } => {
                 Self::conflict("state_conflict", e.to_string())

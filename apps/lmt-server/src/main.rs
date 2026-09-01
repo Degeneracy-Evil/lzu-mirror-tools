@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
-use lmt_server::{ServerConfig, build_router, initialize};
+use lmt_server::{ServerConfig, acquire_server_lock, build_router, initialize};
 use std::path::PathBuf;
 use tokio::{fs, net::TcpListener};
 #[derive(Parser)]
@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("read {}", a.config.display()))?;
     let config: ServerConfig = toml::from_str(&source)?;
+    let _process_lock = acquire_server_lock(&config)?;
     let state = initialize(&config).await?;
     let listener = TcpListener::bind(&config.bind).await?;
     axum::serve(listener, build_router(state))

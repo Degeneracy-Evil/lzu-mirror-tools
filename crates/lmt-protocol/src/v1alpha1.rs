@@ -147,11 +147,20 @@ pub struct NodeView {
     pub name: String,
     pub agent_version: Option<String>,
     pub agent_instance_id: Option<String>,
+    pub bound_agent_id: Option<String>,
+    pub agent_boot_id: Option<String>,
     pub last_seen_at: Option<String>,
     pub active_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
     pub max_concurrent_runs: u32,
     pub online: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BindingReplaceRequest {
+    pub agent_id: String,
+    pub acknowledge_execution_risk: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -176,6 +185,7 @@ pub struct PollRequest {
     pub protocol_version: String,
     pub agent_version: String,
     pub agent_instance_id: String,
+    pub agent_boot_id: String,
     pub poll_sequence: u64,
     pub running: Vec<OwnedAttempt>,
     pub capacity: Capacity,
