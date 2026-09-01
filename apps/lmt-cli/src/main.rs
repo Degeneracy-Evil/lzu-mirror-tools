@@ -18,6 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Debug)]
 enum CommandResult {
     Response(Response),
     Value(serde_json::Value),
@@ -529,6 +530,7 @@ async fn execute_node(c: &Client, token: &str, base: &str, command: NodeCommand)
                     token_file,
                 },
         } => {
+            let pending_secret = PendingSecretFile::prepare(&token_file)?;
             let issued: CredentialIssueResponse = checked(
                 post(
                     c,
@@ -541,30 +543,92 @@ async fn execute_node(c: &Client, token: &str, base: &str, command: NodeCommand)
             .await?
             .json()
             .await?;
-            write_secret(&token_file, &issued.token)?;
-            Ok(CommandResult::Value(serde_json::to_value(issued.credential)?))
+            publish_credential_or_revoke(c, token, base, &name, pending_secret, issued).await
         }
     }
 }
 
-fn write_secret(path: &Path, token: &str) -> anyhow::Result<()> {
-    if path.exists() {
-        anyhow::bail!("refusing to overwrite existing token file {}", path.display());
-    }
-    let temporary = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temporary)?;
-    writeln!(file, "{token}")?;
-    file.sync_all()?;
-    fs::rename(&temporary, path)?;
-    if let Some(parent) = path.parent() {
-        fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
+struct PendingSecretFile {
+    final_path: PathBuf,
+    temporary_path: PathBuf,
+    file: Option<fs::File>,
 }
+
+impl PendingSecretFile {
+    fn prepare(path: &Path) -> anyhow::Result<Self> {
+        if path.exists() {
+            anyhow::bail!("refusing to overwrite existing token file {}", path.display());
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("token file has no parent"))?;
+        if !parent.is_dir() {
+            anyhow::bail!(
+                "token file parent does not exist or is not a directory: {}",
+                parent.display()
+            );
+        }
+        let temporary_path = parent.join(format!(".lmt-token-{}.tmp", ulid::Ulid::new()));
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary_path)?;
+        Ok(Self {
+            final_path: path.to_owned(),
+            temporary_path,
+            file: Some(file),
+        })
+    }
+
+    fn publish(mut self, token: &str) -> anyhow::Result<()> {
+        let mut file = self.file.take().expect("pending secret owns file");
+        writeln!(file, "{token}")?;
+        file.sync_all()?;
+        drop(file);
+        fs::hard_link(&self.temporary_path, &self.final_path)?;
+        fs::remove_file(&self.temporary_path)?;
+        if let Some(parent) = self.final_path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingSecretFile {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        let _ = fs::remove_file(&self.temporary_path);
+    }
+}
+
+async fn publish_credential_or_revoke(
+    client: &Client,
+    operator_token: &str,
+    base: &str,
+    node: &str,
+    pending: PendingSecretFile,
+    issued: CredentialIssueResponse,
+) -> Result<CommandResult, CliError> {
+    let credential_id = issued.credential.id.clone();
+    if let Err(local_error) = pending.publish(&issued.token) {
+        let revoke_url = format!("{base}/nodes/{node}/credentials/{credential_id}/revoke");
+        let revoked = match post_empty(client, operator_token, revoke_url).await {
+            Ok(response) => checked(response).await.is_ok(),
+            Err(_) => false,
+        };
+        let cleanup = if revoked {
+            "the newly issued credential was revoked"
+        } else {
+            "cleanup revocation could not be confirmed; manually revoke this credential ID"
+        };
+        return Err(CliError::local(format!(
+            "failed to publish credential {credential_id} locally: {local_error}; {cleanup}: {credential_id}"
+        )));
+    }
+    Ok(CommandResult::Value(serde_json::to_value(issued.credential)?))
+}
+
 async fn get(c: &Client, t: &str, u: String) -> Result<Response, CliError> {
     Ok(c.get(u).bearer_auth(t).send().await?)
 }
@@ -633,16 +697,84 @@ mod tests {
     fn issued_token_file_is_created_atomically_with_restrictive_mode() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("agent.token");
-        write_secret(&path, "lmt_a_secret").expect("write token");
+        fs::write(path.with_extension("tmp"), "stale crash artifact").expect("stale temp");
+        PendingSecretFile::prepare(&path)
+            .expect("preflight")
+            .publish("lmt_a_secret")
+            .expect("write token");
         assert_eq!(fs::read_to_string(&path).expect("token"), "lmt_a_secret\n");
         assert_eq!(
             fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
             0o600
         );
         assert!(
-            write_secret(&path, "replacement").is_err(),
+            PendingSecretFile::prepare(&path).is_err(),
             "existing secret was overwritten"
         );
+    }
+
+    fn issued_response() -> CredentialIssueResponse {
+        CredentialIssueResponse {
+            credential: lmt_protocol::v1alpha1::CredentialView {
+                id: "credential-a".into(),
+                node: "node-a".into(),
+                label: None,
+                created_at: "2026-09-01T00:00:00Z".into(),
+                last_used_at: None,
+                revoked_at: None,
+            },
+            token: "lmt_a_raw_secret_must_not_be_printed".into(),
+        }
+    }
+
+    async fn revoke_server(status: reqwest::StatusCode) -> (String, std::sync::Arc<std::sync::atomic::AtomicU64>) {
+        use axum::{Router, http::StatusCode, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        };
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let observed = calls.clone();
+        let app = Router::new().route(
+            "/api/v1alpha1/nodes/node-a/credentials/credential-a/revoke",
+            post(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::from_u16(status.as_u16()).expect("status")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let base = format!("http://{}/api/v1alpha1", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        (base, calls)
+    }
+
+    #[tokio::test]
+    async fn failed_local_credential_publication_revokes_or_gives_manual_cleanup_id() {
+        use std::sync::atomic::Ordering;
+
+        for (status, cleanup_confirmed) in [
+            (reqwest::StatusCode::OK, true),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, false),
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("agent.token");
+            let pending = PendingSecretFile::prepare(&path).expect("preflight");
+            fs::write(&path, "racing existing file").expect("inject publication failure");
+            let (base, calls) = revoke_server(status).await;
+            let error =
+                publish_credential_or_revoke(&Client::new(), "operator", &base, "node-a", pending, issued_response())
+                    .await
+                    .expect_err("local publication failure");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(error.message.contains("credential-a"));
+            assert!(!error.message.contains("raw_secret"));
+            assert_eq!(error.message.contains("manually revoke"), !cleanup_confirmed);
+            assert_eq!(fs::read_to_string(path).expect("existing file"), "racing existing file");
+        }
     }
 
     #[test]

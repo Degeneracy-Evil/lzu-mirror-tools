@@ -63,8 +63,16 @@ pub struct Agent {
 async fn load_or_create_installation_id(spool_dir: &Path) -> anyhow::Result<String> {
     let path = spool_dir.join(INSTALLATION_ID_FILE);
     match fs::read_to_string(&path).await {
-        Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_owned()),
-        Ok(_) => bail!("durable Agent installation ID is empty"),
+        Ok(value) => {
+            let value = value.trim();
+            let parsed = value
+                .parse::<ulid::Ulid>()
+                .map_err(|_| anyhow::anyhow!("durable Agent installation ID is invalid"))?;
+            if parsed.to_string() != value {
+                bail!("durable Agent installation ID is not canonical");
+            }
+            return Ok(value.to_owned());
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -73,16 +81,23 @@ async fn load_or_create_installation_id(spool_dir: &Path) -> anyhow::Result<Stri
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
-        let temporary = path.with_extension("tmp");
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        file.write_all(persisted_id.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, &path)?;
+        let temporary = path.with_extension(format!("tmp.{}", ulid::Ulid::new()));
+        let publication = (|| -> anyhow::Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(persisted_id.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        if publication.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        publication?;
         std::fs::File::open(path.parent().expect("Agent ID has parent"))?.sync_all()?;
         Ok(())
     })
@@ -571,6 +586,10 @@ mod tests {
             },
             logging: None,
         };
+        fs::create_dir_all(&config.storage.spool_dir).await.expect("spool");
+        fs::write(config.storage.spool_dir.join("agent-id.tmp"), "crash artifact")
+            .await
+            .expect("stale identity publication");
         let (_shutdown, receiver) = watch::channel(false);
         let first = Agent::new(config.clone(), receiver.clone()).await.expect("first Agent");
         assert!(Agent::new(config.clone(), receiver.clone()).await.is_err());
