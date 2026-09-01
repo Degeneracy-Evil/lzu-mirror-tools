@@ -459,6 +459,9 @@ The remaining questions are intentionally deferred beyond M3 unless production-t
 4. Whether a future release should parse rsync statistics into structured metrics; M3 explicitly does not.
 5. Whether measured real workloads justify stronger per-Attempt cgroup containment beyond the accepted Linux process-group contract.
 6. Whether measured Run-log storage behavior justifies application-level compression beyond transparent filesystem compression.
+7. Whether real concurrent rsync + serving requires an explicit staging/snapshot/publication layer.
+8. If publication is required, whether Mirror should represent a logical published resource separately from a physical Node-owned data tree.
+9. What minimal lifecycle/verification hooks are justified by real publication/operations requirements.
 
 ## Development principle
 

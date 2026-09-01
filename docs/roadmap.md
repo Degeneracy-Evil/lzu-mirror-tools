@@ -123,7 +123,7 @@ Scope:
 - read-only status API polish;
 - configuration examples for representative mirror types.
 
-M3 should be the first milestone considered for serious LZU production trial.
+M3 is accepted for a controlled LZU production trial. The active trial plan and architecture evidence checklist are documented in docs/production-trial.md. Do not begin M4 design solely from hypothetical requirements; collect trial evidence first.
 
 ## M4 - Production/community release hardening
 
