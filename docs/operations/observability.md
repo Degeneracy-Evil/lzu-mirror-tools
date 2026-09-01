@@ -13,6 +13,10 @@ lmt run logs <run-id>
 lmt run logs <run-id> --follow
 ~~~
 
+Both commands consume the complete chunked API stream. Human mode writes log
+chunks directly. `--output json` emits newline-delimited JSON chunk objects so
+automation can process arbitrarily long logs with bounded memory.
+
 These logs are not daemon logs and are not stored as SQLite BLOBs.
 
 ## 2. Daemon logs

@@ -270,7 +270,7 @@ async fn load_backup_recency(state: &AppState) {
     };
     match tokio::task::spawn_blocking(move || backup::list(&directory)).await {
         Ok(Ok(backups)) => {
-            if let Some(seconds) = backups.first().and_then(backup_manifest_timestamp_seconds) {
+            if let Some(seconds) = backups.iter().filter_map(backup_manifest_timestamp_seconds).max() {
                 state
                     .metrics
                     .backup_last_success_seconds

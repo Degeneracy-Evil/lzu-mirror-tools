@@ -1266,6 +1266,11 @@ Both normal log display and follow mode must iterate logical offsets rather than
 
 No CLI output mode may require buffering an arbitrarily large Run log in memory merely for presentation.
 
+For Run logs specifically, human output is streamed as log bytes and
+`--output json` is newline-delimited JSON with one bounded chunk object per
+line (`offset`, `next_offset`, `complete`, and `data`). It is intentionally not
+one unbounded JSON string.
+
 ### Retention finality
 
 Once attempt_logs.expired_at_ms is set, a late Agent log retransmission must not recreate the expired central file.
