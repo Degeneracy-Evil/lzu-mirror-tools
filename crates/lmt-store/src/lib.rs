@@ -47,6 +47,8 @@ pub enum StoreError {
     },
     #[error("Node binding replacement may overlap dispatched work")]
     BindingReplacementUnsafe,
+    #[error("credential not found")]
+    CredentialNotFound,
     #[error("illegal state transition from {from:?} to {to:?}")]
     IllegalTransition { from: AttemptState, to: AttemptState },
     #[error("spec serialization failed: {0}")]
@@ -112,6 +114,22 @@ pub struct NodeObservation {
     pub mirror_root_free_bytes: Option<u64>,
     pub mirror_root: String,
     pub observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CredentialRecord {
+    pub node: String,
+    pub id: String,
+    pub label: Option<String>,
+    pub created_at_ms: i64,
+    pub last_used_at_ms: Option<i64>,
+    pub revoked_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuthenticatedCredential {
+    pub node: String,
+    pub credential_id: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -439,35 +457,175 @@ impl Store {
         .await
     }
 
-    pub async fn upsert_credential(&self, node: &str, token: &str, now: i64) -> Result<(), StoreError> {
+    pub async fn import_legacy_credential(&self, node: &str, token: &str, now: i64) -> Result<bool, StoreError> {
         let node = node.to_owned();
         let hash = token_hash(token);
         self.call(move |connection| {
-        connection.execute(
-            "INSERT INTO nodes(name,registered_at_ms,active_runs,capabilities_json) VALUES(?1,?2,0,'{}') ON CONFLICT(name) DO NOTHING",
-            params![node, now],
-        )?;
-        connection.execute(
-            "INSERT INTO node_credentials(node_name,credential_id,token_hash,created_at_ms,revoked_at_ms)
-             VALUES(?1,'bootstrap',?2,?3,NULL)
-             ON CONFLICT(node_name,credential_id) DO UPDATE SET token_hash=excluded.token_hash,revoked_at_ms=NULL",
-            params![node, hash, now],
-        )?;
-        Ok(())
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO nodes(name,registered_at_ms,active_runs,capabilities_json) VALUES(?1,?2,0,'{}') ON CONFLICT(name) DO NOTHING",
+                params![node, now],
+            )?;
+            let history: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM node_credentials WHERE node_name=?1)",
+                [&node],
+                |row| row.get(0),
+            )?;
+            if history {
+                transaction.commit()?;
+                return Ok(false);
+            }
+            transaction.execute(
+                "INSERT INTO node_credentials(node_name,credential_id,token_hash,created_at_ms,revoked_at_ms,label)
+                 VALUES(?1,'bootstrap',?2,?3,NULL,'legacy-inline')",
+                params![node, hash, now],
+            )?;
+            transaction.commit()?;
+            Ok(true)
+        })
+        .await
+    }
+
+    pub async fn upsert_credential(&self, node: &str, token: &str, now: i64) -> Result<(), StoreError> {
+        self.import_legacy_credential(node, token, now).await.map(|_| ())
+    }
+
+    pub async fn issue_credential(
+        &self,
+        node: &str,
+        credential_id: &str,
+        label: Option<&str>,
+        token: &str,
+        now: i64,
+    ) -> Result<CredentialRecord, StoreError> {
+        let node = node.to_owned();
+        let credential_id = credential_id.to_owned();
+        let label = label.map(str::to_owned);
+        let hash = token_hash(token);
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let exists: bool =
+                transaction.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE name=?1)", [&node], |row| {
+                    row.get(0)
+                })?;
+            if !exists {
+                return Err(StoreError::AttemptNotFound);
+            }
+            transaction.execute(
+                "INSERT INTO node_credentials(node_name,credential_id,token_hash,created_at_ms,label)
+                 VALUES(?1,?2,?3,?4,?5)",
+                params![node, credential_id, hash, now, label],
+            )?;
+            transaction.commit()?;
+            Ok(CredentialRecord {
+                node,
+                id: credential_id,
+                label,
+                created_at_ms: now,
+                last_used_at_ms: None,
+                revoked_at_ms: None,
+            })
+        })
+        .await
+    }
+
+    pub async fn list_credentials(&self, node: &str) -> Result<Vec<CredentialRecord>, StoreError> {
+        let node = node.to_owned();
+        self.call(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT node_name,credential_id,label,created_at_ms,last_used_at_ms,revoked_at_ms
+                 FROM node_credentials WHERE node_name=?1 ORDER BY created_at_ms DESC,credential_id DESC",
+            )?;
+            statement
+                .query_map([node], |row| {
+                    Ok(CredentialRecord {
+                        node: row.get(0)?,
+                        id: row.get(1)?,
+                        label: row.get(2)?,
+                        created_at_ms: row.get(3)?,
+                        last_used_at_ms: row.get(4)?,
+                        revoked_at_ms: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn revoke_credential(&self, node: &str, id: &str, now: i64) -> Result<CredentialRecord, StoreError> {
+        let node = node.to_owned();
+        let id = id.to_owned();
+        self.call(move |connection| {
+            let transaction = connection.transaction()?;
+            let existing = transaction
+                .query_row(
+                    "SELECT node_name,credential_id,label,created_at_ms,last_used_at_ms,revoked_at_ms
+                     FROM node_credentials WHERE node_name=?1 AND credential_id=?2",
+                    params![node, id],
+                    |row| {
+                        Ok(CredentialRecord {
+                            node: row.get(0)?,
+                            id: row.get(1)?,
+                            label: row.get(2)?,
+                            created_at_ms: row.get(3)?,
+                            last_used_at_ms: row.get(4)?,
+                            revoked_at_ms: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?
+                .ok_or(StoreError::CredentialNotFound)?;
+            let revoked_at_ms = existing.revoked_at_ms.unwrap_or(now);
+            transaction.execute(
+                "UPDATE node_credentials SET revoked_at_ms=COALESCE(revoked_at_ms,?3)
+                 WHERE node_name=?1 AND credential_id=?2",
+                params![node, id, now],
+            )?;
+            transaction.commit()?;
+            Ok(CredentialRecord {
+                revoked_at_ms: Some(revoked_at_ms),
+                ..existing
+            })
+        })
+        .await
+    }
+
+    pub async fn authenticate_credential(&self, token: &str) -> Result<Option<AuthenticatedCredential>, StoreError> {
+        let hash = token_hash(token);
+        self.call(move |connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT node_name,credential_id FROM node_credentials WHERE token_hash=?1 AND revoked_at_ms IS NULL",
+                    [hash],
+                    |row| {
+                        Ok(AuthenticatedCredential {
+                            node: row.get(0)?,
+                            credential_id: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()?)
         })
         .await
     }
 
     pub async fn authenticate_node(&self, token: &str) -> Result<Option<String>, StoreError> {
-        let hash = token_hash(token);
+        self.authenticate_credential(token)
+            .await
+            .map(|credential| credential.map(|value| value.node))
+    }
+
+    pub async fn mark_credential_used(&self, node: &str, id: &str, now: i64) -> Result<bool, StoreError> {
+        let node = node.to_owned();
+        let id = id.to_owned();
         self.call(move |connection| {
-            Ok(connection
-                .query_row(
-                    "SELECT node_name FROM node_credentials WHERE token_hash=?1 AND revoked_at_ms IS NULL",
-                    [hash],
-                    |row| row.get(0),
-                )
-                .optional()?)
+            Ok(connection.execute(
+                "UPDATE node_credentials SET last_used_at_ms=?3
+                 WHERE node_name=?1 AND credential_id=?2 AND revoked_at_ms IS NULL
+                   AND (last_used_at_ms IS NULL OR last_used_at_ms<=?3-60000)",
+                params![node, id, now],
+            )? > 0)
         })
         .await
     }
@@ -2552,6 +2710,92 @@ mod tests {
         assert_eq!(
             store.get_run(&run.id).await.expect("run").expect("run").state,
             RunState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_history_prevents_legacy_resurrection_and_usage_is_throttled() {
+        let store = Store::open_in_memory().await.expect("open");
+        assert!(
+            store
+                .import_legacy_credential("node-a", "legacy-secret", 10)
+                .await
+                .expect("import")
+        );
+        assert_eq!(
+            store
+                .authenticate_credential("legacy-secret")
+                .await
+                .expect("authenticate")
+                .expect("credential")
+                .credential_id,
+            "bootstrap"
+        );
+        let revoked = store
+            .revoke_credential("node-a", "bootstrap", 20)
+            .await
+            .expect("revoke");
+        assert_eq!(revoked.revoked_at_ms, Some(20));
+        assert_eq!(
+            store
+                .revoke_credential("node-a", "bootstrap", 30)
+                .await
+                .expect("idempotent")
+                .revoked_at_ms,
+            Some(20)
+        );
+        assert!(
+            !store
+                .import_legacy_credential("node-a", "legacy-secret", 40)
+                .await
+                .expect("stale import")
+        );
+        assert!(
+            store
+                .authenticate_credential("legacy-secret")
+                .await
+                .expect("revoked authentication")
+                .is_none()
+        );
+
+        let issued = store
+            .issue_credential("node-a", "new-id", Some("rotation"), "new-secret", 50)
+            .await
+            .expect("issue");
+        assert_eq!(issued.label.as_deref(), Some("rotation"));
+        let stored_hash: String = store
+            .call(|connection| {
+                Ok(connection.query_row(
+                    "SELECT token_hash FROM node_credentials WHERE credential_id='new-id'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .expect("stored digest");
+        assert_ne!(stored_hash, "new-secret");
+        assert!(!stored_hash.contains("new-secret"));
+        assert!(
+            store
+                .mark_credential_used("node-a", "new-id", 60)
+                .await
+                .expect("first use")
+        );
+        assert!(
+            !store
+                .mark_credential_used("node-a", "new-id", 61)
+                .await
+                .expect("throttled")
+        );
+        assert!(
+            store
+                .mark_credential_used("node-a", "new-id", 60_060)
+                .await
+                .expect("later use")
+        );
+        assert_eq!(
+            store.list_credentials("node-a").await.expect("list")[0].last_used_at_ms,
+            Some(60_060)
         );
     }
 

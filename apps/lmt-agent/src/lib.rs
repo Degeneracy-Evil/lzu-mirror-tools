@@ -3,7 +3,12 @@ mod executor;
 mod process_lock;
 mod spool;
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use anyhow::bail;
 use config::Config;
@@ -24,7 +29,7 @@ const INSTALLATION_ID_FILE: &str = "agent-id";
 #[derive(Clone)]
 pub struct Agent {
     config: Config,
-    token: Arc<str>,
+    token: Arc<RwLock<String>>,
     instance: Arc<str>,
     boot_id: Arc<str>,
     _process_lock: Arc<process_lock::ProcessLock>,
@@ -79,7 +84,7 @@ impl Agent {
         let instance = load_or_create_installation_id(&config.storage.spool_dir).await?;
         Ok(Self {
             config,
-            token: token.into(),
+            token: Arc::new(RwLock::new(token)),
             instance: instance.into(),
             boot_id: ulid::Ulid::new().to_string().into(),
             _process_lock: Arc::new(process_lock),
@@ -88,6 +93,20 @@ impl Agent {
             acceptance: Arc::new(Mutex::new(())),
             shutdown,
         })
+    }
+
+    fn token(&self) -> String {
+        self.token.read().expect("Agent token lock poisoned").clone()
+    }
+
+    pub async fn reload_token(&self) -> anyhow::Result<()> {
+        let token = fs::read_to_string(&self.config.server.token_file).await?;
+        let token = token.trim();
+        if token.is_empty() {
+            bail!("Agent token file is empty");
+        }
+        token.clone_into(&mut self.token.write().expect("Agent token lock poisoned"));
+        Ok(())
     }
 
     pub async fn run(self) -> anyhow::Result<()> {
@@ -116,10 +135,11 @@ impl Agent {
                 },
                 mirror_root: self.config.storage.mirror_root.to_string_lossy().into_owned(),
             };
+            let token = self.token();
             match self
                 .client
                 .post(format!("{}/api/v1alpha1/agent/poll", self.config.server.url))
-                .bearer_auth(self.token.as_ref())
+                .bearer_auth(token)
                 .json(&request)
                 .send()
                 .await
@@ -321,13 +341,14 @@ impl Agent {
                 failure_kind: record.failure_kind,
                 failure_message: record.failure_message.clone(),
             };
+            let token = self.token();
             let response = self
                 .client
                 .post(format!(
                     "{}/api/v1alpha1/agent/attempts/{}/{}/events",
                     self.config.server.url, record.run_id, record.attempt
                 ))
-                .bearer_auth(self.token.as_ref())
+                .bearer_auth(token)
                 .json(&event)
                 .send()
                 .await?;
@@ -358,13 +379,14 @@ impl Agent {
                 file.read_exact(&mut bytes).await?;
             }
             let final_chunk = record.state.is_terminal() && record.log_offset + remaining == stored_bytes;
+            let token = self.token();
             let response = self
                 .client
                 .put(format!(
                     "{}/api/v1alpha1/agent/attempts/{}/{}/log",
                     self.config.server.url, record.run_id, record.attempt
                 ))
-                .bearer_auth(self.token.as_ref())
+                .bearer_auth(token)
                 .header("x-lmt-log-offset", record.log_offset)
                 .header("x-lmt-log-complete", final_chunk.to_string())
                 .body(bytes)
@@ -467,7 +489,7 @@ mod tests {
                     process: config::ProcessPolicy { enabled: true },
                 },
             },
-            token: "token".into(),
+            token: Arc::new(RwLock::new("token".into())),
             instance: "instance".into(),
             boot_id: "boot".into(),
             _process_lock: Arc::new(process_lock),
@@ -521,6 +543,14 @@ mod tests {
         let (_shutdown, receiver) = watch::channel(false);
         let first = Agent::new(config.clone(), receiver.clone()).await.expect("first Agent");
         assert!(Agent::new(config.clone(), receiver.clone()).await.is_err());
+        fs::write(&config.server.token_file, "\n").await.expect("empty token");
+        assert!(first.reload_token().await.is_err());
+        assert_eq!(first.token(), "secret");
+        fs::write(&config.server.token_file, "rotated\n")
+            .await
+            .expect("rotated token");
+        first.reload_token().await.expect("reload");
+        assert_eq!(first.token(), "rotated");
         let installation_id = first.instance.clone();
         let first_boot = first.boot_id.clone();
         drop(first);

@@ -21,8 +21,8 @@ use axum::{
 };
 use lmt_core::{BundleFile, RunState, RunTrigger};
 use lmt_protocol::v1alpha1::{
-    AgentAction, ApplyRequest, ApplyResponse, BundleRequest, ManualRunRequest, PlanResponse, PollResponse, RunDetail,
-    RunView,
+    AgentAction, ApplyRequest, ApplyResponse, BundleRequest, CredentialIssueRequest, CredentialIssueResponse,
+    CredentialView, ManualRunRequest, PlanResponse, PollResponse, RunDetail, RunView,
 };
 use lmt_server::{AgentCredential, AppState, Clock, ServerConfig, build_router, initialize, initialize_with_clock};
 use nix::{
@@ -50,6 +50,7 @@ struct Harness {
     proxy_task: JoinHandle<()>,
     client: Client,
     agent_config: PathBuf,
+    agent_token: PathBuf,
     agent: Option<Child>,
     files: BTreeMap<String, String>,
     drop_accepted: Arc<AtomicUsize>,
@@ -93,7 +94,8 @@ impl Harness {
             bind: server_address.to_string(),
             database_path: directory.path().join("server/lmt.db"),
             log_dir: directory.path().join("server/logs"),
-            operator_token: OPERATOR_TOKEN.into(),
+            operator_token: Some(OPERATOR_TOKEN.into()),
+            operator_token_file: None,
             offline_after_seconds: 2,
             agents: vec![AgentCredential {
                 node: "node-a".into(),
@@ -139,6 +141,7 @@ impl Harness {
             proxy_task,
             client: Client::new(),
             agent_config,
+            agent_token: token_path,
             agent: None,
             files: BTreeMap::new(),
             drop_accepted,
@@ -415,6 +418,63 @@ impl Harness {
                 .expect("cancel request"),
         )
         .await;
+    }
+
+    async fn issue_credential(&self, node: &str, label: &str) -> CredentialIssueResponse {
+        self.checked(
+            self.client
+                .post(format!("{}/api/v1alpha1/nodes/{node}/credentials", self.server_url()))
+                .bearer_auth(OPERATOR_TOKEN)
+                .json(&CredentialIssueRequest {
+                    label: Some(label.into()),
+                })
+                .send()
+                .await
+                .expect("issue credential"),
+        )
+        .await
+        .json()
+        .await
+        .expect("credential response")
+    }
+
+    async fn credentials(&self, node: &str) -> Vec<CredentialView> {
+        self.checked(
+            self.client
+                .get(format!("{}/api/v1alpha1/nodes/{node}/credentials", self.server_url()))
+                .bearer_auth(OPERATOR_TOKEN)
+                .send()
+                .await
+                .expect("list credentials"),
+        )
+        .await
+        .json()
+        .await
+        .expect("credentials")
+    }
+
+    async fn revoke_credential(&self, node: &str, id: &str) {
+        self.checked(
+            self.client
+                .post(format!(
+                    "{}/api/v1alpha1/nodes/{node}/credentials/{id}/revoke",
+                    self.server_url()
+                ))
+                .bearer_auth(OPERATOR_TOKEN)
+                .send()
+                .await
+                .expect("revoke credential"),
+        )
+        .await;
+    }
+
+    fn reload_agent(&mut self) {
+        let pid = self
+            .agent
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .expect("Agent PID");
+        kill(Pid::from_raw(i32::try_from(pid).expect("PID")), Signal::SIGHUP).expect("reload Agent");
     }
 
     async fn logs(&self, id: &str) -> (String, bool) {
@@ -997,4 +1057,69 @@ async fn lost_start_response_followed_by_cancel_executes_nothing_and_retires_tom
     );
     assert_eq!(detail.attempts.len(), 1);
     assert_eq!(detail.attempts[0].state, lmt_core::AttemptState::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_credential_rotation_and_reload_preserve_active_execution() {
+    let mut harness = Harness::new().await;
+    harness.drop_accepted.store(0, Ordering::SeqCst);
+    harness.lose_terminal_ack.store(0, Ordering::SeqCst);
+    let marker = harness.directory.path().join("rotation-running");
+    harness
+        .set_command_policy(
+            "credential-rotation",
+            "/bin/sh",
+            &["-c".into(), format!("touch '{}'; sleep 2", marker.display())],
+            10,
+            1,
+            0,
+            true,
+        )
+        .await;
+    harness.start_agent();
+    let run_id = harness.run("credential-rotation").await;
+    harness.wait_state(&run_id, RunState::Running).await;
+    for _ in 0..50 {
+        if marker.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(marker.exists(), "long Run did not start");
+
+    let issued = harness.issue_credential("node-a", "rotation-e2e").await;
+    let temporary = harness.agent_token.with_extension("new");
+    fs::write(&temporary, format!("{}\n", issued.token))
+        .await
+        .expect("new token");
+    fs::rename(&temporary, &harness.agent_token)
+        .await
+        .expect("atomic token replacement");
+    harness.reload_agent();
+    let mut used = false;
+    for _ in 0..100 {
+        used = harness
+            .credentials("node-a")
+            .await
+            .into_iter()
+            .find(|credential| credential.id == issued.credential.id)
+            .is_some_and(|credential| credential.last_used_at.is_some());
+        if used {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(used, "Agent did not authenticate with reloaded credential");
+    harness.revoke_credential("node-a", "bootstrap").await;
+
+    harness.wait_state(&run_id, RunState::Succeeded).await;
+    let follow_up = harness.run("credential-rotation").await;
+    harness.wait_state(&follow_up, RunState::Succeeded).await;
+    let bootstrap = harness
+        .credentials("node-a")
+        .await
+        .into_iter()
+        .find(|credential| credential.id == "bootstrap")
+        .expect("bootstrap history");
+    assert!(bootstrap.revoked_at.is_some());
 }

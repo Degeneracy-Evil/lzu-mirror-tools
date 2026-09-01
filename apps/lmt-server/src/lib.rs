@@ -9,13 +9,14 @@ use axum::{
 use lmt_core::{AttemptEvent, ConfigBundle, RunId, canonicalize_bundle};
 use lmt_protocol::v1alpha1::*;
 use lmt_store::{AttemptRecord, ChangeKind, ConfigPlan, NodeObservation, RunRecord, Store, StoreError};
+use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -38,7 +39,10 @@ pub struct ServerConfig {
     pub bind: String,
     pub database_path: PathBuf,
     pub log_dir: PathBuf,
-    pub operator_token: String,
+    #[serde(default)]
+    pub operator_token: Option<String>,
+    #[serde(default)]
+    pub operator_token_file: Option<PathBuf>,
     #[serde(default = "offline_default")]
     pub offline_after_seconds: u64,
     #[serde(default)]
@@ -57,7 +61,8 @@ const fn offline_default() -> u64 {
 pub struct AppState {
     store: Store,
     log_dir: PathBuf,
-    operator_token: Arc<str>,
+    operator_token: Arc<RwLock<String>>,
+    operator_token_file: Option<PathBuf>,
     offline_after: Duration,
     notify: Arc<Notify>,
     log_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
@@ -103,7 +108,8 @@ impl AppState {
         Self {
             store,
             log_dir,
-            operator_token: token.into(),
+            operator_token: Arc::new(RwLock::new(token)),
+            operator_token_file: None,
             offline_after,
             notify: Arc::new(Notify::new()),
             log_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -119,6 +125,20 @@ impl AppState {
 
     pub fn wake_scheduler(&self) {
         self.notify.notify_waiters();
+    }
+
+    pub async fn reload_operator_token(&self) -> anyhow::Result<()> {
+        let path = self
+            .operator_token_file
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("operator_token_file is not configured"))?;
+        let token = fs::read_to_string(path).await?;
+        let token = token.trim();
+        if token.is_empty() {
+            anyhow::bail!("operator token file is empty");
+        }
+        token.clone_into(&mut self.operator_token.write().expect("operator token lock poisoned"));
+        Ok(())
     }
 }
 pub async fn initialize(c: &ServerConfig) -> anyhow::Result<AppState> {
@@ -141,17 +161,40 @@ pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> a
     fs::create_dir_all(&c.log_dir).await?;
     let store = Store::open(&c.database_path).await?;
     for a in &c.agents {
-        store.upsert_credential(&a.node, &a.token, clock.now_ms()).await?;
+        if store
+            .import_legacy_credential(&a.node, &a.token, clock.now_ms())
+            .await?
+        {
+            tracing::warn!(node=%a.node, "imported deprecated inline Agent credential; remove it from server config");
+        }
     }
+    let operator_token = load_operator_token(c).await?;
     let mut state = AppState::new(
         store,
         c.log_dir.clone(),
-        c.operator_token.clone(),
+        operator_token,
         Duration::from_secs(c.offline_after_seconds),
     );
     state.clock = clock;
+    state.operator_token_file.clone_from(&c.operator_token_file);
     tokio::spawn(run_scheduler(state.clone()));
     Ok(state)
+}
+
+async fn load_operator_token(c: &ServerConfig) -> anyhow::Result<String> {
+    let token = if let Some(path) = &c.operator_token_file {
+        fs::read_to_string(path).await?
+    } else if let Some(token) = &c.operator_token {
+        tracing::warn!("deprecated inline operator_token is configured; use operator_token_file");
+        token.clone()
+    } else {
+        anyhow::bail!("operator_token_file is required (deprecated operator_token is accepted for migration)");
+    };
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        anyhow::bail!("operator token is empty");
+    }
+    Ok(token)
 }
 
 async fn run_scheduler(state: AppState) {
@@ -219,6 +262,14 @@ pub fn build_router(s: AppState) -> Router {
         .route("/api/v1alpha1/nodes", get(nodes))
         .route("/api/v1alpha1/nodes/{name}", get(node))
         .route("/api/v1alpha1/nodes/{name}/binding", post(replace_binding))
+        .route(
+            "/api/v1alpha1/nodes/{name}/credentials",
+            get(credentials).post(issue_credential),
+        )
+        .route(
+            "/api/v1alpha1/nodes/{name}/credentials/{id}/revoke",
+            post(revoke_credential),
+        )
         .route("/api/v1alpha1/agent/poll", post(poll))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/events", post(event))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/log", put(upload_log))
@@ -533,8 +584,75 @@ async fn replace_binding(
         .ok_or_else(|| Failure::not_found("node_not_found"))?;
     Ok(Json(node_view(node, s.now_ms(), s.offline_after)))
 }
+async fn issue_credential(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<CredentialIssueRequest>,
+) -> Result<Response, Failure> {
+    operator(&h, &s)?;
+    if !s.store.list_nodes().await?.iter().any(|node| node.name == name) {
+        return Err(Failure::not_found("node_not_found"));
+    }
+    let mut secret = [0_u8; 32];
+    OsRng.try_fill_bytes(&mut secret).map_err(|_| {
+        Failure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "entropy_unavailable",
+            "token generation failed",
+        )
+    })?;
+    let token = format!("lmt_a_{}", hex::encode(secret));
+    let credential = s
+        .store
+        .issue_credential(
+            &name,
+            &ulid::Ulid::new().to_string(),
+            request.label.as_deref(),
+            &token,
+            s.now_ms(),
+        )
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(CredentialIssueResponse {
+            credential: credential_view(credential),
+            token,
+        }),
+    )
+        .into_response())
+}
+async fn credentials(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Vec<CredentialView>>, Failure> {
+    operator(&h, &s)?;
+    if !s.store.list_nodes().await?.iter().any(|node| node.name == name) {
+        return Err(Failure::not_found("node_not_found"));
+    }
+    Ok(Json(
+        s.store
+            .list_credentials(&name)
+            .await?
+            .into_iter()
+            .map(credential_view)
+            .collect(),
+    ))
+}
+async fn revoke_credential(
+    State(s): State<AppState>,
+    h: HeaderMap,
+    AxumPath((name, id)): AxumPath<(String, String)>,
+) -> Result<Json<CredentialView>, Failure> {
+    operator(&h, &s)?;
+    Ok(Json(credential_view(
+        s.store.revoke_credential(&name, &id, s.now_ms()).await?,
+    )))
+}
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
-    let node = agent(&h, &s).await?;
+    let credential = agent(&h, &s).await?;
+    let node = credential.node;
     if r.protocol_version != "v1alpha1" {
         return Err(Failure::bad(
             "unsupported_protocol_version",
@@ -553,6 +671,10 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
             mirror_root: r.mirror_root.clone(),
             observed_at_ms: s.now_ms(),
         })
+        .await?;
+    let _ = s
+        .store
+        .mark_credential_used(&node, &credential.credential_id, s.now_ms())
         .await?;
     s.metrics.polls.fetch_add(1, Ordering::Relaxed);
     s.notify.notify_waiters();
@@ -597,8 +719,8 @@ async fn event(
     AxumPath((id, no)): AxumPath<(String, u32)>,
     Json(r): Json<EventRequest>,
 ) -> Result<Json<EventResponse>, Failure> {
-    let node = agent(&h, &s).await?;
-    attempt_auth(&s, &node, &id, no).await?;
+    let credential = agent(&h, &s).await?;
+    attempt_auth(&s, &credential.node, &id, no).await?;
     let terminal_state = r.state;
     let applied = services::apply_attempt_event(
         &s.store,
@@ -647,8 +769,8 @@ async fn upload_log(
     AxumPath((id, no)): AxumPath<(String, u32)>,
     body: Bytes,
 ) -> Result<Response, Failure> {
-    let node = agent(&h, &s).await?;
-    attempt_auth(&s, &node, &id, no).await?;
+    let credential = agent(&h, &s).await?;
+    attempt_auth(&s, &credential.node, &id, no).await?;
     if body.len() > 1_048_576 {
         return Err(Failure::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -776,15 +898,15 @@ fn bearer(h: &HeaderMap) -> Option<&str> {
     h.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 fn operator(h: &HeaderMap, s: &AppState) -> Result<(), Failure> {
-    if bearer(h) == Some(s.operator_token.as_ref()) {
+    if bearer(h) == Some(s.operator_token.read().expect("operator token lock poisoned").as_str()) {
         Ok(())
     } else {
         Err(Failure::unauthorized())
     }
 }
-async fn agent(h: &HeaderMap, s: &AppState) -> Result<String, Failure> {
+async fn agent(h: &HeaderMap, s: &AppState) -> Result<lmt_store::AuthenticatedCredential, Failure> {
     s.store
-        .authenticate_node(bearer(h).ok_or_else(Failure::unauthorized)?)
+        .authenticate_credential(bearer(h).ok_or_else(Failure::unauthorized)?)
         .await?
         .ok_or_else(Failure::unauthorized)
 }
@@ -865,6 +987,16 @@ fn node_view(n: lmt_store::NodeRecord, now: i64, d: Duration) -> NodeView {
         mirror_root_free_bytes: n.mirror_root_free_bytes,
         max_concurrent_runs: n.max_concurrent_runs,
         online: n.last_seen_at_ms.is_some_and(|x| now - x <= d.as_millis() as i64),
+    }
+}
+fn credential_view(credential: lmt_store::CredentialRecord) -> CredentialView {
+    CredentialView {
+        id: credential.id,
+        node: credential.node,
+        label: credential.label,
+        created_at: timestamp(credential.created_at_ms),
+        last_used_at: credential.last_used_at_ms.map(timestamp),
+        revoked_at: credential.revoked_at_ms.map(timestamp),
     }
 }
 fn plan_view(p: ConfigPlan) -> PlanResponse {
@@ -957,6 +1089,7 @@ impl From<StoreError> for Failure {
                 failure
             }
             StoreError::BindingReplacementUnsafe => Self::conflict("binding_replacement_unsafe", e.to_string()),
+            StoreError::CredentialNotFound => Self::not_found("credential_not_found"),
             StoreError::AttemptNotFound => Self::not_found("attempt_not_found"),
             StoreError::RequestConflict | StoreError::IllegalTransition { .. } => {
                 Self::conflict("state_conflict", e.to_string())
@@ -1239,5 +1372,90 @@ mod tests {
             .expect("cancel");
         }
         assert_eq!(cancel_state.metrics.cancellations_immediate.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn issued_credentials_are_secret_safe_revocable_and_operator_reload_is_fail_safe() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open_in_memory().await.expect("store");
+        store
+            .import_legacy_credential("node-a", "legacy", 1)
+            .await
+            .expect("legacy");
+        let token_file = directory.path().join("operator.token");
+        fs::write(&token_file, "operator\n").await.expect("operator token");
+        let mut state = AppState::new(
+            store.clone(),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.operator_token_file = Some(token_file.clone());
+        state.clock = Arc::new(FakeClock(AtomicI64::new(10)));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
+
+        let response = issue_credential(
+            State(state.clone()),
+            headers.clone(),
+            AxumPath("node-a".into()),
+            Json(CredentialIssueRequest {
+                label: Some("rotation".into()),
+            }),
+        )
+        .await
+        .expect("issue");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let issued: CredentialIssueResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 16_384).await.expect("body"))
+                .expect("issue response");
+        assert!(issued.token.starts_with("lmt_a_"));
+        assert_eq!(issued.token.len(), 70);
+        let listed = credentials(State(state.clone()), headers.clone(), AxumPath("node-a".into()))
+            .await
+            .expect("list")
+            .0;
+        assert!(listed.iter().all(|credential| credential.id != issued.token));
+        assert!(
+            store
+                .authenticate_credential(&issued.token)
+                .await
+                .expect("auth")
+                .is_some()
+        );
+
+        let revoked = revoke_credential(
+            State(state.clone()),
+            headers,
+            AxumPath(("node-a".into(), issued.credential.id)),
+        )
+        .await
+        .expect("revoke")
+        .0;
+        assert!(revoked.revoked_at.is_some());
+        assert!(
+            store
+                .authenticate_credential(&issued.token)
+                .await
+                .expect("auth")
+                .is_none()
+        );
+
+        fs::write(&token_file, "\n").await.expect("empty replacement");
+        assert!(state.reload_operator_token().await.is_err());
+        assert_eq!(
+            state.operator_token.read().expect("token").as_str(),
+            "operator",
+            "failed reload replaced the working credential"
+        );
+        fs::write(&token_file, "new-operator\n").await.expect("replacement");
+        state.reload_operator_token().await.expect("reload");
+        assert_eq!(state.operator_token.read().expect("token").as_str(), "new-operator");
     }
 }

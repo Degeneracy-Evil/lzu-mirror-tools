@@ -165,6 +165,31 @@ pub struct BindingReplaceRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct CredentialIssueRequest {
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialView {
+    pub id: String,
+    pub node: String,
+    pub label: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialIssueResponse {
+    #[serde(flatten)]
+    pub credential: CredentialView,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Capacity {
     pub mirror_root_free_bytes: Option<u64>,
     pub active_runs: u32,

@@ -18,6 +18,16 @@ async fn main() -> anyhow::Result<()> {
     let config: ServerConfig = toml::from_str(&source)?;
     let _process_lock = acquire_server_lock(&config)?;
     let state = initialize(&config).await?;
+    let reload_state = state.clone();
+    tokio::spawn(async move {
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("SIGHUP");
+        while signal.recv().await.is_some() {
+            match reload_state.reload_operator_token().await {
+                Ok(()) => tracing::info!(component = "server", "operator credential reloaded"),
+                Err(error) => tracing::error!(component = "server", %error, "operator credential reload failed"),
+            }
+        }
+    });
     let listener = TcpListener::bind(&config.bind).await?;
     axum::serve(listener, build_router(state))
         .with_graceful_shutdown(shutdown())
