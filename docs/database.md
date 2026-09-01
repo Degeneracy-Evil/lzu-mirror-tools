@@ -490,3 +490,75 @@ M2 adds four especially important transaction classes:
 Cancellation intent is transactional and terminalizes immediately only when no Attempt may already have been dispatched.
 
 See m2-design.md for exact eligibility and priority rules.
+
+
+## 23. M3 schema version 3
+
+M3 adds migration 0003_m3.sql.
+
+Before implementation, freeze an accepted schema-v2 fixture and use that artifact for upgrade tests.
+
+Conceptual additions:
+
+~~~text
+node_credentials:
+  label
+  last_used_at_ms
+
+nodes:
+  bound_agent_id
+  agent_boot_id
+
+attempt_logs:
+  expired_at_ms
+~~~
+
+M3 may also add indexes required by bounded Run pagination, credential operations, and log-retention candidate selection.
+
+No generic maintenance/job queue table is introduced.
+
+## 24. Agent credential history
+
+Credential rows are retained after revocation.
+
+An active lookup requires revoked_at_ms IS NULL.
+
+last_used_at is updated from successful Agent poll authentication with write throttling.
+
+Legacy credential IDs remain queryable.
+
+Raw credentials are never stored.
+
+## 25. Agent binding
+
+nodes.bound_agent_id is a safety/fencing field, not transient liveness state.
+
+First M3 Agent poll may establish it when NULL.
+
+A different presented durable Agent ID must not overwrite it implicitly.
+
+Binding replacement is an explicit operator transaction.
+
+agent_boot_id remains diagnostic/transient and may change on process restart.
+
+## 26. Log expiration metadata
+
+attempt_logs.expired_at_ms distinguishes intentional retention from unexpected file loss.
+
+Retention never removes the Attempt row.
+
+When expired_at_ms is non-null, log APIs return log_expired even if a leftover file still exists after a crash before unlink cleanup.
+
+## 27. Bounded operational queries
+
+M3 Store APIs for Run list and metrics must query bounded/indexed rows.
+
+Run history uses a default/max limit and keyset pagination over created_at_ms/id.
+
+Prometheus aggregate queries must not call an unbounded list_runs path.
+
+## 28. Restore normalization
+
+Offline restore may transactionally normalize stale non-terminal state from the restored snapshot before the database is served.
+
+This maintenance mutation is part of the documented restore procedure and must be covered by migration/recovery tests.

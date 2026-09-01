@@ -457,3 +457,109 @@ Run list should support trigger filtering.
 Run detail shows all Attempts plus retry/cancel metadata.
 
 Mirror detail includes scheduler-derived timing status; TOML remains the source of schedule expression itself.
+
+
+## 26. M3 bounded Run list
+
+GET /api/v1alpha1/runs supports:
+
+~~~text
+mirror
+node
+state
+trigger
+limit
+before
+~~~
+
+Default limit is 50 and maximum is 500.
+
+before is a Run-ID keyset cursor.
+
+The API must not return complete Run history by default.
+
+## 27. M3 log follow
+
+Run log reads retain logical offsets and add bounded waiting:
+
+~~~text
+GET /api/v1alpha1/runs/{id}/logs
+  ?attempt=N
+  &offset=K
+  &limit=65536
+  &wait=20s
+~~~
+
+If attempt is omitted, use the latest Attempt.
+
+Expired logs return HTTP 410 with code log_expired.
+
+Unexpected missing files use a distinct operational error.
+
+## 28. M3 Agent credentials
+
+Operator-authenticated endpoints conceptually include:
+
+~~~text
+POST /api/v1alpha1/nodes/{node}/credentials
+GET  /api/v1alpha1/nodes/{node}/credentials
+POST /api/v1alpha1/nodes/{node}/credentials/{id}/revoke
+~~~
+
+Issue returns the raw Server-generated token once and must set Cache-Control: no-store.
+
+List/revoke never expose the raw secret.
+
+## 29. M3 Node binding
+
+Node views expose sanitized binding/install diagnostics.
+
+A conflicting Agent poll returns:
+
+~~~text
+409 agent_binding_conflict
+~~~
+
+with bound and presented installation IDs.
+
+Binding replacement is an explicit operator endpoint and enforces the safety preconditions defined in m3-design.md.
+
+## 30. M3 backups
+
+Online operator endpoints conceptually support:
+
+~~~text
+POST /api/v1alpha1/backups
+GET  /api/v1alpha1/backups
+POST /api/v1alpha1/backups/{id}/verify
+~~~
+
+No remote API accepts an arbitrary Server filesystem path.
+
+There is no HTTP restore endpoint.
+
+## 31. M3 status and doctor
+
+A sanitized read-only status projection supports lmt status and a later web status page.
+
+Public unauthenticated access exists only when explicitly enabled by Server config.
+
+Doctor/diagnostic responses use stable check IDs and do not mutate state.
+
+## 32. M3 error additions
+
+Representative codes:
+
+~~~text
+agent_binding_conflict
+credential_not_found
+credential_revoked
+log_expired
+log_missing
+backup_not_configured
+backup_busy
+backup_invalid
+state_lock_busy
+~~~
+
+API error codes are mapped to documented CLI exit categories.

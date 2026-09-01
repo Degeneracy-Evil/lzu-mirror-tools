@@ -415,3 +415,57 @@ It must remain until both:
 After both acknowledgements, the Agent may retire the tombstone because the authoritative Server Attempt is terminal and StartAttempt will no longer be dispatched.
 
 The tombstone must still survive Agent restart before that acknowledgement boundary.
+
+
+## 21. M3 durable Agent installation identity
+
+The Agent presents a durable installation identity that survives process restart and credential rotation.
+
+A separate boot/process identifier may be sent for diagnostics.
+
+The durable identity is state under the Agent spool/state directory, not user-authored placement configuration.
+
+## 22. M3 Node binding fence
+
+After bearer authentication, the Server verifies the presented durable Agent identity matches nodes.bound_agent_id.
+
+If the Node is unbound, the first M3 Agent may bind it atomically.
+
+If the identity differs:
+
+~~~text
+409 agent_binding_conflict
+~~~
+
+and the Server returns no StartAttempt or CancelAttempt.
+
+A credential alone cannot bypass the binding fence.
+
+## 23. Credential authentication metadata
+
+Agent authentication resolves:
+
+~~~text
+node
+credential_id
+~~~
+
+The successful poll path may update last_used_at with write throttling.
+
+Events/log uploads need not generate heartbeat-style credential writes.
+
+Revocation causes future authenticated requests to fail.
+
+## 24. Credential reload
+
+Agent SIGHUP/systemd reload re-reads only the configured credential file and safe logging-related state.
+
+It does not terminate active Attempts or reload arbitrary runner/storage policy.
+
+If credential reload fails, the Agent keeps the previous credential and reports the error.
+
+## 25. M3 local single-instance rule
+
+The Agent must own an exclusive local state/spool lock before recovery and polling.
+
+This complements, but does not replace, the Server-side durable Agent binding.
