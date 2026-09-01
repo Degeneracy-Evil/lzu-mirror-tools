@@ -190,6 +190,22 @@ pub struct CredentialIssueResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct LogExpirationView {
+    pub run_id: String,
+    pub attempt: u32,
+    pub stored_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LogMaintenancePlan {
+    pub stored_bytes: u64,
+    pub expire_bytes: u64,
+    pub candidates: Vec<LogExpirationView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Capacity {
     pub mirror_root_free_bytes: Option<u64>,
     pub active_runs: u32,

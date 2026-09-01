@@ -101,6 +101,7 @@ impl Harness {
                 node: "node-a".into(),
                 token: AGENT_TOKEN.into(),
             }],
+            run_logs: None,
         };
         let (server_task, server_state) = start_server(&server_config, server_address, clock.clone()).await;
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
@@ -494,6 +495,47 @@ impl Harness {
             .and_then(|value| value.to_str().ok())
             == Some("true");
         (response.text().await.expect("log text"), complete)
+    }
+
+    async fn follow_latest_log(&self, id: &str) -> (String, usize) {
+        let mut offset = 0_u64;
+        let mut chunks = 0;
+        let mut bytes = Vec::new();
+        for _ in 0..100 {
+            let response = self
+                .checked(
+                    self.client
+                        .get(format!(
+                            "{}/api/v1alpha1/runs/{id}/logs?offset={offset}&limit=65536&wait=2s",
+                            self.server_url()
+                        ))
+                        .bearer_auth(OPERATOR_TOKEN)
+                        .send()
+                        .await
+                        .expect("follow logs"),
+                )
+                .await;
+            let complete = response
+                .headers()
+                .get("x-lmt-log-complete")
+                .and_then(|value| value.to_str().ok())
+                == Some("true");
+            offset = response
+                .headers()
+                .get("x-lmt-log-next-offset")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(offset);
+            let chunk = response.bytes().await.expect("log chunk");
+            if !chunk.is_empty() {
+                chunks += 1;
+                bytes.extend_from_slice(&chunk);
+            }
+            if complete {
+                return (String::from_utf8(bytes).expect("UTF-8 log"), chunks);
+            }
+        }
+        panic!("log follow for {id} did not complete")
     }
 
     async fn wait_spool_retired(&self, id: &str) {
@@ -1122,4 +1164,47 @@ async fn agent_credential_rotation_and_reload_preserve_active_execution() {
         .find(|credential| credential.id == "bootstrap")
         .expect("bootstrap history");
     assert!(bootstrap.revoked_at.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_log_follow_crosses_uploads_and_defaults_to_latest_retry_attempt() {
+    let mut harness = Harness::new().await;
+    harness.drop_accepted.store(0, Ordering::SeqCst);
+    harness.lose_terminal_ack.store(0, Ordering::SeqCst);
+    harness
+        .set_command_policy(
+            "follow-live",
+            "/bin/sh",
+            &["-c".into(), "echo first; sleep 1; echo second".into()],
+            10,
+            1,
+            0,
+            true,
+        )
+        .await;
+    harness.start_agent();
+    let live = harness.run("follow-live").await;
+    harness.wait_state(&live, RunState::Running).await;
+    let (log, chunks) = harness.follow_latest_log(&live).await;
+    assert!(log.contains("first"));
+    assert!(log.contains("second"));
+    assert!(chunks >= 2, "follow did not cross incremental uploads");
+
+    harness
+        .set_command_policy(
+            "follow-retry",
+            "/bin/sh",
+            &["-c".into(), "echo attempt-{attempt}; [ {attempt} -eq 2 ]".into()],
+            10,
+            2,
+            1,
+            true,
+        )
+        .await;
+    let retry = harness.run("follow-retry").await;
+    let detail = harness.wait_state(&retry, RunState::Succeeded).await;
+    assert_eq!(detail.attempts.len(), 2);
+    let (latest, _) = harness.follow_latest_log(&retry).await;
+    assert!(latest.contains("attempt-2"));
+    assert!(!latest.contains("attempt-1"));
 }

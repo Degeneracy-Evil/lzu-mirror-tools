@@ -21,6 +21,7 @@ use std::{
 enum CommandResult {
     Response(Response),
     Value(serde_json::Value),
+    Printed,
 }
 
 #[derive(Debug)]
@@ -102,6 +103,22 @@ enum Command {
         #[command(subcommand)]
         command: RunCommand,
     },
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
+}
+#[derive(Subcommand)]
+enum MaintenanceCommand {
+    Logs {
+        #[command(subcommand)]
+        command: LogMaintenanceCommand,
+    },
+}
+#[derive(Subcommand)]
+enum LogMaintenanceCommand {
+    Plan,
+    Run,
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
@@ -189,8 +206,10 @@ enum RunCommand {
     },
     Logs {
         id: String,
-        #[arg(long, default_value_t = 1)]
-        attempt: u32,
+        #[arg(long)]
+        attempt: Option<u32>,
+        #[arg(long)]
+        follow: bool,
     },
     Cancel {
         id: String,
@@ -273,11 +292,22 @@ async fn run() -> Result<(), CliError> {
             .into(),
         },
         Command::Node { command } => execute_node(&client, &token, &base, command).await?,
-        Command::Run { command } => execute_run(&client, &token, &base, command).await?,
+        Command::Run { command } => execute_run(&client, &token, &base, command, settings.output).await?,
+        Command::Maintenance {
+            command: MaintenanceCommand::Logs { command },
+        } => match command {
+            LogMaintenanceCommand::Plan => get(&client, &token, format!("{base}/maintenance/logs/plan"))
+                .await?
+                .into(),
+            LogMaintenanceCommand::Run => post_empty(&client, &token, format!("{base}/maintenance/logs/run"))
+                .await?
+                .into(),
+        },
     };
     let bytes = match result {
         CommandResult::Response(response) => checked(response).await?.bytes().await?.to_vec(),
         CommandResult::Value(value) => serde_json::to_vec(&value)?,
+        CommandResult::Printed => return Ok(()),
     };
     let rendered = output::render(&bytes, settings.output)?;
     if !rendered.is_empty() {
@@ -290,7 +320,13 @@ impl From<Response> for CommandResult {
         Self::Response(response)
     }
 }
-async fn execute_run(c: &Client, token: &str, base: &str, command: RunCommand) -> Result<CommandResult, CliError> {
+async fn execute_run(
+    c: &Client,
+    token: &str,
+    base: &str,
+    command: RunCommand,
+    output: OutputMode,
+) -> Result<CommandResult, CliError> {
     match command {
         RunCommand::List {
             mirror,
@@ -320,13 +356,77 @@ async fn execute_run(c: &Client, token: &str, base: &str, command: RunCommand) -
             get(c, token, url.to_string()).await.map(Into::into)
         }
         RunCommand::Show { id } => get(c, token, format!("{base}/runs/{id}")).await.map(Into::into),
-        RunCommand::Logs { id, attempt } => get(c, token, format!("{base}/runs/{id}/logs?attempt={attempt}"))
-            .await
-            .map(Into::into),
+        RunCommand::Logs { id, attempt, follow } => {
+            if follow {
+                follow_logs(c, token, base, &id, attempt, output).await?;
+                Ok(CommandResult::Printed)
+            } else {
+                let suffix = attempt.map_or_else(String::new, |attempt| format!("?attempt={attempt}"));
+                get(c, token, format!("{base}/runs/{id}/logs{suffix}"))
+                    .await
+                    .map(Into::into)
+            }
+        }
         RunCommand::Cancel { id } => post_empty(c, token, format!("{base}/runs/{id}/cancel"))
             .await
             .map(Into::into),
     }
+}
+
+async fn follow_logs(
+    client: &Client,
+    token: &str,
+    base: &str,
+    id: &str,
+    attempt: Option<u32>,
+    output: OutputMode,
+) -> Result<(), CliError> {
+    let mut offset = 0_u64;
+    let mut collected = Vec::new();
+    loop {
+        let mut url = reqwest::Url::parse(&format!("{base}/runs/{id}/logs"))
+            .map_err(|error| CliError::local(error.to_string()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("offset", &offset.to_string());
+            query.append_pair("limit", "65536");
+            query.append_pair("wait", "20s");
+            if let Some(attempt) = attempt {
+                query.append_pair("attempt", &attempt.to_string());
+            }
+        }
+        let response = checked(get(client, token, url.to_string()).await?).await?;
+        let complete = response
+            .headers()
+            .get("x-lmt-log-complete")
+            .and_then(|value| value.to_str().ok())
+            == Some("true");
+        let next = response
+            .headers()
+            .get("x-lmt-log-next-offset")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(offset);
+        let bytes = response.bytes().await?;
+        match output {
+            OutputMode::Human => {
+                print!("{}", String::from_utf8_lossy(&bytes));
+                std::io::stdout().flush()?;
+            }
+            OutputMode::Json => collected.extend_from_slice(&bytes),
+        }
+        offset = next;
+        if complete {
+            break;
+        }
+    }
+    if matches!(output, OutputMode::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&String::from_utf8_lossy(&collected))?
+        );
+    }
+    Ok(())
 }
 async fn execute_node(c: &Client, token: &str, base: &str, command: NodeCommand) -> Result<CommandResult, CliError> {
     match command {

@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc, RwLock, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -47,12 +47,25 @@ pub struct ServerConfig {
     pub offline_after_seconds: u64,
     #[serde(default)]
     pub agents: Vec<AgentCredential>,
+    #[serde(default)]
+    pub run_logs: Option<RunLogsConfig>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCredential {
     pub node: String,
     pub token: String,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunLogsConfig {
+    pub retention: Option<String>,
+    pub max_total_bytes: Option<u64>,
+    #[serde(default = "log_maintenance_default")]
+    pub maintenance_interval: String,
+}
+fn log_maintenance_default() -> String {
+    "1h".into()
 }
 const fn offline_default() -> u64 {
     90
@@ -65,10 +78,18 @@ pub struct AppState {
     operator_token_file: Option<PathBuf>,
     offline_after: Duration,
     notify: Arc<Notify>,
-    log_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    log_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     metrics: Arc<AppMetrics>,
     poll_wait: Duration,
     clock: Arc<dyn Clock>,
+    run_log_policy: Option<RunLogPolicy>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunLogPolicy {
+    retention: Option<Duration>,
+    max_total_bytes: Option<u64>,
+    maintenance_interval: Duration,
 }
 
 pub trait Clock: Send + Sync {
@@ -102,6 +123,7 @@ struct AppMetrics {
     attempts_interrupted: AtomicU64,
     cancellations_immediate: AtomicU64,
     cancellations_dispatched: AtomicU64,
+    logs_expired: AtomicU64,
 }
 impl AppState {
     pub fn new(store: Store, log_dir: PathBuf, token: String, offline_after: Duration) -> Self {
@@ -116,6 +138,7 @@ impl AppState {
             metrics: Arc::new(AppMetrics::default()),
             poll_wait: Duration::from_secs(20),
             clock: Arc::new(SystemClock),
+            run_log_policy: None,
         }
     }
 
@@ -177,8 +200,28 @@ pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> a
     );
     state.clock = clock;
     state.operator_token_file.clone_from(&c.operator_token_file);
+    state.run_log_policy = c.run_logs.as_ref().map(parse_run_log_policy).transpose()?.flatten();
     tokio::spawn(run_scheduler(state.clone()));
+    if state.run_log_policy.is_some() {
+        tokio::spawn(run_log_maintenance(state.clone()));
+    }
     Ok(state)
+}
+
+fn parse_run_log_policy(config: &RunLogsConfig) -> anyhow::Result<Option<RunLogPolicy>> {
+    if config.retention.is_none() && config.max_total_bytes.is_none() {
+        return Ok(None);
+    }
+    let retention = config.retention.as_deref().map(humantime::parse_duration).transpose()?;
+    let maintenance_interval = humantime::parse_duration(&config.maintenance_interval)?;
+    if maintenance_interval.is_zero() {
+        anyhow::bail!("run_logs.maintenance_interval must be positive");
+    }
+    Ok(Some(RunLogPolicy {
+        retention,
+        max_total_bytes: config.max_total_bytes,
+        maintenance_interval,
+    }))
 }
 
 async fn load_operator_token(c: &ServerConfig) -> anyhow::Result<String> {
@@ -240,6 +283,127 @@ async fn run_scheduler(state: AppState) {
         }
     }
 }
+
+async fn run_log_maintenance(state: AppState) {
+    let interval = state.run_log_policy.expect("maintenance policy").maintenance_interval;
+    loop {
+        if let Err(error) = execute_log_maintenance(&state).await {
+            tracing::error!(%error.message, "Run-log maintenance failed");
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn plan_log_maintenance(state: &AppState) -> Result<LogMaintenancePlan, StoreError> {
+    let entries = state.store.log_retention_entries().await?;
+    let stored_bytes = entries
+        .iter()
+        .filter(|entry| entry.expired_at_ms.is_none())
+        .map(|entry| entry.stored_bytes)
+        .sum::<u64>();
+    let Some(policy) = state.run_log_policy else {
+        return Ok(LogMaintenancePlan {
+            stored_bytes,
+            expire_bytes: 0,
+            candidates: vec![],
+        });
+    };
+    let age_cutoff = policy.retention.map(|retention| {
+        state
+            .now_ms()
+            .saturating_sub(i64::try_from(retention.as_millis()).unwrap_or(i64::MAX))
+    });
+    let mut candidates = Vec::new();
+    let mut projected = stored_bytes;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.expired_at_ms.is_none() && entry.eligible)
+    {
+        if age_cutoff.is_some_and(|cutoff| entry.updated_at_ms <= cutoff) {
+            projected = projected.saturating_sub(entry.stored_bytes);
+            candidates.push(LogExpirationView {
+                run_id: entry.run_id.clone(),
+                attempt: entry.attempt_no,
+                stored_bytes: entry.stored_bytes,
+            });
+        }
+    }
+    if let Some(cap) = policy.max_total_bytes {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.expired_at_ms.is_none() && entry.eligible)
+        {
+            if projected <= cap {
+                break;
+            }
+            if candidates
+                .iter()
+                .any(|candidate| candidate.run_id == entry.run_id && candidate.attempt == entry.attempt_no)
+            {
+                continue;
+            }
+            projected = projected.saturating_sub(entry.stored_bytes);
+            candidates.push(LogExpirationView {
+                run_id: entry.run_id.clone(),
+                attempt: entry.attempt_no,
+                stored_bytes: entry.stored_bytes,
+            });
+        }
+    }
+    Ok(LogMaintenancePlan {
+        stored_bytes,
+        expire_bytes: candidates.iter().map(|candidate| candidate.stored_bytes).sum(),
+        candidates,
+    })
+}
+
+async fn execute_log_maintenance(state: &AppState) -> Result<LogMaintenancePlan, Failure> {
+    for entry in state
+        .store
+        .log_retention_entries()
+        .await?
+        .into_iter()
+        .filter(|entry| entry.expired_at_ms.is_some())
+    {
+        let lock = attempt_log_lock(state, &entry.run_id, entry.attempt_no).await;
+        let _guard = lock.lock().await;
+        remove_log_file(state, &entry.run_id, entry.attempt_no).await?;
+    }
+    let plan = plan_log_maintenance(state).await?;
+    for candidate in &plan.candidates {
+        let lock = attempt_log_lock(state, &candidate.run_id, candidate.attempt).await;
+        let _guard = lock.lock().await;
+        if state
+            .store
+            .mark_log_expired(&candidate.run_id, candidate.attempt, state.now_ms())
+            .await?
+        {
+            state.metrics.logs_expired.fetch_add(1, Ordering::Relaxed);
+        }
+        remove_log_file(state, &candidate.run_id, candidate.attempt).await?;
+    }
+    Ok(plan)
+}
+
+async fn remove_log_file(state: &AppState, run_id: &str, attempt: u32) -> Result<(), Failure> {
+    match fs::remove_file(log_path(&state.log_dir, run_id, attempt)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Failure::io(error)),
+    }
+}
+
+async fn attempt_log_lock(state: &AppState, run_id: &str, attempt: u32) -> Arc<Mutex<()>> {
+    let key = format!("{run_id}-{attempt}");
+    let mut locks = state.log_locks.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
 pub fn build_router(s: AppState) -> Router {
     Router::new()
         .route(
@@ -270,6 +434,8 @@ pub fn build_router(s: AppState) -> Router {
             "/api/v1alpha1/nodes/{name}/credentials/{id}/revoke",
             post(revoke_credential),
         )
+        .route("/api/v1alpha1/maintenance/logs/plan", get(log_maintenance_plan))
+        .route("/api/v1alpha1/maintenance/logs/run", post(log_maintenance_run))
         .route("/api/v1alpha1/agent/poll", post(poll))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/events", post(event))
         .route("/api/v1alpha1/agent/attempts/{id}/{no}/log", put(upload_log))
@@ -661,6 +827,14 @@ async fn revoke_credential(
         s.store.revoke_credential(&name, &id, s.now_ms()).await?,
     )))
 }
+async fn log_maintenance_plan(State(s): State<AppState>, h: HeaderMap) -> Result<Json<LogMaintenancePlan>, Failure> {
+    operator(&h, &s)?;
+    Ok(Json(plan_log_maintenance(&s).await?))
+}
+async fn log_maintenance_run(State(s): State<AppState>, h: HeaderMap) -> Result<Json<LogMaintenancePlan>, Failure> {
+    operator(&h, &s)?;
+    Ok(Json(execute_log_maintenance(&s).await?))
+}
 async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest>) -> Result<Response, Failure> {
     let credential = agent(&h, &s).await?;
     let node = credential.node;
@@ -801,6 +975,7 @@ async fn upload_log(
     s.metrics
         .uploaded_bytes
         .fetch_add(u64::try_from(body.len()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    s.notify.notify_waiters();
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
         "x-lmt-log-next-offset",
@@ -814,6 +989,7 @@ struct LogQuery {
     #[serde(default)]
     offset: u64,
     limit: Option<u64>,
+    wait: Option<String>,
 }
 async fn read_log(
     State(s): State<AppState>,
@@ -822,27 +998,83 @@ async fn read_log(
     Query(q): Query<LogQuery>,
 ) -> Result<Response, Failure> {
     operator(&h, &s)?;
-    let no = q.attempt.unwrap_or(1);
     let id = RunId::from_str(&id)
         .map_err(|_| Failure::not_found("run_not_found"))?
         .to_string();
+    let attempts = s.store.list_attempts(&id).await?;
+    let no = q
+        .attempt
+        .or_else(|| attempts.last().map(|attempt| attempt.attempt_no))
+        .ok_or_else(|| Failure::not_found("attempt_not_found"))?;
+    if !attempts.iter().any(|attempt| attempt.attempt_no == no) {
+        return Err(Failure::not_found("attempt_not_found"));
+    }
+    let limit = q.limit.unwrap_or(65_536);
+    if limit == 0 || limit > 1_048_576 {
+        return Err(Failure::bad("invalid_log_limit", "limit must be between 1 and 1048576"));
+    }
+    let wait = q
+        .wait
+        .as_deref()
+        .map(humantime::parse_duration)
+        .transpose()
+        .map_err(|_| Failure::bad("invalid_log_wait", "wait must be a duration"))?
+        .unwrap_or_default()
+        .min(Duration::from_secs(20));
+    if !wait.is_zero() {
+        let metadata = s.store.log_metadata(&id, no).await?;
+        if metadata.as_ref().is_none_or(|metadata| {
+            metadata.expired_at_ms.is_none() && !metadata.complete && q.offset >= metadata.stored_bytes
+        }) {
+            let _ = tokio::time::timeout(wait, s.notify.notified()).await;
+        }
+    }
+    let lock = attempt_log_lock(&s, &id, no).await;
+    let _guard = lock.lock().await;
     let mut data = vec![];
     let mut complete = false;
-    if let Some((_, stored, c)) = s.store.log_metadata(&id, no).await? {
-        complete = c;
-        if q.offset < stored {
-            let take = (stored - q.offset).min(q.limit.unwrap_or(65536).min(1_048_576));
+    let mut stored_bytes = 0;
+    if let Some(metadata) = s.store.log_metadata(&id, no).await? {
+        if metadata.expired_at_ms.is_some() {
+            return Err(Failure::gone("log_expired", "Run log expired by retention policy"));
+        }
+        if let Err(error) = fs::metadata(log_path(&s.log_dir, &id, no)).await {
+            return Err(if error.kind() == std::io::ErrorKind::NotFound {
+                Failure::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "log_missing",
+                    "Run log file is missing",
+                )
+            } else {
+                Failure::io(error)
+            });
+        }
+        complete = metadata.complete;
+        stored_bytes = metadata.stored_bytes;
+        if q.offset < metadata.stored_bytes {
+            let take = (metadata.stored_bytes - q.offset).min(limit);
             let mut f = OpenOptions::new()
                 .read(true)
                 .open(log_path(&s.log_dir, &id, no))
                 .await
-                .map_err(Failure::io)?;
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Failure::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "log_missing",
+                            "Run log file is missing",
+                        )
+                    } else {
+                        Failure::io(error)
+                    }
+                })?;
             f.seek(std::io::SeekFrom::Start(q.offset)).await.map_err(Failure::io)?;
             data.resize(take as usize, 0);
             f.read_exact(&mut data).await.map_err(Failure::io)?;
         }
     }
     let next = q.offset + data.len() as u64;
+    let complete = complete && next >= stored_bytes;
     let mut response = ([(header::CONTENT_TYPE, "application/octet-stream")], data).into_response();
     for (n, v) in [
         ("x-lmt-log-offset", q.offset.to_string()),
@@ -859,11 +1091,7 @@ async fn append_log(s: &AppState, id: &str, no: u32, offset: u64, body: &[u8], c
     let id = RunId::from_str(id)
         .map_err(|_| Failure::bad("invalid_run_id", "invalid run id"))?
         .to_string();
-    let key = format!("{id}-{no}");
-    let lock = {
-        let mut locks = s.log_locks.lock().await;
-        locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
-    };
+    let lock = attempt_log_lock(s, &id, no).await;
     let _guard = lock.lock().await;
     let path = log_path(&s.log_dir, &id, no);
     if let Some(p) = path.parent() {
@@ -1064,6 +1292,9 @@ impl Failure {
     }
     fn not_found(c: &'static str) -> Self {
         Self::new(StatusCode::NOT_FOUND, c, "not found")
+    }
+    fn gone(c: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, c, message)
     }
     fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "valid bearer token required")
@@ -1468,5 +1699,146 @@ mod tests {
         fs::write(&token_file, "new-operator\n").await.expect("replacement");
         state.reload_operator_token().await.expect("reload");
         assert_eq!(state.operator_token.read().expect("token").as_str(), "new-operator");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn log_retention_is_safe_crash_recoverable_and_lock_registry_is_bounded() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open_in_memory().await.expect("store");
+        store
+            .upsert_credential("node-a", "secret", 1)
+            .await
+            .expect("credential");
+        let bundle = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: "[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='command'\nprogram='/bin/true'\n".into(),
+            }],
+        })
+        .expect("bundle");
+        store.apply(&bundle, 0, "test", 0).await.expect("apply");
+        let clock = Arc::new(FakeClock(AtomicI64::new(0)));
+        let mut state = AppState::new(
+            store.clone(),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.clock = clock.clone();
+        let mut terminal_ids = Vec::new();
+        for (index, (updated_at, bytes)) in [
+            (10, b"1111".as_slice()),
+            (20, b"22222"),
+            (90, b"333333"),
+            (95, b"4444444"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let run = services::create_manual_run(&store, "demo", &format!("retention-{index}"), updated_at - 2)
+                .await
+                .expect("run");
+            services::next_action(&store, "node-a", "/tmp/mirrors", updated_at - 1)
+                .await
+                .expect("poll")
+                .expect("action");
+            clock.0.store(updated_at, Ordering::SeqCst);
+            append_log(&state, &run.id, 1, 0, bytes, true)
+                .await
+                .expect("complete log");
+            services::apply_attempt_event(
+                &store,
+                &run.id,
+                1,
+                &AttemptEvent {
+                    event_sequence: 1,
+                    state: lmt_core::AttemptState::Succeeded,
+                    agent_instance_id: "instance".into(),
+                    accepted_at_ms: None,
+                    started_at_ms: None,
+                    finished_at_ms: Some(updated_at),
+                    exit_code: Some(0),
+                    failure_kind: None,
+                    failure_message: None,
+                },
+                updated_at,
+            )
+            .await
+            .expect("terminal");
+            terminal_ids.push(run.id);
+        }
+        let active = services::create_manual_run(&store, "demo", "retention-active", 96)
+            .await
+            .expect("active");
+        services::next_action(&store, "node-a", "/tmp/mirrors", 97)
+            .await
+            .expect("poll")
+            .expect("action");
+        clock.0.store(98, Ordering::SeqCst);
+        append_log(&state, &active.id, 1, 0, b"active", false)
+            .await
+            .expect("active log");
+
+        clock.0.store(100, Ordering::SeqCst);
+        state.run_log_policy = Some(RunLogPolicy {
+            retention: Some(Duration::from_millis(50)),
+            max_total_bytes: None,
+            maintenance_interval: Duration::from_secs(1),
+        });
+        let age_plan = plan_log_maintenance(&state).await.expect("age plan");
+        assert_eq!(age_plan.candidates.len(), 2);
+        assert!(
+            age_plan
+                .candidates
+                .iter()
+                .all(|candidate| candidate.run_id != active.id)
+        );
+        execute_log_maintenance(&state).await.expect("age retention");
+        assert_eq!(store.list_runs().await.expect("history").len(), 5);
+        let mut operator_headers = HeaderMap::new();
+        operator_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
+        let expired = read_log(
+            State(state.clone()),
+            operator_headers,
+            AxumPath(terminal_ids[0].clone()),
+            Query(LogQuery {
+                attempt: None,
+                offset: 0,
+                limit: None,
+                wait: None,
+            }),
+        )
+        .await
+        .expect_err("expired log");
+        assert_eq!(expired.status, StatusCode::GONE);
+        assert_eq!(expired.code, "log_expired");
+
+        state.run_log_policy = Some(RunLogPolicy {
+            retention: None,
+            max_total_bytes: Some(8),
+            maintenance_interval: Duration::from_secs(1),
+        });
+        let size_plan = plan_log_maintenance(&state).await.expect("size plan");
+        assert_eq!(size_plan.candidates.len(), 1);
+        assert_eq!(size_plan.candidates[0].run_id, terminal_ids[2]);
+        execute_log_maintenance(&state).await.expect("size retention");
+
+        assert!(
+            store
+                .mark_log_expired(&terminal_ids[3], 1, 101)
+                .await
+                .expect("expire-before-unlink")
+        );
+        assert!(log_path(&state.log_dir, &terminal_ids[3], 1).exists());
+        execute_log_maintenance(&state).await.expect("restart cleanup");
+        assert!(!log_path(&state.log_dir, &terminal_ids[3], 1).exists());
+        assert!(log_path(&state.log_dir, &active.id, 1).exists());
+
+        let transient = attempt_log_lock(&state, "transient-a", 1).await;
+        drop(transient);
+        let replacement = attempt_log_lock(&state, "transient-b", 1).await;
+        assert!(state.log_locks.lock().await.len() <= 1);
+        drop(replacement);
     }
 }

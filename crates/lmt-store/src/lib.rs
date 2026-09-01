@@ -133,6 +133,25 @@ pub struct AuthenticatedCredential {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LogMetadata {
+    pub relative_path: String,
+    pub stored_bytes: u64,
+    pub complete: bool,
+    pub updated_at_ms: i64,
+    pub expired_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct LogRetentionEntry {
+    pub run_id: String,
+    pub attempt_no: u32,
+    pub stored_bytes: u64,
+    pub updated_at_ms: i64,
+    pub eligible: bool,
+    pub expired_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RunRecord {
     pub id: String,
     pub mirror_name: String,
@@ -1315,16 +1334,68 @@ impl Store {
         .await
     }
 
-    pub async fn log_metadata(&self, run_id: &str, attempt_no: u32) -> Result<Option<(String, u64, bool)>, StoreError> {
+    pub async fn log_metadata(&self, run_id: &str, attempt_no: u32) -> Result<Option<LogMetadata>, StoreError> {
         let run_id = run_id.to_owned();
         self.call(move |connection| {
             Ok(connection
                 .query_row(
-                    "SELECT relative_path,stored_bytes,complete FROM attempt_logs WHERE run_id=?1 AND attempt_no=?2",
+                    "SELECT relative_path,stored_bytes,complete,updated_at_ms,expired_at_ms
+                     FROM attempt_logs WHERE run_id=?1 AND attempt_no=?2",
                     params![run_id, attempt_no],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok(LogMetadata {
+                            relative_path: row.get(0)?,
+                            stored_bytes: row.get(1)?,
+                            complete: row.get(2)?,
+                            updated_at_ms: row.get(3)?,
+                            expired_at_ms: row.get(4)?,
+                        })
+                    },
                 )
                 .optional()?)
+        })
+        .await
+    }
+
+    pub async fn log_retention_entries(&self) -> Result<Vec<LogRetentionEntry>, StoreError> {
+        self.call(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT l.run_id,l.attempt_no,l.stored_bytes,l.updated_at_ms,
+                    CASE WHEN a.state IN('succeeded','failed','timed_out','cancelled','interrupted','rejected')
+                         THEN 1 ELSE 0 END,l.expired_at_ms
+                 FROM attempt_logs l JOIN attempts a ON a.run_id=l.run_id AND a.attempt_no=l.attempt_no
+                 WHERE l.complete=1
+                 ORDER BY l.updated_at_ms,l.run_id,l.attempt_no",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(LogRetentionEntry {
+                        run_id: row.get(0)?,
+                        attempt_no: row.get(1)?,
+                        stored_bytes: row.get(2)?,
+                        updated_at_ms: row.get(3)?,
+                        eligible: row.get(4)?,
+                        expired_at_ms: row.get(5)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from)
+        })
+        .await
+    }
+
+    pub async fn mark_log_expired(&self, run_id: &str, attempt_no: u32, now: i64) -> Result<bool, StoreError> {
+        let run_id = run_id.to_owned();
+        self.call(move |connection| {
+            Ok(connection.execute(
+                "UPDATE attempt_logs SET expired_at_ms=?3
+                 WHERE run_id=?1 AND attempt_no=?2 AND complete=1 AND expired_at_ms IS NULL
+                   AND EXISTS(
+                     SELECT 1 FROM attempts a WHERE a.run_id=?1 AND a.attempt_no=?2
+                       AND a.state IN('succeeded','failed','timed_out','cancelled','interrupted','rejected')
+                   )",
+                params![run_id, attempt_no, now],
+            )? > 0)
         })
         .await
     }

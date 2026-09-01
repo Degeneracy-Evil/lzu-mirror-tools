@@ -12,6 +12,7 @@ axum.workspace = true
 bytes.workspace = true
 clap.workspace = true
 http.workspace = true
+humantime.workspace = true
 hex.workspace = true
 lmt-core = { path = "../../crates/lmt-core" }
 lmt-protocol = { path = "../../crates/lmt-protocol" }
