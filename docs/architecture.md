@@ -283,3 +283,50 @@ The following rules should be treated as architecture invariants:
 8. Logs/metrics integrations are optional; durable business state is not.
 9. Cross-node failover is not automatic in v1.
 10. Complexity must be justified by a demonstrated operational requirement.
+
+
+## 11. M3 production-operations boundary
+
+M3 does not alter the core control/serving topology.
+
+It adds operational safety around the accepted architecture:
+
+~~~text
+operator CLI/client TOML
+        |
+        v
+single locked lmt-server
+  + credential lifecycle
+  + backup/diagnostics
+  + bounded metrics/status
+        |
+        v
+durably bound Agent installation
+  + local single-instance lock
+  + credential reload
+        |
+        v
+accepted M2 execution model
+~~~
+
+### Agent identity
+
+Node ownership in TOML remains static placement.
+
+M3 Agent installation binding is a fencing identity only; it does not become dynamic scheduling placement.
+
+### Backup
+
+Control-plane database backup is separate from mirror data and Run-log filesystem backup.
+
+### Public status
+
+Any unauthenticated status projection is explicitly opt-in and read-only.
+
+It is not an administrative web panel.
+
+### Production trial versus stable release
+
+M3 defines a serious production-trial layout.
+
+M4 still owns stable compatibility windows, packaging/release artifacts, external contributor/release documentation, and final security review.

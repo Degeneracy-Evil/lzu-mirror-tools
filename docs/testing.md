@@ -374,3 +374,60 @@ Scheduler tests must use injected/manual time. Real minute/hour sleeps are not a
 Add a lightweight schedule-row scale test to ensure earliest-deadline queries are indexed and scheduler ticks do not scan full Run history.
 
 This is a regression sanity check, not a reason to replace SQLite.
+
+
+## 23. M3 production-operations gates
+
+M3 adds tests for:
+
+- schema-v2 fixture upgrade to v3;
+- Server/Agent local process locks;
+- durable Agent installation identity;
+- Node binding conflict and explicit replacement;
+- credential issue/use/revoke/rotation;
+- token reload while a Run remains active;
+- legacy credential import without resurrection;
+- CLI client TOML/output/exit-code mapping;
+- keyset Run pagination;
+- latest-Attempt log default;
+- log long-poll/follow;
+- age/size log retention;
+- expired versus missing log semantics;
+- log-lock registry lifetime;
+- online SQLite backup while writes occur;
+- backup checksum/integrity corruption detection;
+- offline restore locking and state normalization;
+- Agent spool reset preserving Agent ID/mirror_root;
+- bounded-cost metrics;
+- sanitized public status;
+- doctor check IDs and unhealthy exit code;
+- systemd permission/hardening compatibility where practical.
+
+Every accepted M1/M2 fault test remains a gate.
+
+## 24. Historical migration fixtures
+
+Starting with M3, migration tests use a frozen accepted-v2 artifact.
+
+Do not generate the old schema by calling the current migration runner.
+
+This ensures a future edit cannot silently rewrite the definition of historical production data.
+
+## 25. Scale sanity
+
+Create enough Run history to catch accidental O(history) behavior in:
+
+- /metrics;
+- default Run list;
+- status/doctor projections.
+
+The test is a regression guard, not a benchmark contest.
+
+## 26. Secret-safety tests
+
+Tests should verify:
+
+- issued raw Agent token is absent from SQLite file/content queries;
+- secrets are absent from list/show DTOs;
+- structured logging test sinks do not contain bearer values;
+- public status contains no source/path/secret-bearing fields.

@@ -538,3 +538,79 @@ Before recording a normal Succeeded or Failed terminal result, the executor must
 A background descendant must not outlive a terminal Run and overlap a future synchronization.
 
 Timeout, cancellation, shutdown, and normal direct-child completion all have to close the Attempt process ownership boundary safely.
+
+
+## 25. M3 process locks
+
+Server and Agent binaries acquire advisory exclusive locks around their local correctness state.
+
+The lock primitive belongs in small Linux/runtime infrastructure modules, not lmt-core.
+
+Server offline backup/restore commands acquire the same Server lock as normal service startup.
+
+Agent disaster-recovery spool maintenance acquires the same Agent lock as normal Agent startup.
+
+## 26. M3 durable Agent identity
+
+Agent installation identity is persisted atomically under Agent state and loaded before polling.
+
+A per-process boot ID may remain ephemeral.
+
+The durable identity is passed through protocol DTOs and Node binding checks but is not Mirror placement configuration.
+
+## 27. M3 credential reload
+
+Bearer secret state becomes reloadable without replacing the whole Agent/Server application object.
+
+Use a small synchronized/atomic credential holder.
+
+SIGHUP/reload should:
+
+- read the configured token file;
+- validate non-empty content;
+- atomically replace only after successful read/validation;
+- preserve the previous credential on failure.
+
+Do not turn SIGHUP into arbitrary TOML hot reload.
+
+## 28. M3 backup module
+
+Use rusqlite's backup feature / SQLite Online Backup API.
+
+Online backup may use a transient dedicated SQLite source/destination connection in blocking infrastructure; it does not create a second authoritative application database.
+
+Backup file/manifest publication is fsync + atomic rename based.
+
+Restore remains a local lmt-server maintenance path, not HTTP handler logic.
+
+## 29. M3 log maintenance
+
+Retention selection is Store/domain policy; file unlinking belongs in Server log infrastructure.
+
+Intentional DB expiration is committed before unlink.
+
+Attempt log-lock ownership must coordinate append and delete without a permanently growing strong-reference registry.
+
+## 30. M3 CLI architecture
+
+The CLI should stop being one large response-printing main.rs.
+
+Keep one binary/crate but split internal modules for:
+
+- client config/auth;
+- API client;
+- human rendering;
+- JSON rendering;
+- commands;
+- log streaming;
+- exit-code mapping.
+
+Do not create a generic SDK/framework solely for M3 CLI polish.
+
+## 31. M3 metrics/status
+
+Operational DB projections belong in lmt-store semantic queries.
+
+Server metrics/status handlers format those projections.
+
+Avoid repeated full-history scans or duplicating business logic in Prometheus collectors.

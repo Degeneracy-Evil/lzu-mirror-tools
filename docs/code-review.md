@@ -222,3 +222,65 @@ The authoritative M2 reference for these checks is docs/m2-design.md.
 Because Agent event delivery is at-least-once, semantic metrics must be updated from newly applied state transitions rather than HTTP request count unless a metric is explicitly named and documented as a request counter.
 
 In particular, retransmitted terminal Attempt events after a lost acknowledgement must not double-count Attempt outcomes or newly scheduled retries.
+
+
+## 15. M3 review additions
+
+### Credentials
+
+- production Server config uses operator token file;
+- generated Agent tokens have sufficient entropy;
+- raw secrets are never persisted/logged/metric-labeled;
+- revocation is idempotent;
+- stale legacy config cannot resurrect revoked credentials;
+- reload preserves active Attempts and preserves old secret on failure.
+
+### Agent fencing
+
+- Agent installation ID is durable across restart;
+- local spool lock prevents two processes sharing state;
+- Node binding mismatch blocks all control actions;
+- binding replacement is explicit and safety-gated;
+- credentials do not implicitly bypass binding.
+
+### Logs
+
+- --follow uses bounded wait and durable offset state;
+- latest Attempt default is correct;
+- retention only touches complete terminal logs;
+- intentional expiration is distinct from missing files;
+- Run/Attempt history survives log expiration;
+- log-lock registry lifetime is bounded;
+- no application-level compression sneaks into M3.
+
+### Backup/restore
+
+- online backup uses SQLite backup API rather than raw WAL-file copy;
+- only fully verified backups are advertised;
+- manifests/checksums are atomic;
+- remote API cannot choose arbitrary Server path;
+- restore requires Server lock/offline state;
+- documented restore quiesces Agents;
+- restore normalization prevents stale dispatch;
+- Agent spool reset preserves installation ID and mirror data.
+
+### Operational scalability
+
+- /metrics does not call unbounded list_runs;
+- Run list has default/max bounds;
+- pagination is keyset-based;
+- metric label cardinality excludes Run/Attempt/credential IDs.
+
+### Public status/doctor
+
+- public status is opt-in and sanitized;
+- doctor is read-only;
+- stable check IDs are used;
+- unhealthy doctor result maps to exit code 8.
+
+### systemd
+
+- Server sandbox remains writable only where intended;
+- Agent hardening does not break representative sync processes;
+- mirror_root is not duplicated as hidden systemd configuration;
+- state/secret modes are restrictive.
