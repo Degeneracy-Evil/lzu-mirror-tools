@@ -327,8 +327,9 @@ These can be reconsidered after LZU and community deployments establish real req
 
 M1 and M2 are accepted implementation baselines.
 
-M3 production-operations design remains frozen; its implementation is complete
-and awaiting acceptance review/controlled production-trial evidence.
+M3 production-operations design remains frozen; its focused implementation
+hardening is complete and awaiting review-round-2 acceptance. A controlled
+production trial must not begin before that acceptance.
 
 For M3 work, read:
 

@@ -1,6 +1,6 @@
 # M3 Implementation Plan
 
-Status: implementation candidate landed at `73d90897733a1a2e98aa655c3dda0f562ed33d33`; M3 hardening review is in progress.
+Status: implementation candidate landed at `73d90897733a1a2e98aa655c3dda0f562ed33d33`; focused hardening is complete and awaiting review round 2.
 
 Authoritative behavior: docs/m3-design.md.
 
