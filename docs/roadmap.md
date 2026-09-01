@@ -102,7 +102,7 @@ M2 completion means a small mirror site can replace a collection of cron jobs.
 
 ## M3 - Operational hardening
 
-Status: **focused hardening complete; awaiting review round 2**. See `docs/reviews/m3-review-2026-09-01.md`.
+Status: **accepted** at implementation baseline `8d0c032c37d6bb34c1e398e6d68e31c20ef28881`. See `docs/reviews/m3-review-round2-2026-09-01.md`.
 
 Goal:
 

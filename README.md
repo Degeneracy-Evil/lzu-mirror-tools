@@ -6,7 +6,7 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1 and M2 accepted; the focused M3 hardening pass is complete and awaiting review round 2.**
+**Current phase: M1, M2, and M3 accepted; LMT is ready for a controlled LZU production trial.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
@@ -20,7 +20,7 @@ M3 is frozen in:
 1. [M3 Design](docs/m3-design.md)
 2. [M3 Implementation Plan](docs/m3-implementation-plan.md)
 
-The first M3 implementation candidate landed at `73d90897733a1a2e98aa655c3dda0f562ed33d33`. The release blockers in [the M3 code review](docs/reviews/m3-review-2026-09-01.md) have received a focused hardening pass without changing the accepted architecture. M3 still requires review-round-2 acceptance. Do not begin M4.
+M3 is accepted at implementation baseline `8d0c032c37d6bb34c1e398e6d68e31c20ef28881`. See the [M3 second review](docs/reviews/m3-review-round2-2026-09-01.md). LMT may enter a controlled LZU production trial. M4 has not yet been designed or authorized.
 
 ## What LMT does
 

@@ -30,15 +30,16 @@ M1 is an accepted baseline. For M2-specific semantics, **`docs/m2-design.md` is 
 
 Implement the current milestone only.
 
-M1 and M2 are accepted implementation baselines.
+M1, M2, and M3 are accepted implementation baselines.
 
-The current authorized development target is **M3 only**, defined by:
+**There is currently no authorized M4 implementation target.** LMT should enter a controlled production trial before M4 design is frozen.
 
-- `docs/m3-design.md`;
-- `docs/m3-implementation-plan.md`;
-- the M3 operational runbooks under `docs/operations/`.
+Until M4 is explicitly designed and documented:
 
-For M3 behavior, `docs/m3-design.md` is authoritative. Preserve all M1/M2 release-gating tests. Do not start M4/M5 work.
+- preserve all accepted M1/M2/M3 behavior and fault tests;
+- do not introduce M4/M5 features opportunistically;
+- maintenance fixes must remain compatible with the accepted M3 contracts;
+- production-trial evidence may motivate later design changes, but those changes must be documented before implementation.
 
 Do not implement deferred features such as:
 
@@ -123,9 +124,9 @@ Avoid:
 
 A feature is not complete without its failure/idempotency tests.
 
-M3 must preserve the complete accepted M1/M2 fault matrices and additionally cover the release gates in `docs/m3-design.md`, especially:
+The accepted M3 baseline must preserve the complete M1/M2 fault matrices and the release gates in `docs/m3-design.md`, especially:
 
-- schema-v2 to schema-v3 migration from a frozen historical fixture;
+- frozen historical schema migration through the current M3 schema;
 - Server/Agent single-instance locks and durable Agent binding;
 - credential issue/rotation/revocation and reload;
 - bounded Run queries and CLI output/exit semantics;
@@ -153,7 +154,7 @@ Do not allow design documents and implementation to intentionally drift.
 
 ## 9. Development workflow
 
-Follow the M3.0 through M3.9 implementation order. M3 is an operations/hardening milestone; do not redesign the accepted M2 scheduler/execution model.
+M3 is complete and accepted. Do not begin M4 implementation until M4 design documents explicitly authorize a new milestone. During the production trial, prefer small maintenance fixes and evidence collection over feature expansion.
 
 Work in small vertical slices and logical commits.
 

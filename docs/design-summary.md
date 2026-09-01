@@ -325,11 +325,9 @@ These can be reconsidered after LZU and community deployments establish real req
 
 ## 16. Current milestone status
 
-M1 and M2 are accepted implementation baselines.
+M1, M2, and M3 are accepted implementation baselines.
 
-M3 production-operations design remains frozen; its focused implementation
-hardening is complete and awaiting review-round-2 acceptance. A controlled
-production trial must not begin before that acceptance.
+M3 is accepted at `8d0c032c37d6bb34c1e398e6d68e31c20ef28881` and LMT may now enter a controlled LZU production trial.
 
 For M3 work, read:
 

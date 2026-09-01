@@ -1,6 +1,6 @@
 # M3 Implementation Plan
 
-Status: implementation candidate landed at `73d90897733a1a2e98aa655c3dda0f562ed33d33`; focused hardening is complete and awaiting review round 2.
+Status: **accepted** at implementation baseline `8d0c032c37d6bb34c1e398e6d68e31c20ef28881` after review round 2.
 
 Authoritative behavior: docs/m3-design.md.
 
