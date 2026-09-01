@@ -1,0 +1,17 @@
+[mirror]
+name = "rsync-simple"
+enabled = true
+target = "rsync-simple"
+
+[schedule]
+interval = "6h"
+
+[sync]
+type = "rsync"
+source = "rsync://archive.example.org/project/"
+args = ["--archive"]
+
+[run]
+timeout_seconds = 7200
+max_attempts = 3
+retry_delay_seconds = 300

@@ -90,3 +90,17 @@ Normal runtime configuration lives in TOML files.
 M3 does not add environment-variable overrides for ordinary LMT configuration.
 
 Internal systemd/kernel protocol environment variables are not considered user configuration.
+
+## Production-trial examples
+
+Start from `config/server.example.toml` and `config/agent.example.toml`, then
+install secrets separately with the ownership and modes above. Representative
+Mirror documents live under `config/nodes/mirror01/mirrors/`:
+
+- `rsync-simple.toml` demonstrates minimal periodic rsync;
+- `rsync-production.toml` demonstrates delete, hard-link, numeric-ID, and cron settings;
+- `command-hook.toml` is disabled by default and demonstrates an explicit site command.
+
+Review source URLs, target names, deletion semantics, time zones, timeouts, and
+the command executable before applying them. The `archive.example.org` sources
+are documentation placeholders.

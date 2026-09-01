@@ -1,0 +1,8 @@
+scrape_configs:
+  - job_name: lmt-server
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+
+# Put this file into an existing Prometheus deployment. LMT does not install,
+# start, or own Prometheus. Protect /metrics at the network/reverse-proxy layer.

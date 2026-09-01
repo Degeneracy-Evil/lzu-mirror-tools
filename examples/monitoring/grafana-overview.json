@@ -1,0 +1,70 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "panels": [
+    {
+      "title": "Pending / running Runs",
+      "type": "stat",
+      "targets": [
+        { "expr": "lmt_runs_pending", "legendFormat": "pending", "refId": "A" },
+        { "expr": "lmt_runs_running", "legendFormat": "running", "refId": "B" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Mirror last-success age",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "time() - lmt_mirror_last_success_timestamp_seconds > 0",
+          "legendFormat": "{{mirror}} ({{node}})",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 0 }
+    },
+    {
+      "title": "Node online",
+      "type": "stat",
+      "targets": [
+        { "expr": "lmt_node_online", "legendFormat": "{{node}}", "refId": "A" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 }
+    },
+    {
+      "title": "Mirror-root free bytes",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "lmt_node_mirror_root_free_bytes", "legendFormat": "{{node}}", "refId": "A" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 }
+    },
+    {
+      "title": "Run-log storage",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "lmt_run_logs_stored_bytes", "legendFormat": "central logs", "refId": "A" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 }
+    },
+    {
+      "title": "Backup age",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "time() - lmt_backup_last_success_timestamp_seconds > 0",
+          "legendFormat": "seconds",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["lmt", "production-trial"],
+  "templating": { "list": [] },
+  "time": { "from": "now-24h", "to": "now" },
+  "title": "LMT production-trial overview",
+  "uid": "lmt-overview",
+  "version": 1
+}

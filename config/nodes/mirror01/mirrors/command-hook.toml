@@ -1,0 +1,13 @@
+[mirror]
+name = "command-hook"
+enabled = false
+target = "command-hook"
+
+[sync]
+type = "command"
+program = "/usr/local/libexec/lmt/sync-command-hook"
+args = ["--mode", "trial"]
+
+[run]
+timeout_seconds = 3600
+max_attempts = 1

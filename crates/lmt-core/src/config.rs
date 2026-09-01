@@ -439,4 +439,34 @@ mod tests {
             ["--archive", "--delete", "--", "local/source/", "/srv/mirrors/example/"]
         );
     }
+
+    #[test]
+    fn production_trial_mirror_examples_form_a_valid_bundle() {
+        let files = [
+            (
+                "example.toml",
+                include_str!("../../../config/nodes/mirror01/mirrors/example.toml"),
+            ),
+            (
+                "rsync-simple.toml",
+                include_str!("../../../config/nodes/mirror01/mirrors/rsync-simple.toml"),
+            ),
+            (
+                "rsync-production.toml",
+                include_str!("../../../config/nodes/mirror01/mirrors/rsync-production.toml"),
+            ),
+            (
+                "command-hook.toml",
+                include_str!("../../../config/nodes/mirror01/mirrors/command-hook.toml"),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, contents)| BundleFile {
+            path: format!("nodes/mirror01/mirrors/{name}"),
+            contents: contents.into(),
+        })
+        .collect();
+        let canonical = canonicalize_bundle(&ConfigBundle { files }).expect("valid examples");
+        assert_eq!(canonical.mirrors.len(), 4);
+    }
 }

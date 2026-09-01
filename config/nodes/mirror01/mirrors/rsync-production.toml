@@ -1,0 +1,18 @@
+[mirror]
+name = "rsync-production"
+enabled = true
+target = "rsync-production"
+
+[schedule]
+cron = "17 */4 * * *"
+timezone = "Asia/Shanghai"
+
+[sync]
+type = "rsync"
+source = "rsync://archive.example.org/project/"
+args = ["--archive", "--delete", "--hard-links", "--numeric-ids", "--delay-updates"]
+
+[run]
+timeout_seconds = 10800
+max_attempts = 3
+retry_delay_seconds = 600

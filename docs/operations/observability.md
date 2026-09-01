@@ -72,7 +72,9 @@ Never label by Run ID, Attempt number, credential ID, or free-form error message
 
 ## Grafana
 
-M3 should include an example overview dashboard, not a dashboard engine.
+Import `examples/monitoring/grafana-overview.json` into an existing Grafana and
+select the site's Prometheus data source. This is an example overview dashboard,
+not a dashboard engine managed by LMT.
 
 The dashboard should emphasize:
 
@@ -97,6 +99,45 @@ Representative alerts:
 - no recent successful backup.
 
 Exact site thresholds belong to deployment configuration.
+
+## Scrape example
+
+`examples/monitoring/prometheus.yml` contains the smallest static scrape job.
+Merge its `scrape_configs` entry into the site's Prometheus configuration; do
+not replace an existing configuration wholesale. The example assumes the
+Server is reachable at `127.0.0.1:8080` from Prometheus. If metrics traverse a
+reverse proxy, protect that route using the site's management-network policy.
+
+## journald to Loki example
+
+LMT deliberately does not ship a collector. An existing Promtail-compatible
+collector can select only the two systemd units before forwarding to Loki:
+
+~~~yaml
+scrape_configs:
+  - job_name: lmt-journal
+    journal:
+      labels:
+        job: lmt-daemons
+    relabel_configs:
+      - source_labels: [__journal__systemd_unit]
+        regex: lmt-(server|agent)\.service
+        action: keep
+      - source_labels: [__journal__systemd_unit]
+        target_label: systemd_unit
+~~~
+
+Collector positions, Loki credentials, transport TLS, retention, and tenant
+labels remain deployment responsibilities. Do not scrape central Run-log files
+with this job: users retrieve those through `lmt run logs` and LMT retention.
+
+Useful local daemon-log commands are:
+
+~~~text
+journalctl -u lmt-server.service --since today
+journalctl -u lmt-agent.service --since today
+journalctl -u lmt-agent.service -f -o json
+~~~
 
 ## Read-only status
 
