@@ -1,10 +1,20 @@
 bind = "127.0.0.1:8080"
 database_path = "/var/lib/lmt/lmt.db"
 log_dir = "/var/lib/lmt/logs"
-operator_token = "replace-with-a-random-operator-token"
+operator_token_file = "/etc/lmt/operator.token"
 offline_after_seconds = 90
 
-[[agents]]
-node = "mirror01"
-token = "replace-with-an-independent-random-node-token"
+[logging]
+level = "info"
+format = "json"
 
+[status]
+public = false
+
+[backup]
+directory = "/var/lib/lmt/backups"
+
+[run_logs]
+retention = "30d"
+max_total_bytes = 10737418240
+maintenance_interval = "1h"

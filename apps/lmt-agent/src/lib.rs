@@ -509,6 +509,7 @@ mod tests {
                 runner: config::Runner {
                     process: config::ProcessPolicy { enabled: true },
                 },
+                logging: None,
             },
             token: Arc::new(RwLock::new("token".into())),
             instance: "instance".into(),
@@ -537,6 +538,14 @@ mod tests {
     fn nested_config_rejects_unknown_fields() {
         let source = "[node]\nname='n'\ntypo=true\n[server]\nurl='http://x'\ntoken_file='/x'\n[storage]\nmirror_root='/x'\nspool_dir='/y'\n[execution]\nmax_concurrent_runs=1\n[runner.process]\nenabled=true\n";
         assert!(toml::from_str::<Config>(source).is_err());
+        let production: Config =
+            toml::from_str(include_str!("../../../config/agent.example.toml")).expect("production Agent example");
+        assert!(production.logging.is_some());
+        let invalid = format!(
+            "{}\n[logging]\nlevel='info'\nformat='xml'\n",
+            source.replace("typo=true\n", "")
+        );
+        assert!(toml::from_str::<Config>(&invalid).is_err());
     }
 
     #[tokio::test]
@@ -560,6 +569,7 @@ mod tests {
             runner: config::Runner {
                 process: config::ProcessPolicy { enabled: true },
             },
+            logging: None,
         };
         let (_shutdown, receiver) = watch::channel(false);
         let first = Agent::new(config.clone(), receiver.clone()).await.expect("first Agent");

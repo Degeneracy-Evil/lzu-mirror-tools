@@ -9,13 +9,23 @@ Type=simple
 User=lmt
 Group=lmt
 ExecStart=/usr/bin/lmt-server --config /etc/lmt/server.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s
 StateDirectory=lmt
+StateDirectoryMode=0750
+RuntimeDirectory=lmt
+RuntimeDirectoryMode=0750
+UMask=0027
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

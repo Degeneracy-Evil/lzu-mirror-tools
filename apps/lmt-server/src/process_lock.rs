@@ -38,4 +38,24 @@ mod tests {
         drop(first);
         ProcessLock::acquire(&path).expect("released lock");
     }
+
+    #[test]
+    fn production_unit_keeps_state_writable_and_reloadable_under_hardening() {
+        let unit = include_str!("../../../packaging/systemd/lmt-server.service");
+        for directive in [
+            "StateDirectory=lmt",
+            "StateDirectoryMode=0750",
+            "RuntimeDirectory=lmt",
+            "ExecReload=/bin/kill -HUP $MAINPID",
+            "ProtectSystem=strict",
+            "PrivateDevices=true",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
+            "RestrictSUIDSGID=true",
+            "Restart=on-failure",
+        ] {
+            assert!(unit.contains(directive), "missing {directive}");
+        }
+    }
 }

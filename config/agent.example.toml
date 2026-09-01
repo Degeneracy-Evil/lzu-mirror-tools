@@ -15,3 +15,6 @@ max_concurrent_runs = 1
 [runner.process]
 enabled = true
 
+[logging]
+level = "info"
+format = "json"

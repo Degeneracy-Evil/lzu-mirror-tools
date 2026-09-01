@@ -10,6 +10,29 @@ pub struct Config {
     pub storage: Storage,
     pub execution: Execution,
     pub runner: Runner,
+    #[serde(default)]
+    pub logging: Option<Logging>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Logging {
+    #[serde(default = "logging_level_default")]
+    pub level: String,
+    #[serde(default = "logging_format_default")]
+    pub format: LoggingFormat,
+}
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingFormat {
+    Json,
+    Text,
+}
+fn logging_level_default() -> String {
+    "info".into()
+}
+const fn logging_format_default() -> LoggingFormat {
+    LoggingFormat::Json
 }
 
 #[derive(Clone, Deserialize)]

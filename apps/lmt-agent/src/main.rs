@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use lmt_agent::{Agent, config::Config, reset_spool};
+use lmt_agent::{
+    Agent,
+    config::{Config, Logging, LoggingFormat},
+    reset_spool,
+};
 use tokio::{fs, sync::watch};
 
 #[derive(Parser)]
@@ -21,9 +25,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().json().with_env_filter("info").init();
     let args = Args::parse();
     let config: Config = toml::from_str(&fs::read_to_string(args.config).await?)?;
+    initialize_logging(config.logging.as_ref())?;
     if let Some(Command::ResetSpool {
         acknowledge_control_plane_restore,
     }) = args.command
@@ -33,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let (sender, receiver) = watch::channel(false);
+    tracing::info!(component = "agent", version = env!("CARGO_PKG_VERSION"), node = %config.node.name, "starting LMT Agent");
     tokio::spawn(async move {
         shutdown_signal().await;
         let _ = sender.send(true);
@@ -49,6 +54,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     agent.run().await
+}
+
+fn initialize_logging(config: Option<&Logging>) -> anyhow::Result<()> {
+    let level = config.map_or("info", |logging| logging.level.as_str());
+    let filter = tracing_subscriber::EnvFilter::try_new(level)?;
+    match config.map_or(LoggingFormat::Json, |logging| logging.format) {
+        LoggingFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        LoggingFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

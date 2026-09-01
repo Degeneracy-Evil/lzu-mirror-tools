@@ -54,6 +54,8 @@ pub struct ServerConfig {
     pub backup: Option<BackupConfig>,
     #[serde(default)]
     pub status: Option<StatusConfig>,
+    #[serde(default)]
+    pub logging: Option<LoggingConfig>,
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +67,26 @@ pub struct BackupConfig {
 pub struct StatusConfig {
     #[serde(default)]
     pub public: bool,
+}
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingConfig {
+    #[serde(default = "logging_level_default")]
+    pub level: String,
+    #[serde(default = "logging_format_default")]
+    pub format: LoggingFormat,
+}
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingFormat {
+    Json,
+    Text,
+}
+fn logging_level_default() -> String {
+    "info".into()
+}
+const fn logging_format_default() -> LoggingFormat {
+    LoggingFormat::Json
 }
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1779,6 +1801,16 @@ mod tests {
     use std::sync::atomic::AtomicI64;
 
     struct FakeClock(AtomicI64);
+
+    #[test]
+    fn production_server_example_has_explicit_valid_logging_and_secret_files() {
+        let source = include_str!("../../../config/server.example.toml");
+        let config: ServerConfig = toml::from_str(source).expect("production Server example");
+        assert!(config.logging.is_some());
+        assert!(config.operator_token.is_none());
+        assert!(config.operator_token_file.is_some());
+        assert!(toml::from_str::<ServerConfig>(&source.replace("format = \"json\"", "format = \"xml\"")).is_err());
+    }
 
     impl Clock for FakeClock {
         fn now_ms(&self) -> i64 {

@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use lmt_server::{ServerConfig, acquire_server_lock, backup, build_router, initialize};
+use lmt_server::{LoggingConfig, LoggingFormat, ServerConfig, acquire_server_lock, backup, build_router, initialize};
 use std::{
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -29,16 +29,21 @@ enum Command {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().json().with_env_filter("info").init();
     let a = Args::parse();
     let source = fs::read_to_string(&a.config)
         .await
         .with_context(|| format!("read {}", a.config.display()))?;
     let config: ServerConfig = toml::from_str(&source)?;
+    initialize_logging(config.logging.as_ref())?;
     if let Some(command) = a.command {
         return maintenance(&config, command).await;
     }
     let _process_lock = acquire_server_lock(&config)?;
+    tracing::info!(
+        component = "server",
+        version = env!("CARGO_PKG_VERSION"),
+        "starting LMT Server"
+    );
     let state = initialize(&config).await?;
     let reload_state = state.clone();
     tokio::spawn(async move {
@@ -54,6 +59,23 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, build_router(state))
         .with_graceful_shutdown(shutdown())
         .await?;
+    Ok(())
+}
+
+fn initialize_logging(config: Option<&LoggingConfig>) -> anyhow::Result<()> {
+    let level = config.map_or("info", |logging| logging.level.as_str());
+    let filter = tracing_subscriber::EnvFilter::try_new(level)?;
+    match config.map_or(LoggingFormat::Json, |logging| logging.format) {
+        LoggingFormat::Json => tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+        LoggingFormat::Text => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .try_init()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+    }
     Ok(())
 }
 

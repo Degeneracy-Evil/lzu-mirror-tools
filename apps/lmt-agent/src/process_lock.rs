@@ -24,3 +24,27 @@ impl ProcessLock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn production_unit_preserves_process_runner_compatibility_and_reload() {
+        let unit = include_str!("../../../packaging/systemd/lmt-agent.service");
+        for directive in [
+            "StateDirectory=lmt-agent",
+            "StateDirectoryMode=0700",
+            "ExecReload=/bin/kill -HUP $MAINPID",
+            "KillMode=control-group",
+            "ProtectSystem=full",
+            "Restart=on-failure",
+        ] {
+            assert!(unit.contains(directive), "missing {directive}");
+        }
+        for incompatible in ["SystemCallFilter=", "CapabilityBoundingSet=", "PrivateDevices=true"] {
+            assert!(
+                !unit.contains(incompatible),
+                "Agent runner was over-restricted by {incompatible}"
+            );
+        }
+    }
+}
