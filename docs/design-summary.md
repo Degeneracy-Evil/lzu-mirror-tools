@@ -327,7 +327,8 @@ These can be reconsidered after LZU and community deployments establish real req
 
 M1 and M2 are accepted implementation baselines.
 
-M3 production-operations design is frozen and is the current implementation target.
+M3 production-operations design remains frozen; its implementation is complete
+and awaiting acceptance review/controlled production-trial evidence.
 
 For M3 work, read:
 
