@@ -614,3 +614,28 @@ Operational DB projections belong in lmt-store semantic queries.
 Server metrics/status handlers format those projections.
 
 Avoid repeated full-history scans or duplicating business logic in Prometheus collectors.
+
+
+## 32. M3 crash-safe file publication
+
+Small durable local files such as Agent installation identity and CLI-created bearer-token files must tolerate a process crash between temporary-file fsync and final rename.
+
+A fixed create_new temporary name without stale-temp recovery is not sufficient.
+
+The publication helper should use unique temporary names or explicit stale-artifact recovery under the appropriate local lock.
+
+Credential issue additionally needs compensation: if the Server has issued a credential but local secret publication fails, the CLI should revoke that credential best-effort and clearly surface its credential ID when cleanup cannot be confirmed.
+
+## 33. M3 expired-log upload behavior
+
+append-log handling must consult log expiration metadata before creating or writing a file.
+
+An intentionally expired log is terminal from the central storage-policy perspective. Late Agent retransmission can advance/ack recovery state but cannot rehydrate the expired file.
+
+## 34. M3 bounded log streaming
+
+CLI log commands use a shared offset/chunk loop.
+
+Normal display consumes until complete EOF; follow mode additionally long-polls at incomplete EOF.
+
+Presentation layers must not accumulate an unbounded Run log into one in-memory object.

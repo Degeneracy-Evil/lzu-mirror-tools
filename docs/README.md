@@ -43,3 +43,5 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 - [Run Log Retention](operations/log-retention.md)
 - [Observability](operations/observability.md)
 - [Incident Diagnosis](operations/incident-diagnosis.md)
+
+- [M3 Code Review — 2026-09-01](reviews/m3-review-2026-09-01.md) — blocking review of implementation candidate `73d90897733a1a2e98aa655c3dda0f562ed33d33`; focused hardening required before production-trial acceptance.

@@ -1,6 +1,6 @@
 # M3 Implementation Plan
 
-Status: design-ready; implementation not started.
+Status: implementation candidate landed at `73d90897733a1a2e98aa655c3dda0f562ed33d33`; M3 hardening review is in progress.
 
 Authoritative behavior: docs/m3-design.md.
 

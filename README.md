@@ -6,7 +6,7 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1 and M2 accepted; the M3 production-operations implementation is complete and ready for acceptance review and a controlled production trial.**
+**Current phase: M1 and M2 accepted; the M3 implementation candidate is under hardening review.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
@@ -20,10 +20,7 @@ M3 is frozen in:
 1. [M3 Design](docs/m3-design.md)
 2. [M3 Implementation Plan](docs/m3-implementation-plan.md)
 
-The M3 implementation adds credential rotation and Agent fencing, bounded
-operations and diagnostics, live/retained Run logs, online SQLite backup and
-offline restore recovery, and production-trial service/observability examples.
-It does not add M4/M5 scope.
+The first M3 implementation candidate landed at `73d90897733a1a2e98aa655c3dda0f562ed33d33`. It preserves the intended M3 architecture, but M3 is not accepted until the release blockers in [the M3 code review](docs/reviews/m3-review-2026-09-01.md) are resolved. Do not begin M4.
 
 ## What LMT does
 

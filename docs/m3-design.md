@@ -1244,3 +1244,50 @@ without hand-editing SQLite, relying on hidden environment variables, or bypassi
 M3 completion means LMT is ready for a serious LZU production trial.
 
 It does **not** yet mean stable v1/community release.
+
+
+## 40. Hardening clarifications from implementation review
+
+The first M3 implementation review exposed several lifecycle details that are now part of the M3 contract.
+
+### Crash-safe local identity/secret publication
+
+Durable Agent installation-ID creation must recover from a crash that leaves a temporary publication file but no final file.
+
+CLI credential token-file publication must likewise use a crash-safe temporary-file strategy.
+
+Credential issuance is a distributed two-step operation: Server credential creation followed by local raw-secret persistence. If local persistence fails after issuance, the CLI must best-effort revoke the newly issued credential and surface the credential ID if cleanup cannot be confirmed.
+
+### Complete and bounded Run-log streaming
+
+The Run-log API is chunked by design.
+
+Both normal log display and follow mode must iterate logical offsets rather than assuming one response contains the full log.
+
+No CLI output mode may require buffering an arbitrarily large Run log in memory merely for presentation.
+
+### Retention finality
+
+Once attempt_logs.expired_at_ms is set, a late Agent log retransmission must not recreate the expired central file.
+
+The Server must still respond idempotently enough for an old Agent spool to reach its acknowledgement/retirement boundary.
+
+### Bounded stored-log metrics
+
+Prometheus current-log-byte reporting must not perform a full historical attempt_logs aggregate on every scrape when log metadata can grow indefinitely.
+
+M3 requires bounded/O(1)-style current aggregate state or an equivalent bounded-cost design.
+
+### Restore rollback safety
+
+Offline restore treats the previous SQLite main database plus any relevant WAL/SHM state as one recovery unit.
+
+The implementation must not delete committed old WAL state before the previous control plane has been safely archived/checkpointed.
+
+If installation of the restored database fails, the previous coherent database state must remain recoverable.
+
+### Persistent backup recency
+
+Backup-recency metrics are operational facts derived from published backup manifests, not process-lifetime counters.
+
+Server restart must not reset the last-success metric to zero when valid backups remain on disk.

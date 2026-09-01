@@ -284,3 +284,29 @@ In particular, retransmitted terminal Attempt events after a lost acknowledgemen
 - Agent hardening does not break representative sync processes;
 - mirror_root is not duplicated as hidden systemd configuration;
 - state/secret modes are restrictive.
+
+
+## 16. M3 crash/recovery review additions
+
+For production-operation changes, explicitly test the failure window between:
+
+~~~text
+write temporary file
+fsync temporary file
+rename final file
+fsync parent
+~~~
+
+A restart must recover from stale temporary artifacts for durable Agent identity and secret-file publication.
+
+Credential issue is not complete until both central issuance and local one-time-secret persistence are accounted for; failed local publication must not silently leave an active orphan credential.
+
+Completed Run-log display must consume every chunk, not only the first API response, and no output mode should buffer unbounded logs.
+
+Expired Run logs are final: later at-least-once retransmission must not recreate central files.
+
+Metrics advertised as bounded-cost must be reviewed at SQL-query level; replacing an application full-history list with an unindexed/full-history SQL aggregate is not sufficient.
+
+Offline restore rollback must preserve the previous SQLite main/WAL state coherently.
+
+Process-memory backup-recency counters are insufficient when published backup manifests are the durable source of truth.
