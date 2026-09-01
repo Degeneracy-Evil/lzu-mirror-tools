@@ -254,6 +254,7 @@ pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> a
     state.run_log_policy = c.run_logs.as_ref().map(parse_run_log_policy).transpose()?.flatten();
     state.database_path.clone_from(&c.database_path);
     state.backup_dir = c.backup.as_ref().map(|value| value.directory.clone());
+    load_backup_recency(&state).await;
     state.public_status = c.status.as_ref().is_some_and(|status| status.public);
     state.deprecated_inline_credentials = !c.agents.is_empty() || c.operator_token.is_some();
     tokio::spawn(run_scheduler(state.clone()));
@@ -261,6 +262,34 @@ pub async fn initialize_with_clock(c: &ServerConfig, clock: Arc<dyn Clock>) -> a
         tokio::spawn(run_log_maintenance(state.clone()));
     }
     Ok(state)
+}
+
+async fn load_backup_recency(state: &AppState) {
+    let Some(directory) = state.backup_dir.clone() else {
+        return;
+    };
+    match tokio::task::spawn_blocking(move || backup::list(&directory)).await {
+        Ok(Ok(backups)) => {
+            if let Some(seconds) = backups.first().and_then(backup_manifest_timestamp_seconds) {
+                state
+                    .metrics
+                    .backup_last_success_seconds
+                    .store(seconds, Ordering::Relaxed);
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(component = "server", error_code = "backup_invalid", %error, "failed to load backup recency")
+        }
+        Err(error) => {
+            tracing::warn!(component = "server", error_code = "backup_invalid", %error, "backup recency task failed")
+        }
+    }
+}
+
+fn backup_manifest_timestamp_seconds(manifest: &BackupManifest) -> Option<u64> {
+    OffsetDateTime::parse(&manifest.created_at, &Rfc3339)
+        .ok()
+        .and_then(|timestamp| u64::try_from(timestamp.unix_timestamp()).ok())
 }
 
 fn parse_run_log_policy(config: &RunLogsConfig) -> anyhow::Result<Option<RunLogPolicy>> {
@@ -997,9 +1026,9 @@ async fn create_backup(State(s): State<AppState>, h: HeaderMap) -> Result<Json<B
             ));
         }
     };
-    s.metrics
-        .backup_last_success_seconds
-        .store(u64::try_from(s.now_ms() / 1000).unwrap_or(0), Ordering::Relaxed);
+    if let Some(seconds) = backup_manifest_timestamp_seconds(&manifest) {
+        s.metrics.backup_last_success_seconds.store(seconds, Ordering::Relaxed);
+    }
     Ok(Json(manifest))
 }
 
@@ -1523,6 +1552,11 @@ async fn append_log(s: &AppState, id: &str, no: u32, offset: u64, body: &[u8], c
         .to_string();
     let lock = attempt_log_lock(s, &id, no).await;
     let _guard = lock.lock().await;
+    if let Some(metadata) = s.store.log_metadata(&id, no).await?
+        && metadata.expired_at_ms.is_some()
+    {
+        return Ok(metadata.stored_bytes);
+    }
     let path = log_path(&s.log_dir, &id, no);
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).await.map_err(Failure::io)?;
@@ -2243,7 +2277,29 @@ mod tests {
                 .all(|candidate| candidate.run_id != active.id)
         );
         execute_log_maintenance(&state).await.expect("age retention");
+        assert_eq!(
+            store.operational_counts().await.expect("age counter").stored_log_bytes,
+            19
+        );
         assert_eq!(store.list_runs().await.expect("history").len(), 5);
+        let expired_path = log_path(&state.log_dir, &terminal_ids[0], 1);
+        assert!(!expired_path.exists());
+        assert_eq!(
+            append_log(&state, &terminal_ids[0], 1, 0, b"1111", true)
+                .await
+                .expect("late retransmission is acknowledged"),
+            4
+        );
+        assert!(!expired_path.exists(), "late retransmission recreated an expired log");
+        assert!(
+            store
+                .log_metadata(&terminal_ids[0], 1)
+                .await
+                .expect("metadata")
+                .expect("expired metadata")
+                .expired_at_ms
+                .is_some()
+        );
         let mut operator_headers = HeaderMap::new();
         operator_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
         let expired = read_log(
@@ -2271,6 +2327,10 @@ mod tests {
         assert_eq!(size_plan.candidates.len(), 1);
         assert_eq!(size_plan.candidates[0].run_id, terminal_ids[2]);
         execute_log_maintenance(&state).await.expect("size retention");
+        assert_eq!(
+            store.operational_counts().await.expect("size counter").stored_log_bytes,
+            13
+        );
 
         assert!(
             store
@@ -2321,13 +2381,26 @@ mod tests {
             )
             .expect("seed entities");
         {
-            let mut insert = transaction
+            let mut insert_run = transaction
                 .prepare("INSERT INTO runs(id,mirror_name,mirror_generation,owner_node,trigger,state,created_at_ms,finished_at_ms,max_attempts,retry_delay_ms) VALUES(?1,'demo',1,'node-a','manual','succeeded',?2,?2,1,0)")
                 .expect("prepare runs");
+            let mut insert_attempt = transaction
+                .prepare("INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,finished_at_ms,dispatch_count) VALUES(?1,1,'succeeded','hash','{}',?2,?2,1)")
+                .expect("prepare Attempts");
+            let mut insert_log = transaction
+                .prepare("INSERT INTO attempt_logs(run_id,attempt_no,relative_path,stored_bytes,complete,updated_at_ms) VALUES(?1,1,?1 || '/1.log',1,1,?2)")
+                .expect("prepare log metadata");
             for index in 0..10_000_i64 {
-                insert
-                    .execute(rusqlite::params![format!("run-{index:05}"), index + 1])
+                let id = format!("run-{index:05}");
+                insert_run
+                    .execute(rusqlite::params![id, index + 1])
                     .expect("historical Run");
+                insert_attempt
+                    .execute(rusqlite::params![id, index + 1])
+                    .expect("historical Attempt");
+                insert_log
+                    .execute(rusqlite::params![id, index + 1])
+                    .expect("historical log metadata");
             }
         }
         transaction.commit().expect("commit history");
@@ -2348,6 +2421,7 @@ mod tests {
         let metrics_text = std::str::from_utf8(&metrics_body).expect("utf8");
         assert!(metrics_text.contains("lmt_runs_pending 0"));
         assert!(metrics_text.contains("lmt_mirrors_due 1"));
+        assert!(metrics_text.contains("lmt_run_logs_stored_bytes 10000"));
 
         let projection = status(State(state), HeaderMap::new()).await.expect("public status").0;
         let json = serde_json::to_string(&projection).expect("status JSON");
@@ -2390,6 +2464,29 @@ mod tests {
         let failure = create_backup(State(state), headers).await.expect_err("backup busy");
         assert_eq!(failure.status, StatusCode::CONFLICT);
         assert_eq!(failure.code, "backup_busy");
+    }
+
+    #[tokio::test]
+    async fn backup_recency_is_reloaded_from_published_manifest_after_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let database = directory.path().join("lmt.db");
+        drop(Store::open(&database).await.expect("schema"));
+        let backup_dir = directory.path().join("backups");
+        let manifest = backup::create(&database, &backup_dir).expect("published backup");
+        let expected = backup_manifest_timestamp_seconds(&manifest).expect("manifest timestamp");
+        let mut restarted = AppState::new(
+            Store::open(&database).await.expect("reopened store"),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        restarted.backup_dir = Some(backup_dir);
+        assert_eq!(restarted.metrics.backup_last_success_seconds.load(Ordering::Relaxed), 0);
+        load_backup_recency(&restarted).await;
+        assert_eq!(
+            restarted.metrics.backup_last_success_seconds.load(Ordering::Relaxed),
+            expected
+        );
     }
 
     async fn state_for_doctor(database: &Path, logs: PathBuf) -> AppState {

@@ -1278,6 +1278,10 @@ Prometheus current-log-byte reporting must not perform a full historical attempt
 
 M3 requires bounded/O(1)-style current aggregate state or an equivalent bounded-cost design.
 
+The hardening implementation uses ordered corrective migration
+`0004_m3_hardening.sql` to initialize and transactionally maintain one current
+stored-log-byte counter. Migration `0003_m3.sql` remains immutable.
+
 ### Restore rollback safety
 
 Offline restore treats the previous SQLite main database plus any relevant WAL/SHM state as one recovery unit.

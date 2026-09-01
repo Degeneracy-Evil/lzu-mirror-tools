@@ -496,6 +496,11 @@ See m2-design.md for exact eligibility and priority rules.
 
 M3 adds migration 0003_m3.sql.
 
+The focused M3 acceptance hardening adds `0004_m3_hardening.sql`. It contains
+only the transactionally maintained singleton `operational_counters` row and
+its `attempt_logs` triggers, making current stored-log byte metrics O(1) per
+scrape. This is an M3 corrective migration, not an M4 schema expansion.
+
 Before implementation, freeze an accepted schema-v2 fixture and use that artifact for upgrade tests.
 
 Conceptual additions:

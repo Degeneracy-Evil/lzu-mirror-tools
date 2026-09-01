@@ -1268,7 +1268,7 @@ impl Store {
                        (SELECT COUNT(*) FROM runs WHERE state='pending'),
                        (SELECT COUNT(*) FROM runs WHERE state='running'),
                        (SELECT COUNT(*) FROM mirror_schedule_state WHERE catch_up_pending=1),
-                       (SELECT COALESCE(SUM(stored_bytes),0) FROM attempt_logs WHERE expired_at_ms IS NULL)",
+                       (SELECT stored_log_bytes FROM operational_counters WHERE singleton=1)",
                     [],
                     |row| {
                         Ok(OperationalCounts {
@@ -1982,6 +1982,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_m1.sql")),
     (2, include_str!("../migrations/0002_m2.sql")),
     (3, include_str!("../migrations/0003_m3.sql")),
+    (4, include_str!("../migrations/0004_m3_hardening.sql")),
 ];
 
 fn configure_and_migrate(connection: &mut Connection, migration_time_ms: i64) -> Result<(), StoreError> {
@@ -2254,11 +2255,11 @@ mod tests {
             })
             .await
             .expect("query upgraded state");
-        assert_eq!((version, node_count, capacity), (3, 1, 1));
+        assert_eq!((version, node_count, capacity), (4, 1, 1));
     }
 
     #[tokio::test]
-    async fn frozen_populated_v2_fixture_upgrades_to_v3_without_reconstruction() {
+    async fn frozen_populated_v2_fixture_upgrades_through_m3_hardening_without_reconstruction() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("accepted-v2.db");
         Connection::open(&path)
@@ -2291,7 +2292,7 @@ mod tests {
             })
             .await
             .expect("query v3 columns");
-        assert_eq!(migrated, (3, None, None, None, None));
+        assert_eq!(migrated, (4, None, None, None, None));
         assert_eq!(store.list_mirrors().await.expect("mirrors").len(), 1);
         assert_eq!(store.list_runs().await.expect("runs").len(), 1);
         assert_eq!(
@@ -2319,7 +2320,7 @@ mod tests {
             Store::open(path).await,
             Err(StoreError::FutureSchema {
                 found: 99,
-                supported: 3
+                supported: 4
             })
         ));
     }
