@@ -437,6 +437,7 @@ impl Store {
                 current: plan.base_revision,
             });
         }
+        enforce_quiescent_high_impact_changes(&transaction, &plan.changes)?;
         let summary = serde_json::to_string(
             &plan
                 .changes
@@ -1678,6 +1679,29 @@ fn publication_change(current_toml: &str, next: &MirrorDocument) -> Result<Optio
     })
 }
 
+fn enforce_quiescent_high_impact_changes(
+    transaction: &Transaction<'_>,
+    changes: &[ConfigChange],
+) -> Result<(), StoreError> {
+    for change in changes {
+        if change.kind != ChangeKind::Move && change.publication_change.is_none() {
+            continue;
+        }
+        let active_run = transaction
+            .query_row(
+                "SELECT id FROM runs WHERE mirror_name=?1 AND state IN('pending','running')
+                 ORDER BY created_at_ms,id LIMIT 1",
+                [&change.mirror],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(run_id) = active_run {
+            return Err(StoreError::MirrorBusy { run_id });
+        }
+    }
+    Ok(())
+}
+
 fn cancel_undispatched_pending(transaction: &Transaction<'_>, mirror: &str, now: i64) -> Result<(), StoreError> {
     transaction.execute(
         "UPDATE attempts SET state='cancelled',finished_at_ms=?2
@@ -2473,6 +2497,151 @@ mod tests {
             direct_plan.changes[0].publication_change,
             Some(PublicationChange::AtomicToDirect)
         );
+        let post_move_run = store
+            .create_manual_run("demo", "post-move", 3, policy)
+            .await
+            .expect("post-Move Run");
+        assert_eq!(post_move_run.owner_node, "node-b");
+        assert_eq!(post_move_run.mirror_generation, 2);
+    }
+
+    #[tokio::test]
+    async fn active_run_blocks_move_and_publication_mode_change_in_apply_transaction() {
+        let store = Store::open_in_memory().await.expect("open");
+        let direct = publication_bundle("node-a", PublicationMode::Direct);
+        store.apply(&direct, 0, "direct", 1).await.expect("apply Direct");
+        let run = store
+            .create_manual_run("demo", "active", 2, policy)
+            .await
+            .expect("active Run");
+        let atomic_move = publication_bundle("node-b", PublicationMode::Atomic);
+        let plan = store.plan(&atomic_move).await.expect("plan");
+
+        assert!(matches!(
+            store.apply(&atomic_move, plan.base_revision, "blocked", 3).await,
+            Err(StoreError::MirrorBusy { run_id }) if run_id == run.id
+        ));
+        let mirror = store
+            .get_mirror("demo")
+            .await
+            .expect("Mirror")
+            .expect("existing Mirror");
+        assert_eq!(mirror.owner_node, "node-a");
+        assert_eq!(mirror.current_generation, 1);
+        assert_eq!(store.current_revision().await.expect("revision"), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_run_races_transactionally_with_move_and_mode_change() {
+        for move_owner in [false, true] {
+            let store = Store::open_in_memory().await.expect("open");
+            let direct = publication_bundle("node-a", PublicationMode::Direct);
+            store.apply(&direct, 0, "direct", 1).await.expect("apply Direct");
+            let next_owner = if move_owner { "node-b" } else { "node-a" };
+            let atomic = publication_bundle(next_owner, PublicationMode::Atomic);
+            let run_store = store.clone();
+            let apply_store = store.clone();
+            let atomic_for_apply = atomic.clone();
+            let (run_result, apply_result) = tokio::join!(
+                run_store.create_manual_run("demo", "racing-run", 2, policy),
+                apply_store.apply(&atomic_for_apply, 1, "racing-apply", 2),
+            );
+            let run = run_result.expect("one Run is created");
+            match apply_result {
+                Ok(_) => {
+                    assert_eq!(run.owner_node, next_owner);
+                    assert_eq!(run.mirror_generation, 2);
+                }
+                Err(StoreError::MirrorBusy { run_id }) => {
+                    assert_eq!(run_id, run.id);
+                    assert_eq!(run.owner_node, "node-a");
+                    assert_eq!(run.mirror_generation, 1);
+                }
+                Err(error) => panic!("unexpected apply result: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_materialization_races_transactionally_with_move() {
+        let store = Store::open_in_memory().await.expect("open");
+        store
+            .import_legacy_credential("node-a", "secret", 0)
+            .await
+            .expect("Node");
+        let scheduled = scheduled_bundle("/bin/true", "1h", 1);
+        store
+            .apply(&scheduled, 0, "scheduled", 0)
+            .await
+            .expect("apply schedule");
+        store
+            .call(|connection| {
+                connection.execute(
+                    "UPDATE mirror_schedule_state SET next_due_at_ms=1,catch_up_pending=1,catch_up_since_ms=1
+                     WHERE mirror_name='demo'",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("mark due");
+        let moved = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-b/mirrors/demo.toml".into(),
+                contents: scheduled
+                    .mirrors
+                    .values()
+                    .next()
+                    .expect("Mirror")
+                    .canonical_toml
+                    .clone(),
+            }],
+        })
+        .expect("moved bundle");
+        let poll_store = store.clone();
+        let apply_store = store.clone();
+        let moved_for_apply = moved.clone();
+        let (poll_result, apply_result) = tokio::join!(
+            poll_store.poll_action("node-a", 1, |_| {
+                Ok(Some((
+                    ProcessRunSpec {
+                        runner: "process".into(),
+                        program: "/bin/true".into(),
+                        args: vec![],
+                        cwd: None,
+                        timeout_seconds: 30,
+                        mirror_root: "/tmp/mirrors".into(),
+                        target_dir: "/tmp/mirrors/demo".into(),
+                        publication: None,
+                    },
+                    "sha256:scheduled-race".into(),
+                    RunPolicySnapshot {
+                        max_attempts: 1,
+                        retry_delay_ms: 0,
+                    },
+                )))
+            }),
+            apply_store.apply(&moved_for_apply, 1, "move", 1),
+        );
+        let action = poll_result.expect("poll");
+        match apply_result {
+            Ok(_) => {
+                assert!(action.is_none());
+                assert!(
+                    store
+                        .list_runs()
+                        .await
+                        .expect("Runs")
+                        .iter()
+                        .all(|run| run.owner_node != "node-a")
+                );
+            }
+            Err(StoreError::MirrorBusy { run_id }) => {
+                let action = action.expect("Run won the race");
+                assert_eq!(start_fields(&action).0, run_id);
+            }
+            Err(error) => panic!("unexpected apply result: {error}"),
+        }
     }
 
     #[tokio::test]
