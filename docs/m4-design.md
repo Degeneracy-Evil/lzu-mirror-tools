@@ -154,9 +154,11 @@ rsync -> serving tree
 
 Atomic publication should be explicit configuration, not a silent behavior change for every existing Mirror.
 
-## 4. Publication mechanism design gate
+## 4. Publication architecture
 
-Do not implement until the mechanism is frozen.
+Status: **frozen** in `docs/m4-publication-design.md`.
+
+Do not implement until the full M4 implementation plan is reviewed and accepted.
 
 The selected M4 generic mechanism is:
 
@@ -266,4 +268,4 @@ Only after items 1-7 are reviewed should M4 implementation begin.
 
 ## 9. Detailed publication design
 
-The current detailed proposal is `docs/m4-publication-design.md`. Review and freeze that document before implementation planning.
+The accepted publication architecture is `docs/m4-publication-design.md`. The next step is M4 implementation planning, including the rsync compatibility table, GC/admission numeric policy, installer/upgrade plan, and runtime-maintenance work.

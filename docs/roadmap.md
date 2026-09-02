@@ -127,7 +127,7 @@ M3 is accepted for a controlled LZU production trial. The active trial plan and 
 
 ## M4 - Production architecture and release hardening
 
-Status: **design in progress** after the controlled LZU production trial.
+Status: **design in progress** after the controlled LZU production trial. The publication architecture is frozen; implementation planning is next.
 
 Authoritative draft: `docs/m4-design.md`.
 

@@ -1,12 +1,13 @@
 # M4 Publication Architecture Design
 
-Status: **proposed revision 3 after second architecture review**.
+Status: **frozen for M4 implementation planning**.
 
-This document is a freeze candidate, but it does not authorize implementation.
+Publication architecture is accepted after three adversarial review rounds.
+Implementation is not authorized until the M4 implementation plan is reviewed.
 
-Revision 3 closes the remaining post-visibility recovery, write-ahead ordering,
-spool-protection, GC/admission, previous-generation reconstruction, transactional
-Move, and frozen-M3 compatibility-test boundaries raised by the second review.
+The frozen design includes the final pre-namespace write-ahead phase,
+full-writer fencing, and publication-lock serialization requested in the final
+review.
 
 ## 1. Problem proven by the production trial
 
@@ -104,25 +105,41 @@ Atomic publication must obey this ordering:
 
 ~~~text
 1. synchronization process completes successfully
-2. candidate identity + prior published identity + commit intent are written
-   durably to Agent spool as ready_to_commit
-3. cancellation/preconditions are rechecked under the local Attempt commit lock
-4. visibility commit executes
-5. required parent-directory fsync operations complete
-6. Agent spool is written durably as committed/terminal-pending-report
-7. AttemptSucceeded is emitted to Server
+2. candidate identity + current exchange/previous identity + published identity
+   are written durably to Agent spool as preparing_exchange
+3. only after preparing_exchange is durable may the first exchange/gc namespace
+   mutation occur
+4. rotate the old stable exchange/previous path to a protected GC path when needed
+5. stage the fresh candidate into the fixed exchange slot
+6. persist the resulting exchange/candidate/rotated-path identities durably as
+   ready_to_commit
+7. cancellation/preconditions are rechecked under the same per-Mirror
+   publication lock
+8. visibility commit executes
+9. required parent-directory fsync operations complete
+10. Agent spool is written durably as committed/terminal-pending-report
+11. AttemptSucceeded is emitted to Server
 ~~~
 
-The critical invariant is:
+There are two write-ahead invariants:
+
+> `preparing_exchange` must be durable before the first mutation of the private
+> exchange/gc namespace.
+
+and:
 
 > `ready_to_commit` must be durable before the visibility commit is allowed.
 
 Durable spool write means the record itself and the spool namespace update are
 persisted using the Agent's crash-safe file-publication procedure.
 
-If the daemon crashes after step 4 but before a later spool update, the durable
-`ready_to_commit` record plus stored path identities is sufficient to discover
-that visibility commit already happened.
+`preparing_exchange` records the exact paths and identities needed to reconstruct
+or restore the stable private layout if the daemon crashes while rotating the
+old previous generation or staging the new candidate.
+
+If the daemon crashes after visibility commit but before a later spool update,
+the durable `ready_to_commit` record plus stored path identities is sufficient
+to discover that visibility commit already happened.
 
 ### 4.2 Recovery phases override generic Interrupted recovery
 
@@ -132,6 +149,7 @@ execution into Interrupted applies only to pre-commit execution phases.
 A spool record in any publication-recovery phase, including:
 
 ~~~text
+preparing_exchange
 ready_to_commit
 visible_pending_durability
 committed_pending_report
@@ -146,6 +164,12 @@ Publication recovery reconciles the existing Attempt first.
 The old published tree remains visible.
 
 If the durable phase is ordinary execution, existing Interrupted semantics apply.
+
+If the durable phase is `preparing_exchange`, the Agent reconstructs the private
+namespace from the recorded identities while holding the per-Mirror publication
+lock. It either completes staging into a durable `ready_to_commit` state or
+restores the stable previous slot. It must not normalize the Attempt to
+Interrupted until that private namespace is made stable.
 
 If the durable phase is `ready_to_commit`, the Agent first reconciles with the
 Server so a cancellation already persisted by the Server can be delivered before
@@ -223,25 +247,44 @@ visible_pending_durability
       -> local publication fence remains until separately cleared
 ~~~
 
-Abandon/fence is a high-risk explicit operation against the affected Run/Attempt.
-It is never automatic.
+Abandon/fence is a high-risk explicit operation against one exact immutable
+execution identity:
+
+~~~text
+mirror
+run_id
+attempt_no
+spec_hash
+~~~
+
+The operator action is rejected unless all four identities match the local
+protected spool record.
+
+Abandon/fence runs under the same per-Mirror publication lock used by commit,
+recovery, GC, admission, and fence-clear. It is never automatic.
 
 Its contract is:
 
 - it acknowledges that visibility may already have committed;
 - it does not claim namespace durability succeeded;
-- it writes a durable local `abandoned_fenced` record before terminal failure is
-  reported;
+- it writes and fsyncs a durable local `abandoned_fenced` record **before** any
+  terminal failure is reported to Server;
+- the durable fence binds the exact Run/Attempt/spec identity being abandoned;
 - it terminates the public Run with a publication-durability failure category;
 - it guarantees no further namespace operation will be performed by that
   abandoned Attempt;
 - it releases the Mirror from the public non-terminal Run so an operator may
   perform controlled Move/recovery;
-- the old Node retains a local publication fence and recovery evidence until an
+- on that old Node, the fence blocks **all LMT writers for the Mirror**, including
+  direct-mode execution, atomic execution, recovery publication, and any future
+  LMT write path, until fence-clear succeeds;
+- the old Node retains the local publication fence and recovery evidence until an
   explicit fence-clear operation confirms the local publication paths are safe.
 
-A fence-clear operation is allowed only after doctor/preflight can establish a
-stable local namespace and no recoverable commit remains.
+A fence-clear operation takes the same per-Mirror publication lock and is allowed
+only after doctor/preflight can establish a stable local namespace, no recoverable
+commit remains, and the exact durable fence record being cleared still matches
+the local Mirror state.
 
 The explicit abandon path exists to escape permanent EIO without lying that the
 Attempt succeeded or silently discarding evidence.
@@ -265,6 +308,7 @@ stronger data-durability claim.
 The following spool phases are correctness evidence, not disposable retry state:
 
 ~~~text
+preparing_exchange
 ready_to_commit
 visible_pending_durability
 committed_pending_report
@@ -577,7 +621,24 @@ M4 therefore freezes this invariant:
 > LMT is the only supported namespace writer for a managed atomic published
 > pathname.
 
-Per-Mirror Agent locking prevents two LMT publication paths from racing.
+One per-Mirror publication lock serializes every local operation that can change
+or retire publication state:
+
+~~~text
+commit preparation
+visibility commit
+publication recovery
+pre-visibility restore
+abandon/fence
+fence-clear
+GC scan/delete
+atomic admission
+~~~
+
+The same lock also gates all LMT writer admission while an old-Node fence exists.
+
+This lock is a local correctness primitive. It prevents two LMT publication,
+recovery, GC, or admission paths from racing with each other.
 
 Pre-commit inode/device identity checks remain useful best-effort detection for
 manual replacement or invariant violation, but they are not the correctness
@@ -667,11 +728,15 @@ No separate publication manifest is required for previous-generation identity.
 
 ### 20.2 GC protected set
 
+GC scan, protected-set construction, deletion, and admission checks all execute
+under the same per-Mirror publication lock used by commit/recovery/fence-clear.
+
 GC MUST NOT delete or mutate:
 
 - the current published tree;
 - the stable previous generation in `exchange/`;
 - any candidate/path referenced by a live or recoverable spool record;
+- any path referenced by `preparing_exchange`;
 - any path referenced by `ready_to_commit`;
 - any path referenced by `visible_pending_durability`;
 - any path referenced by `committed_pending_report`;
@@ -685,12 +750,14 @@ ownership/age checks.
 
 Private-generation accumulation is bounded.
 
-Before a new atomic Attempt is admitted:
+Before a new atomic Attempt is admitted, while holding the per-Mirror publication
+lock:
 
-1. run eligible GC;
-2. recompute the protected and garbage sets;
-3. compare the remaining private-generation count with the hard bound;
-4. check the publication free-space reserve.
+1. verify no old-Node writer fence exists;
+2. run eligible GC;
+3. recompute the protected and garbage sets;
+4. compare the remaining private-generation count with the hard bound;
+5. check the publication free-space reserve.
 
 If the hard bound is still reached, the new atomic Attempt is not created.
 
@@ -833,9 +900,9 @@ Downgrade therefore means an offline recovery procedure, not binary rollback in
 place.
 
 Before downgrade, the M4 tooling must prove there is no protected publication
-recovery evidence. If `ready_to_commit`, `visible_pending_durability`,
-`committed_pending_report`, or `abandoned_fenced` exists, downgrade is
-refused until M4 recovery/abandon procedures resolve it.
+recovery evidence. If `preparing_exchange`, `ready_to_commit`,
+`visible_pending_durability`, `committed_pending_report`, or
+`abandoned_fenced` exists, downgrade is refused until M4 recovery/abandon procedures resolve it.
 
 A valid downgrade then requires:
 
@@ -981,7 +1048,18 @@ Automated acceptance must cover at least:
     the two valid race outcomes;
 29. compatibility tests consume frozen M3 wire fixtures, not M4-generated legacy
     structs;
-30. downgrade restores matching pre-M4 TOML as well as database/binaries.
+30. downgrade restores matching pre-M4 TOML as well as database/binaries;
+31. preparing_exchange is durable before the first exchange/gc namespace mutation;
+32. crash during exchange-slot preparation recovers or restores the private
+    namespace without losing previous-generation ownership;
+33. abandon/fence rejects mismatched Run/Attempt/spec identity;
+34. abandon/fence and fence-clear serialize through the same publication lock;
+35. durable local fence exists before Server terminalization;
+36. an old-Node fence blocks every LMT writer for that Mirror, including direct
+    mode;
+37. GC scan/delete/admission race tests share the publication lock with
+    commit/recovery/fence-clear;
+38. preparing_exchange paths are always part of the GC protected set.
 
 A small real-host smoke test is sufficient after automated coverage.
 

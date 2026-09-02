@@ -480,22 +480,25 @@ The remaining questions are intentionally deferred beyond M3 unless production-t
 
 When choosing between a broader abstraction and a smaller design, prefer the smaller design until a real mirror workload demonstrates the need for the abstraction.
 
-## Proposed M4 decisions
+## M4 publication decisions
 
-These remain design proposals. The second M4 review found the core architecture
-acceptable but requested final recovery/GC boundary changes. This section now
-reflects revision 3.
+Status: **accepted** after controlled-production evidence and three adversarial
+architecture review rounds.
+
+D049-D072 freeze the M4 publication architecture. Implementation must conform to
+`docs/m4-publication-design.md` and is not authorized until the implementation
+plan is accepted.
 
 ### D049 - Mirror denotes the logical published mirror resource
 
-Status: proposed.
+Status: accepted.
 
 Mirror identity is not tied to one concrete directory inode or historical
 synchronization tree.
 
 ### D050 - Atomic publication is an Attempt commit phase
 
-Status: proposed.
+Status: accepted.
 
 For atomic Mirrors, AttemptSucceeded is emitted only after synchronization,
 atomic visibility commit, and namespace durability complete. No public
@@ -503,14 +506,14 @@ Publication resource/state machine is introduced.
 
 ### D051 - M4 atomic publication uses real-directory exchange
 
-Status: proposed.
+Status: accepted.
 
 M4 uses fresh private candidates plus Linux renameat2(RENAME_EXCHANGE) for
 existing published directories and no-overwrite rename for first publication.
 
 ### D052 - Atomic candidates are fresh per Attempt
 
-Status: proposed.
+Status: accepted.
 
 Failed/interrupted candidates are never reused by later Attempts and the
 currently published tree is never an LMT synchronization destination in atomic
@@ -518,7 +521,7 @@ mode.
 
 ### D053 - Atomic built-in rsync uses fresh-generation materialization semantics
 
-Status: proposed.
+Status: accepted.
 
 Atomic rsync intentionally differs from direct existing-destination semantics.
 It uses an LMT-controlled link-dest basis and accepts only an audited atomic
@@ -526,7 +529,7 @@ rsync option profile.
 
 ### D054 - Hard-linked atomic generations are immutable
 
-Status: proposed.
+Status: accepted.
 
 Published/previous atomic generations may share inodes and are therefore
 immutable from LMT's perspective and must be treated as immutable by operators.
@@ -534,7 +537,7 @@ Previous is a namespace generation, not an isolated snapshot.
 
 ### D055 - M4 version compatibility is forward-only
 
-Status: proposed.
+Status: accepted.
 
 Supported rolling upgrade is M3 Server+Agent -> M4 Server+M3 Agent Direct ->
 M4 Server+M4 Agent. M3 Server+M4 Agent is unsupported. Downgrade is offline
@@ -542,13 +545,13 @@ restore/runbook, not in-place Server rollback.
 
 ### D056 - Mirror targets may not overlap on one Node
 
-Status: proposed.
+Status: accepted.
 
 Exact or ancestor/descendant target overlap on one owner Node is rejected.
 
 ### D057 - Publication separates visibility from durability
 
-Status: proposed.
+Status: accepted.
 
 Visibility commit is the successful atomic rename/exchange. AttemptSucceeded is
 not emitted until required parent-directory fsync completes. M4 guarantees
@@ -557,21 +560,21 @@ power-loss durability of all repository data.
 
 ### D058 - Managed atomic published paths have one supported namespace writer
 
-Status: proposed.
+Status: accepted.
 
 LMT is the only supported namespace writer for a managed atomic target.
 Inode/device checks are best-effort invariant detection, not compare-and-swap.
 
 ### D059 - Move requires a quiescent Mirror
 
-Status: proposed.
+Status: accepted.
 
 A Mirror with a Pending or Running Run cannot change owner Node. Move
 acknowledgement cannot override this safety gate.
 
 ### D060 - Atomic GC and storage health are bounded correctness concerns
 
-Status: proposed.
+Status: accepted.
 
 Stale private generations cannot accumulate indefinitely. GC backlog, cleanup
 failure, free-space health, and admission blocking are explicit operational
@@ -579,7 +582,7 @@ semantics.
 
 ### D061 - M4 upgrade is Server-first and downgrade is restore-based
 
-Status: proposed.
+Status: accepted.
 
 Before M4 rollout, operators create a control-plane backup. Server upgrades
 first, old Agents continue Direct work, then Agents upgrade and advertise atomic
@@ -589,7 +592,7 @@ matching binaries rather than binary rollback over M4 state.
 
 ### D062 - ready-to-commit is a durable write-ahead publication record
 
-Status: proposed.
+Status: accepted.
 
 Atomic visibility commit is forbidden until the Agent has durably persisted
 ready_to_commit with the candidate/prior-published identities and commit intent.
@@ -597,7 +600,7 @@ Publication-recovery phases bypass generic restart-to-Interrupted normalization.
 
 ### D063 - post-visibility durability ambiguity has explicit abandon/fence recovery
 
-Status: proposed.
+Status: accepted.
 
 Persistent visible_pending_durability may be explicitly abandoned only through a
 high-risk operator action. The Run terminates Failed without rollback, the
@@ -606,7 +609,7 @@ plus recovery evidence remains until explicitly cleared.
 
 ### D064 - publication recovery evidence survives spool reset/restore/downgrade
 
-Status: proposed.
+Status: accepted.
 
 ready_to_commit, visible_pending_durability, committed_pending_report, and
 abandoned_fenced records are protected correctness state. Generic spool cleanup
@@ -615,7 +618,7 @@ semantics.
 
 ### D065 - atomic GC has a frozen protected set and fail-closed admission gate
 
-Status: proposed.
+Status: accepted.
 
 Current published, stable previous, every live/recoverable-spool path, and every
 path referenced by publication recovery/fence state are non-GCable. If GC cannot
@@ -624,7 +627,7 @@ above reserve, new atomic Attempts remain blocked.
 
 ### D066 - the fixed exchange slot determines previous-generation ownership
 
-Status: proposed.
+Status: accepted.
 
 A fresh candidate is staged into one fixed private exchange slot immediately
 before commit. RENAME_EXCHANGE with the published target makes that same slot
@@ -634,7 +637,7 @@ publication manifest.
 
 ### D067 - quiescent Move is one transactional Store decision
 
-Status: proposed.
+Status: accepted.
 
 The active-Run check and owner-node update occur in the same Store transaction as
 Move reconciliation. Concurrent Run creation either wins and rejects Move, or
@@ -642,7 +645,7 @@ Move wins and no old-owner Run can be created.
 
 ### D068 - M3 compatibility is tested from frozen historical artifacts
 
-Status: proposed.
+Status: accepted.
 
 M4 compatibility gates consume verbatim M3 PollRequest, PollResponse, and Direct
 ProcessRunSpec fixtures captured from the accepted M3 baseline rather than
@@ -652,7 +655,7 @@ the matching pre-M4 authoritative TOML bundle.
 
 ### D069 - pre-visibility abort restores the stable exchange slot
 
-Status: proposed.
+Status: accepted.
 
 If commit preparation has moved the fresh candidate into the fixed exchange slot
 and rotated the former previous generation, but cancellation or another
@@ -660,3 +663,31 @@ precondition wins before visibility commit, the Agent must restore the stable
 previous-generation layout before reporting a terminal Attempt. Failure to
 restore that private layout is a fail-closed local publication-recovery state
 that blocks new atomic admission.
+
+
+### D070 - preparing-exchange is the first durable namespace write-ahead phase
+
+Status: accepted.
+
+Before LMT mutates exchange/ or gc/ for a commit, it durably records
+preparing_exchange with the exact candidate, published, stable-previous, and
+rotation identities. Crash recovery from this phase must reconstruct or restore
+the private namespace before generic Interrupted handling is allowed.
+
+### D071 - publication fence binds exact execution identity and blocks all old-Node writers
+
+Status: accepted.
+
+Abandon/fence requires exact Mirror, Run ID, Attempt number, and spec hash. It
+runs under the per-Mirror publication lock and persists the local fence before
+Server terminalization. Until explicitly cleared, that fence blocks every LMT
+writer for that Mirror on the old Node, including Direct and Atomic execution.
+
+### D072 - publication, recovery, fence, GC, and admission share one per-Mirror lock
+
+Status: accepted.
+
+Commit preparation, visibility commit, recovery, pre-visibility restoration,
+abandon/fence, fence-clear, GC protected-set scan/deletion, and atomic admission
+serialize through one per-Mirror publication lock. preparing_exchange references
+belong to the GC protected set.
