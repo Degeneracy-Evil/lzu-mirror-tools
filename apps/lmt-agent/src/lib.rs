@@ -14,6 +14,7 @@ use anyhow::bail;
 use config::Config;
 use lmt_core::{AttemptState, FailureKind, NodeName, ProcessRunSpec};
 use lmt_protocol::v1alpha1::{AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse};
+use nix::sys::statvfs::statvfs;
 use reqwest::{Client, StatusCode};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
@@ -164,11 +165,7 @@ impl Agent {
                 agent_boot_id: self.boot_id.to_string(),
                 poll_sequence: sequence,
                 running: self.owned().await,
-                capacity: Capacity {
-                    mirror_root_free_bytes: None,
-                    active_runs: u32::try_from(self.active.lock().await.len()).unwrap_or(u32::MAX),
-                    max_concurrent_runs: self.config.execution.max_concurrent_runs,
-                },
+                capacity: self.capacity().await,
                 mirror_root: self.config.storage.mirror_root.to_string_lossy().into_owned(),
             };
             let token = self.token();
@@ -205,6 +202,29 @@ impl Agent {
         }
         reconciliation.abort();
         Ok(())
+    }
+
+    async fn capacity(&self) -> Capacity {
+        let active_runs = u32::try_from(self.active.lock().await.len()).unwrap_or(u32::MAX);
+        let mirror_root = self.config.storage.mirror_root.clone();
+        let measurement_path = mirror_root.clone();
+        let mirror_root_free_bytes = match tokio::task::spawn_blocking(move || available_bytes(&measurement_path)).await
+        {
+            Ok(Ok(bytes)) => Some(bytes),
+            Ok(Err(error)) => {
+                tracing::warn!(path=%mirror_root.display(), %error, "failed to measure mirror-root available bytes");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(path=%mirror_root.display(), %error, "mirror-root capacity measurement task failed");
+                None
+            }
+        };
+        Capacity {
+            mirror_root_free_bytes,
+            active_runs,
+            max_concurrent_runs: self.config.execution.max_concurrent_runs,
+        }
     }
 
     async fn accept(&self, run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec) {
@@ -469,6 +489,14 @@ impl Agent {
     }
 }
 
+fn available_bytes(path: &Path) -> anyhow::Result<u64> {
+    let filesystem = statvfs(path)?;
+    filesystem
+        .blocks_available()
+        .checked_mul(filesystem.fragment_size())
+        .ok_or_else(|| anyhow::anyhow!("filesystem available-byte count overflowed u64"))
+}
+
 async fn spool_paths(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     let mut entries = fs::read_dir(root).await?;
     let mut paths = Vec::new();
@@ -561,6 +589,34 @@ mod tests {
             source.replace("typo=true\n", "")
         );
         assert!(toml::from_str::<Config>(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn filesystem_backed_capacity_reports_user_available_bytes_and_degrades_to_none() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mirror_root = directory.path().join("mirrors");
+        std::fs::create_dir(&mirror_root).expect("mirror root");
+        let (_shutdown, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1".into());
+
+        let capacity = agent.capacity().await;
+        let reported = capacity
+            .mirror_root_free_bytes
+            .expect("filesystem-backed available bytes");
+        let filesystem = statvfs(&mirror_root).expect("statvfs");
+        let total_free = filesystem
+            .blocks_free()
+            .checked_mul(filesystem.fragment_size())
+            .expect("total free bytes");
+        assert!(reported <= total_free, "reported space includes reserved blocks");
+        assert_eq!(reported % filesystem.fragment_size(), 0);
+        assert_eq!(capacity.active_runs, 0);
+        assert_eq!(capacity.max_concurrent_runs, 4);
+
+        std::fs::remove_dir(&mirror_root).expect("remove mirror root");
+        let failed_measurement = agent.capacity().await;
+        assert_eq!(failed_measurement.mirror_root_free_bytes, None);
+        assert_eq!(failed_measurement.active_runs, 0);
     }
 
     #[tokio::test]
