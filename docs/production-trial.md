@@ -489,11 +489,9 @@ This validates that operator cancellation suppresses retry and closes the active
 
 After T005-T009, the manual trial should focus only on architecture-critical paths rather than exhaustively exercising every state-machine branch.
 
-Remaining high-value manual checks before moving to multi-node/real-mirror work:
+Remaining manual checks are intentionally narrowed to architecture-critical evidence only:
 
-1. one genuine synchronization failure followed by Server-managed retry;
-2. one backup/verify/offline-restore rehearsal;
-3. one multi-node ownership/binding test when n02 is introduced;
-4. later, one real repository concurrent-sync/serving publication-consistency experiment.
+1. introduce n02 and validate real multi-node ownership/dispatch/binding;
+2. run one small real repository while Nginx serves the same tree and observe publication consistency.
 
-Lower-value permutations are covered by automated tests unless production evidence suggests otherwise.
+Retry variants, credential rotation, backup/restore permutations, and other state-machine branches remain covered by automated tests unless production evidence exposes a problem that justifies a targeted manual reproduction.
