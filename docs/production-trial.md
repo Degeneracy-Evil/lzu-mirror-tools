@@ -495,3 +495,75 @@ Remaining manual checks are intentionally narrowed to architecture-critical evid
 2. run one small real repository while Nginx serves the same tree and observe publication consistency.
 
 Retry variants, credential rotation, backup/restore permutations, and other state-machine branches remain covered by automated tests unless production evidence exposes a problem that justifies a targeted manual reproduction.
+
+### T010 - explicit cross-node ownership move and dispatch succeeded
+
+Observed on n01/n02 on 2026-09-02.
+
+~~~text
+mirror: local-smoke
+ownership: n01 -> n02
+generation: 3 -> 4
+config revision: 3 -> 4
+Run ID: 01M1GA78905YDE35Q5YM4YDFNC
+owner_node: n02
+Attempt 1: succeeded
+~~~
+
+The config-path move was explicitly acknowledged. The subsequent Run was dispatched to n02 and produced n02-specific content. The pre-existing n01 mirror tree remained intact, confirming that ownership moves change control-plane ownership only and do not imply hidden data migration or deletion.
+
+### T011 - real rsync serving-tree update is not repository-atomic
+
+Observed on n01 on 2026-09-02 using the real kernel.org `SillySounds` rsync source while an isolated Nginx served the same mirror tree.
+
+Topology:
+
+~~~text
+lmt-server + lmt-agent + nginx
+        |
+        +--> /mnt/data/lmt-trial/mirrors/kernel-sillysounds
+~~~
+
+After an initial successful sync, `english.wav` and `swedish.wav` in the serving tree were deliberately replaced with old marker contents. The next LMT Run used rsync with a low bandwidth limit so replacement ordering was observable.
+
+Run:
+
+~~~text
+Run ID: 01M1GN8Q4EKATA9PNEW03D4EJ7
+Mirror generation: 2
+Attempt 1: succeeded
+started:  2026-09-02T08:55:13.910Z
+finished: 2026-09-02T08:55:31.581Z
+~~~
+
+Rsync reported the two serving-file replacements in sequence:
+
+~~~text
+>f.st...... english.wav
+>f.st...... swedish.wav
+~~~
+
+Because Nginx was directly serving the same tree, each file becomes visible independently when rsync completes that file's temporary-file/rename cycle. Between the `english.wav` replacement and the later `swedish.wav` replacement, the repository necessarily exposes a mixed generation (`new english.wav` with `old swedish.wav`).
+
+This is not an rsync correctness bug. It demonstrates the architectural boundary of the current v1 publication model:
+
+~~~text
+sync tree == serving tree
+~~~
+
+Per-file replacement is reasonably safe, but a repository generation is not atomically published. This is now production-trial evidence for considering a later staging/snapshot -> verify -> atomic publish layer. The trial does not authorize implementing that layer yet.
+
+### Controlled production-trial conclusion
+
+The architecture-critical manual checks are complete. The trial validated:
+
+- fresh-install Node/credential bootstrap;
+- Agent capacity reporting on the real filesystem;
+- normal and incremental rsync Runs;
+- Server restart during active execution;
+- Agent restart with process-group closure and retry;
+- active Run cancellation without retry;
+- explicit cross-node ownership and dispatch;
+- real Nginx serving behavior during rsync publication.
+
+No new v1 blocker remains from these checks. The main architectural evidence carried forward is the lack of repository-level atomic publication when the synchronization tree is also the serving tree.
