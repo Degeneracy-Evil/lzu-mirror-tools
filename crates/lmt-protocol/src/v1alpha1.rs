@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use lmt_core::{AttemptState, BundleFile, FailureKind, ProcessRunSpec, RunState, RunTrigger};
 use serde::{Deserialize, Serialize};
 
+pub const ATOMIC_EXCHANGE_V1: &str = "atomic_exchange_v1";
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ApiErrorEnvelope {
@@ -320,6 +322,10 @@ pub struct PollRequest {
     pub running: Vec<OwnedAttempt>,
     pub capacity: Capacity,
     pub mirror_root: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -390,6 +396,7 @@ mod tests {
                     timeout_seconds: 30,
                     mirror_root: "/srv/mirrors".into(),
                     target_dir: "/srv/mirrors/example".into(),
+                    publication: None,
                 },
             }],
         };

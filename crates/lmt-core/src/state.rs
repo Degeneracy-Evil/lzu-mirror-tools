@@ -81,6 +81,20 @@ pub struct ProcessRunSpec {
     pub timeout_seconds: u64,
     pub mirror_root: String,
     pub target_dir: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<Box<AtomicPublicationSpec>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AtomicPublicationSpec {
+    pub mirror: String,
+    pub publication_root: String,
+    pub published_dir: String,
+    pub candidate_dir: String,
+    pub basis_dir: String,
+    pub exchange_dir: String,
+    pub gc_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

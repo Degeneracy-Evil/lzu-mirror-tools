@@ -54,6 +54,7 @@ pub struct Agent {
     token: Arc<RwLock<String>>,
     instance: Arc<str>,
     boot_id: Arc<str>,
+    capabilities: Arc<[String]>,
     _process_lock: Arc<process_lock::ProcessLock>,
     client: Client,
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
@@ -112,6 +113,18 @@ impl Agent {
         if config.execution.max_concurrent_runs == 0 {
             bail!("max_concurrent_runs must be positive");
         }
+        match (
+            config.storage.publication_root.as_ref(),
+            config.storage.publication_max_private_generations,
+            config.storage.publication_reserve_bytes,
+        ) {
+            (None, None, None) => {}
+            (Some(_), Some(max_private_generations), Some(_)) if max_private_generations > 0 => {}
+            (Some(_), Some(0), Some(_)) => bail!("publication_max_private_generations must be positive"),
+            _ => bail!(
+                "publication_root, publication_max_private_generations, and publication_reserve_bytes must be configured together"
+            ),
+        }
         fs::create_dir_all(&config.storage.spool_dir).await?;
         let process_lock = process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))?;
         let token = fs::read_to_string(&config.server.token_file).await?.trim().to_owned();
@@ -124,6 +137,7 @@ impl Agent {
             token: Arc::new(RwLock::new(token)),
             instance: instance.into(),
             boot_id: ulid::Ulid::new().to_string().into(),
+            capabilities: Arc::from([]),
             _process_lock: Arc::new(process_lock),
             client: Client::builder().timeout(Duration::from_secs(35)).build()?,
             active: Arc::new(Mutex::new(HashMap::new())),
@@ -167,6 +181,13 @@ impl Agent {
                 running: self.owned().await,
                 capacity: self.capacity().await,
                 mirror_root: self.config.storage.mirror_root.to_string_lossy().into_owned(),
+                capabilities: self.capabilities.to_vec(),
+                publication_root: self
+                    .config
+                    .storage
+                    .publication_root
+                    .as_ref()
+                    .map(|root| root.to_string_lossy().into_owned()),
             };
             let token = self.token();
             match self
@@ -547,6 +568,9 @@ mod tests {
                 storage: config::Storage {
                     mirror_root: root.join("mirrors"),
                     spool_dir: root.join("spool"),
+                    publication_root: None,
+                    publication_max_private_generations: None,
+                    publication_reserve_bytes: None,
                 },
                 execution: config::Execution { max_concurrent_runs: 4 },
                 runner: config::Runner {
@@ -557,6 +581,7 @@ mod tests {
             token: Arc::new(RwLock::new("token".into())),
             instance: "instance".into(),
             boot_id: "boot".into(),
+            capabilities: Arc::from([]),
             _process_lock: Arc::new(process_lock),
             client: Client::new(),
             active: Arc::new(Mutex::new(HashMap::new())),
@@ -574,6 +599,7 @@ mod tests {
             timeout_seconds,
             mirror_root: root.to_string_lossy().into_owned(),
             target_dir: root.join("demo").to_string_lossy().into_owned(),
+            publication: None,
         }
     }
 
@@ -589,6 +615,17 @@ mod tests {
             source.replace("typo=true\n", "")
         );
         assert!(toml::from_str::<Config>(&invalid).is_err());
+
+        let atomic = toml::from_str::<Config>(
+            "[node]\nname='n'\n[server]\nurl='http://x'\ntoken_file='/x'\n[storage]\nmirror_root='/mirrors'\nspool_dir='/spool'\npublication_root='/publication'\npublication_max_private_generations=4\npublication_reserve_bytes=10737418240\n[execution]\nmax_concurrent_runs=1\n[runner.process]\nenabled=true\n",
+        )
+        .expect("Atomic Agent storage config");
+        assert_eq!(
+            atomic.storage.publication_root.as_deref(),
+            Some(Path::new("/publication"))
+        );
+        assert_eq!(atomic.storage.publication_max_private_generations, Some(4));
+        assert_eq!(atomic.storage.publication_reserve_bytes, Some(10_737_418_240));
     }
 
     #[tokio::test]
@@ -635,6 +672,9 @@ mod tests {
             storage: config::Storage {
                 mirror_root: directory.path().join("mirrors"),
                 spool_dir: directory.path().join("spool"),
+                publication_root: None,
+                publication_max_private_generations: None,
+                publication_reserve_bytes: None,
             },
             execution: config::Execution { max_concurrent_runs: 1 },
             runner: config::Runner {
@@ -975,8 +1015,10 @@ mod tests {
                 attempt_no: AttemptNo::new(1).expect("attempt"),
                 node_name: &node,
                 mirror_root: &mirror_root,
+                publication_root: None,
             },
-        );
+        )
+        .expect("compile direct spec");
         assert_eq!(compiled.program, "rsync");
         assert_eq!(compiled.args[compiled.args.len() - 2], format!("{}/", source.display()));
 

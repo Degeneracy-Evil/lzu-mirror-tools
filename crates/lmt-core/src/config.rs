@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{AttemptNo, MirrorName, NodeName, ProcessRunSpec, RunId, ScheduleConfig};
+use crate::{AtomicPublicationSpec, AttemptNo, MirrorName, NodeName, ProcessRunSpec, RunId, ScheduleConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -26,10 +26,33 @@ pub struct MirrorDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleConfig>,
     pub sync: SyncConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationConfig>,
     #[serde(default)]
     pub runner: ProcessRunner,
     #[serde(default)]
     pub run: RunPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationConfig {
+    pub mode: PublicationMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationMode {
+    Direct,
+    Atomic,
+}
+
+impl MirrorDocument {
+    pub fn publication_mode(&self) -> PublicationMode {
+        self.publication
+            .as_ref()
+            .map_or(PublicationMode::Direct, |publication| publication.mode)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -153,6 +176,8 @@ pub enum ConfigError {
     InvalidSchedule(String),
     #[error("unsupported placeholder {0}")]
     UnsupportedPlaceholder(String),
+    #[error("atomic publication requires an Agent publication root")]
+    MissingPublicationRoot,
 }
 
 #[derive(Debug, Clone)]
@@ -162,15 +187,43 @@ pub struct RunSpecContext<'a> {
     pub attempt_no: AttemptNo,
     pub node_name: &'a NodeName,
     pub mirror_root: &'a Path,
+    pub publication_root: Option<&'a Path>,
 }
 
-pub fn compile_process_run_spec(document: &MirrorDocument, context: &RunSpecContext<'_>) -> ProcessRunSpec {
+pub fn compile_process_run_spec(
+    document: &MirrorDocument,
+    context: &RunSpecContext<'_>,
+) -> Result<ProcessRunSpec, ConfigError> {
     let mirror_root = context.mirror_root.to_string_lossy();
-    let target_dir = context
+    let published_dir = context
         .mirror_root
         .join(&document.mirror.target)
         .to_string_lossy()
         .into_owned();
+    let publication = match document.publication_mode() {
+        PublicationMode::Direct => None,
+        PublicationMode::Atomic => {
+            let publication_root = context.publication_root.ok_or(ConfigError::MissingPublicationRoot)?;
+            let mirror_private = publication_root.join(context.mirror_name.as_str());
+            let attempt_private =
+                mirror_private
+                    .join("attempts")
+                    .join(format!("{}-{}", context.run_id, context.attempt_no.get()));
+            Some(Box::new(AtomicPublicationSpec {
+                mirror: context.mirror_name.to_string(),
+                publication_root: publication_root.to_string_lossy().into_owned(),
+                published_dir: published_dir.clone(),
+                candidate_dir: attempt_private.join("root").to_string_lossy().into_owned(),
+                basis_dir: attempt_private.join("basis").to_string_lossy().into_owned(),
+                exchange_dir: mirror_private.join("exchange").to_string_lossy().into_owned(),
+                gc_dir: mirror_private.join("gc").to_string_lossy().into_owned(),
+            }))
+        }
+    };
+    let target_dir = publication.as_ref().map_or_else(
+        || published_dir.clone(),
+        |publication| publication.candidate_dir.clone(),
+    );
     let resolve = |value: &str| {
         value
             .replace("{mirror_name}", context.mirror_name.as_str())
@@ -179,6 +232,7 @@ pub fn compile_process_run_spec(document: &MirrorDocument, context: &RunSpecCont
             .replace("{node_name}", context.node_name.as_str())
             .replace("{mirror_root}", &mirror_root)
             .replace("{target_dir}", &target_dir)
+            .replace("{published_dir}", &published_dir)
     };
     let (program, args, cwd) = match &document.sync {
         SyncConfig::Command { program, args, cwd } => (
@@ -188,13 +242,16 @@ pub fn compile_process_run_spec(document: &MirrorDocument, context: &RunSpecCont
         ),
         SyncConfig::Rsync { source, args } => {
             let mut compiled = args.clone();
+            if let Some(publication) = &publication {
+                compiled.push(format!("--link-dest={}", publication.basis_dir));
+            }
             compiled.push("--".into());
             compiled.push(source.clone());
             compiled.push(format!("{}/", target_dir.trim_end_matches('/')));
             ("rsync".into(), compiled, None)
         }
     };
-    ProcessRunSpec {
+    Ok(ProcessRunSpec {
         runner: "process".into(),
         program,
         args,
@@ -202,7 +259,8 @@ pub fn compile_process_run_spec(document: &MirrorDocument, context: &RunSpecCont
         timeout_seconds: document.run.timeout_seconds,
         mirror_root: mirror_root.into_owned(),
         target_dir,
-    }
+        publication,
+    })
 }
 
 pub fn canonicalize_bundle(bundle: &ConfigBundle) -> Result<CanonicalBundle, Vec<ConfigError>> {
@@ -337,7 +395,7 @@ fn validate_placeholders(value: &str) -> Result<(), ConfigError> {
         let placeholder = &after[..close];
         if !matches!(
             placeholder,
-            "mirror_name" | "run_id" | "attempt" | "node_name" | "mirror_root" | "target_dir"
+            "mirror_name" | "run_id" | "attempt" | "node_name" | "mirror_root" | "target_dir" | "published_dir"
         ) {
             return Err(ConfigError::UnsupportedPlaceholder(placeholder.to_owned()));
         }
@@ -431,13 +489,47 @@ mod tests {
                 attempt_no: AttemptNo::new(1).expect("attempt"),
                 node_name: &node,
                 mirror_root: Path::new("/srv/mirrors"),
+                publication_root: None,
             },
-        );
+        )
+        .expect("compile direct spec");
         assert_eq!(spec.program, "rsync");
         assert_eq!(
             spec.args,
             ["--archive", "--delete", "--", "local/source/", "/srv/mirrors/example/"]
         );
+        assert_eq!(spec.publication, None);
+    }
+
+    #[test]
+    fn atomic_config_compiles_a_fresh_private_candidate_and_published_placeholder() {
+        let canonical = canonicalize_bundle(&bundle(
+            "[mirror]\nname='example'\ntarget='example'\n[sync]\ntype='command'\nprogram='/bin/sync'\nargs=['{target_dir}','{published_dir}']\n[publication]\nmode='atomic'\n",
+        ))
+        .expect("valid Atomic config");
+        let document = &canonical.mirrors.values().next().expect("mirror").document;
+        let mirror = MirrorName::new("example").expect("name");
+        let node = NodeName::new("node-a").expect("node");
+        let run_id = RunId::new();
+        let spec = compile_process_run_spec(
+            document,
+            &RunSpecContext {
+                mirror_name: &mirror,
+                run_id,
+                attempt_no: AttemptNo::new(2).expect("attempt"),
+                node_name: &node,
+                mirror_root: Path::new("/srv/mirrors"),
+                publication_root: Some(Path::new("/srv/publication")),
+            },
+        )
+        .expect("compile Atomic spec");
+        let publication = spec.publication.as_ref().expect("publication extension");
+        assert_eq!(publication.published_dir, "/srv/mirrors/example");
+        assert_eq!(spec.target_dir, publication.candidate_dir);
+        assert_eq!(spec.args, [publication.candidate_dir.as_str(), "/srv/mirrors/example"]);
+        assert!(publication.candidate_dir.ends_with(&format!("{run_id}-2/root")));
+        assert_eq!(publication.exchange_dir, "/srv/publication/example/exchange");
+        assert_eq!(publication.gc_dir, "/srv/publication/example/gc");
     }
 
     #[test]

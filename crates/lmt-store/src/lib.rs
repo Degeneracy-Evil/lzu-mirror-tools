@@ -244,6 +244,8 @@ pub struct DispatchSource {
     pub config_toml: String,
 }
 
+pub type CompiledDispatch = (ProcessRunSpec, String, RunPolicySnapshot);
+
 #[derive(Debug, Clone)]
 pub struct TerminalDecisionSource {
     pub outcome: AttemptState,
@@ -920,7 +922,7 @@ impl Store {
 
     pub async fn poll_action<F>(&self, node: &str, now: i64, compile: F) -> Result<Option<PollAction>, StoreError>
     where
-        F: FnOnce(&DispatchSource) -> Result<(ProcessRunSpec, String, RunPolicySnapshot), StoreError> + Send + 'static,
+        F: FnOnce(&DispatchSource) -> Result<Option<CompiledDispatch>, StoreError> + Send + 'static,
     {
         let node = node.to_owned();
         self.call(move |connection| {
@@ -949,7 +951,6 @@ impl Store {
                 transaction.commit()?;
                 return Ok(None);
             }
-
             let initial: Option<(String, String, u64, u32)> = transaction
                 .query_row(
                     "SELECT r.id,r.mirror_name,r.mirror_generation,1
@@ -995,29 +996,10 @@ impl Store {
                 mirror_generation: generation,
                 config_toml,
             };
-            let (spec, spec_hash, policy) = compile(&source)?;
-            transaction.execute(
-                "UPDATE runs SET max_attempts=?2,retry_delay_ms=?3 WHERE id=?1 AND trigger='scheduled'",
-                params![run_id, policy.max_attempts, policy.retry_delay_ms],
-            )?;
-            let spec_json = serde_json::to_string(&spec)?;
-            transaction.execute(
-                "INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,
-                   last_event_sequence,dispatch_count,last_dispatch_at_ms)
-                 VALUES(?1,?2,'queued',?3,?4,?5,0,1,?5)",
-                params![run_id, attempt_no, spec_hash, spec_json, now],
-            )?;
-            transaction.execute(
-                "UPDATE runs SET attempt_count=?2,retry_due_at_ms=NULL WHERE id=?1",
-                params![run_id, attempt_no],
-            )?;
-            transaction.commit()?;
-            Ok(Some(PollAction::StartAttempt {
-                run_id,
-                attempt_no,
-                spec_hash,
-                spec,
-            }))
+            let Some((spec, spec_hash, policy)) = compile(&source)? else {
+                return unavailable_dispatch(transaction);
+            };
+            persist_dispatch(transaction, run_id, attempt_no, spec_hash, spec, policy, now)
         })
         .await
     }
@@ -1880,6 +1862,44 @@ fn map_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
     })
 }
 
+fn unavailable_dispatch(transaction: Transaction<'_>) -> Result<Option<PollAction>, StoreError> {
+    transaction.rollback()?;
+    Ok(None)
+}
+
+fn persist_dispatch(
+    transaction: Transaction<'_>,
+    run_id: String,
+    attempt_no: u32,
+    spec_hash: String,
+    spec: ProcessRunSpec,
+    policy: RunPolicySnapshot,
+    now: i64,
+) -> Result<Option<PollAction>, StoreError> {
+    transaction.execute(
+        "UPDATE runs SET max_attempts=?2,retry_delay_ms=?3 WHERE id=?1 AND trigger='scheduled'",
+        params![run_id, policy.max_attempts, policy.retry_delay_ms],
+    )?;
+    let spec_json = serde_json::to_string(&spec)?;
+    transaction.execute(
+        "INSERT INTO attempts(run_id,attempt_no,state,spec_hash,spec_json,created_at_ms,
+         last_event_sequence,dispatch_count,last_dispatch_at_ms)
+         VALUES(?1,?2,'queued',?3,?4,?5,0,1,?5)",
+        params![run_id, attempt_no, spec_hash, spec_json, now],
+    )?;
+    transaction.execute(
+        "UPDATE runs SET attempt_count=?2,retry_due_at_ms=NULL WHERE id=?1",
+        params![run_id, attempt_no],
+    )?;
+    transaction.commit()?;
+    Ok(Some(PollAction::StartAttempt {
+        run_id,
+        attempt_no,
+        spec_hash,
+        spec,
+    }))
+}
+
 fn map_poll_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<PollAction> {
     let spec_json: String = row.get(3)?;
     Ok(PollAction::StartAttempt {
@@ -2144,7 +2164,7 @@ mod tests {
     async fn poll_at(store: &Store, now: i64) -> PollAction {
         store
             .poll_action("node-a", now, |_| {
-                Ok((
+                Ok(Some((
                     ProcessRunSpec {
                         runner: "process".into(),
                         program: "/bin/true".into(),
@@ -2153,13 +2173,14 @@ mod tests {
                         timeout_seconds: 30,
                         mirror_root: "/tmp/mirrors".into(),
                         target_dir: "/tmp/mirrors/demo".into(),
+                        publication: None,
                     },
                     "sha256:test".into(),
                     RunPolicySnapshot {
                         max_attempts: 3,
                         retry_delay_ms: 5_000,
                     },
-                ))
+                )))
             })
             .await
             .expect("poll")
@@ -2219,6 +2240,33 @@ mod tests {
                 .expect("list")
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_dispatch_compilation_creates_no_attempt() {
+        let store = Store::open_in_memory().await.expect("open");
+        store
+            .import_legacy_credential("node-a", "secret", 1)
+            .await
+            .expect("Node");
+        store.apply(&bundle("/bin/true"), 0, "test", 2).await.expect("apply");
+        let run = store
+            .create_manual_run("demo", "request", 3, policy)
+            .await
+            .expect("Run");
+
+        assert!(
+            store
+                .poll_action("node-a", 4, |_| Ok(None))
+                .await
+                .expect("poll")
+                .is_none()
+        );
+        assert!(store.list_attempts(&run.id).await.expect("Attempts").is_empty());
+        assert_eq!(
+            store.get_run(&run.id).await.expect("Run").expect("existing Run").state,
+            RunState::Pending
         );
     }
 

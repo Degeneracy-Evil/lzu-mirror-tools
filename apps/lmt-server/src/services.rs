@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use lmt_core::{
-    AttemptEvent, AttemptNo, MirrorDocument, MirrorName, NodeName, RetryContext, RunId, RunSpecContext,
-    compile_process_run_spec, decide_retry, evaluate_schedule_due, rearm_interval,
+    AttemptEvent, AttemptNo, MirrorDocument, MirrorName, NodeName, PublicationMode, RetryContext, RunId,
+    RunSpecContext, compile_process_run_spec, decide_retry, evaluate_schedule_due, rearm_interval,
 };
+use lmt_protocol::v1alpha1::ATOMIC_EXCHANGE_V1;
 use lmt_store::{
     AttemptEventApplyResult, CancellationApplyResult, DispatchSource, PollAction, RunPolicySnapshot, RunRecord, Store,
     StoreError, TerminalDecision,
@@ -14,16 +15,38 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+#[cfg(test)]
 pub async fn next_action(
     store: &Store,
     node: &str,
     mirror_root: &str,
     now: i64,
 ) -> Result<Option<PollAction>, StoreError> {
+    next_action_for_agent(store, node, mirror_root, None, &[], now).await
+}
+
+pub async fn next_action_for_agent(
+    store: &Store,
+    node: &str,
+    mirror_root: &str,
+    publication_root: Option<&str>,
+    capabilities: &[String],
+    now: i64,
+) -> Result<Option<PollAction>, StoreError> {
     let owned_node = node.to_owned();
     let owned_root = mirror_root.to_owned();
+    let owned_publication_root = publication_root.map(str::to_owned);
+    let supports_atomic = capabilities.iter().any(|capability| capability == ATOMIC_EXCHANGE_V1);
     store
-        .poll_action(node, now, move |source| compile(source, &owned_node, &owned_root))
+        .poll_action(node, now, move |source| {
+            compile(
+                source,
+                &owned_node,
+                &owned_root,
+                owned_publication_root.as_deref(),
+                supports_atomic,
+            )
+        })
         .await
 }
 
@@ -109,7 +132,9 @@ fn compile(
     source: &DispatchSource,
     node: &str,
     mirror_root: &str,
-) -> Result<(lmt_core::ProcessRunSpec, String, RunPolicySnapshot), StoreError> {
+    publication_root: Option<&str>,
+    supports_atomic: bool,
+) -> Result<Option<(lmt_core::ProcessRunSpec, String, RunPolicySnapshot)>, StoreError> {
     let document: MirrorDocument =
         toml::from_str(&source.config_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
     let mirror = MirrorName::new(&source.mirror_name).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
@@ -119,6 +144,9 @@ fn compile(
         .parse::<RunId>()
         .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
     let attempt_no = AttemptNo::new(source.attempt_no).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+    if document.publication_mode() == PublicationMode::Atomic && (!supports_atomic || publication_root.is_none()) {
+        return Ok(None);
+    }
     let spec = compile_process_run_spec(
         &document,
         &RunSpecContext {
@@ -127,15 +155,17 @@ fn compile(
             attempt_no,
             node_name: &node,
             mirror_root: Path::new(mirror_root),
+            publication_root: publication_root.map(Path::new),
         },
-    );
+    )
+    .map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
     let bytes = serde_json::to_vec(&spec)?;
     let hash = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
     let policy = RunPolicySnapshot {
         max_attempts: document.run.max_attempts,
         retry_delay_ms: document.run.retry_delay_seconds.saturating_mul(1_000),
     };
-    Ok((spec, hash, policy))
+    Ok(Some((spec, hash, policy)))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -177,4 +207,58 @@ pub async fn evaluate_schedules(store: &Store, now: i64) -> Result<ScheduleEvalu
         cron_due: counts[2].load(Ordering::Relaxed),
         cron_skipped: counts[3].load(Ordering::Relaxed),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(config_toml: &str) -> DispatchSource {
+        DispatchSource {
+            run_id: "01M40000000000000000000000".into(),
+            attempt_no: 1,
+            mirror_name: "demo".into(),
+            mirror_generation: 1,
+            config_toml: config_toml.into(),
+        }
+    }
+
+    #[test]
+    fn direct_specs_remain_legacy_shaped_without_atomic_capability() {
+        let compiled = compile(
+            &source("[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='command'\nprogram='/bin/true'\n"),
+            "node-a",
+            "/srv/mirrors",
+            None,
+            false,
+        )
+        .expect("compile")
+        .expect("Direct dispatch");
+        let json = serde_json::to_value(compiled.0).expect("serialize Direct spec");
+        assert!(json.get("publication").is_none());
+    }
+
+    #[test]
+    fn atomic_specs_require_explicit_capability_and_publication_root() {
+        let atomic = source(
+            "[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='command'\nprogram='/bin/true'\n[publication]\nmode='atomic'\n",
+        );
+        assert!(
+            compile(&atomic, "node-a", "/srv/mirrors", Some("/srv/publication"), false)
+                .expect("unsupported")
+                .is_none()
+        );
+        assert!(
+            compile(&atomic, "node-a", "/srv/mirrors", None, true)
+                .expect("missing root")
+                .is_none()
+        );
+
+        let compiled = compile(&atomic, "node-a", "/srv/mirrors", Some("/srv/publication"), true)
+            .expect("compile")
+            .expect("Atomic dispatch");
+        let publication = compiled.0.publication.expect("publication extension");
+        assert_eq!(publication.published_dir, "/srv/mirrors/demo");
+        assert!(publication.candidate_dir.starts_with("/srv/publication/demo/attempts/"));
+    }
 }

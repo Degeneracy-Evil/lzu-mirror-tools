@@ -53,6 +53,12 @@ pub struct Server {
 pub struct Storage {
     pub mirror_root: PathBuf,
     pub spool_dir: PathBuf,
+    #[serde(default)]
+    pub publication_root: Option<PathBuf>,
+    #[serde(default)]
+    pub publication_max_private_generations: Option<u32>,
+    #[serde(default)]
+    pub publication_reserve_bytes: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]

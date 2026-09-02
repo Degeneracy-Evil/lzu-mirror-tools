@@ -1320,11 +1320,29 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
         .await?;
     s.metrics.polls.fetch_add(1, Ordering::Relaxed);
     s.notify.notify_waiters();
-    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, s.now_ms()).await? {
+    if let Some(a) = services::next_action_for_agent(
+        &s.store,
+        &node,
+        &r.mirror_root,
+        r.publication_root.as_deref(),
+        &r.capabilities,
+        s.now_ms(),
+    )
+    .await?
+    {
         return Ok(action(a).into_response());
     }
     let _ = tokio::time::timeout(s.poll_wait, s.notify.notified()).await;
-    if let Some(a) = services::next_action(&s.store, &node, &r.mirror_root, s.now_ms()).await? {
+    if let Some(a) = services::next_action_for_agent(
+        &s.store,
+        &node,
+        &r.mirror_root,
+        r.publication_root.as_deref(),
+        &r.capabilities,
+        s.now_ms(),
+    )
+    .await?
+    {
         return Ok(action(a).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -2161,6 +2179,8 @@ mod tests {
                 max_concurrent_runs: 1,
             },
             mirror_root: "/srv/mirrors".into(),
+            capabilities: vec![],
+            publication_root: None,
         };
         let unauthenticated = poll(State(state.clone()), HeaderMap::new(), Json(request.clone()))
             .await
