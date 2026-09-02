@@ -37,8 +37,22 @@ pub async fn reset_spool(config: &Config, acknowledged: bool) -> anyhow::Result<
     let _lock = process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))?;
     let mut removed = 0;
     let mut entries = fs::read_dir(&config.storage.spool_dir).await?;
+    let mut paths = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
+        paths.push(entry.path());
+    }
+    for path in paths
+        .iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+    {
+        let record = read(path)
+            .await
+            .map_err(|error| anyhow::anyhow!("cannot prove spool record {} safe to reset: {error}", path.display()))?;
+        if record.has_protected_publication_evidence() {
+            bail!("protected publication recovery evidence exists at {}", path.display());
+        }
+    }
+    for path in paths {
         if matches!(
             path.extension().and_then(|value| value.to_str()),
             Some("json" | "log" | "retired")
@@ -369,6 +383,15 @@ impl Agent {
             let Ok(mut record) = read(&path).await else {
                 continue;
             };
+            if record.requires_publication_recovery() {
+                tracing::warn!(
+                    run_id=%record.run_id,
+                    attempt=record.attempt,
+                    phase=?record.publication.as_ref().map(|publication| publication.phase),
+                    "publication recovery evidence bypassed generic Interrupted normalization"
+                );
+                continue;
+            }
             if !record.state.is_terminal() && record.cancel_requested {
                 record.terminal(AttemptState::Cancelled, None, None, None, now());
                 let _ = write(&path, &record).await;
@@ -395,6 +418,9 @@ impl Agent {
             .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
         {
             if let Ok(mut record) = read(&path).await {
+                if record.requires_publication_recovery() {
+                    continue;
+                }
                 if let Err(error) = self.reconcile(&path, &mut record).await {
                     tracing::debug!(%error, "background reconciliation deferred");
                 }
@@ -570,8 +596,8 @@ mod tests {
         routing::{post, put},
     };
     use lmt_core::{
-        AttemptNo, BundleFile, ConfigBundle, MirrorName, RunId, RunSpecContext, canonicalize_bundle,
-        compile_process_run_spec,
+        AtomicPublicationSpec, AttemptNo, BundleFile, ConfigBundle, MirrorName, RunId, RunSpecContext,
+        canonicalize_bundle, compile_process_run_spec,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -793,7 +819,14 @@ mod tests {
         fs::write(config.storage.spool_dir.join(INSTALLATION_ID_FILE), "installation-a\n")
             .await
             .expect("identity");
-        fs::write(config.storage.spool_dir.join("run-1.json"), "{}")
+        let record = SpoolRecord::accepted(
+            "run-1".into(),
+            1,
+            "hash".into(),
+            spec(&config.storage.mirror_root, "/bin/true", Vec::new(), 10),
+            now(),
+        );
+        write(&config.storage.spool_dir.join("run-1.json"), &record)
             .await
             .expect("state");
         fs::write(config.storage.spool_dir.join("run-1.log"), "output")
@@ -823,6 +856,59 @@ mod tests {
                 .expect("preserved mirror"),
             "authoritative mirror data"
         );
+    }
+
+    #[tokio::test]
+    async fn protected_publication_evidence_survives_reset_and_generic_restart_recovery() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        let config = agent.config.clone();
+        fs::create_dir_all(&config.storage.spool_dir).await.expect("spool");
+        let path = state_path(&config.storage.spool_dir, "run-atomic", 1);
+        let candidate = directory.path().join("publication/.lmt/candidates/demo/run-atomic-1");
+        let mut run_spec = spec(&config.storage.mirror_root, "/bin/true", Vec::new(), 10);
+        run_spec.target_dir = candidate.to_string_lossy().into_owned();
+        run_spec.publication = Some(Box::new(AtomicPublicationSpec {
+            mirror: "demo".into(),
+            publication_root: directory.path().join("publication").to_string_lossy().into_owned(),
+            published_dir: directory.path().join("publication/demo").to_string_lossy().into_owned(),
+            candidate_dir: candidate.to_string_lossy().into_owned(),
+            basis_dir: directory
+                .path()
+                .join("publication/.lmt/basis/demo")
+                .to_string_lossy()
+                .into_owned(),
+            exchange_dir: directory
+                .path()
+                .join("publication/.lmt/exchange/demo")
+                .to_string_lossy()
+                .into_owned(),
+            gc_dir: directory
+                .path()
+                .join("publication/.lmt/gc/demo")
+                .to_string_lossy()
+                .into_owned(),
+        }));
+        let mut record = SpoolRecord::accepted("run-atomic".into(), 1, "hash".into(), run_spec, now());
+        record.state = AttemptState::Running;
+        record.publication.as_mut().expect("publication state").phase = spool::PublicationPhase::ReadyToCommit;
+        write(&path, &record).await.expect("protected spool record");
+
+        agent.recover().await;
+        let recovered = read(&path).await.expect("recovered record");
+        assert_eq!(recovered.state, AttemptState::Running);
+        assert_eq!(
+            recovered.publication.expect("publication state").phase,
+            spool::PublicationPhase::ReadyToCommit
+        );
+        drop(agent);
+
+        let error = reset_spool(&config, true)
+            .await
+            .expect_err("protected reset must fail closed");
+        assert!(error.to_string().contains("protected publication recovery evidence"));
+        assert!(fs::try_exists(path).await.expect("state existence"));
     }
 
     #[tokio::test]

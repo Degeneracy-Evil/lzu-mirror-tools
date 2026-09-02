@@ -10,8 +10,9 @@ use nix::{
     fcntl::{RenameFlags, renameat2},
     unistd::fsync,
 };
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileIdentity {
     pub device: u64,
     pub inode: u64,
