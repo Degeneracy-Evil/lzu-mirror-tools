@@ -463,18 +463,29 @@ This does not permit unauthenticated Agent self-registration and does not move M
 
 ## Current open questions
 
-The remaining questions are intentionally deferred beyond M3 unless production-trial evidence requires earlier resolution:
+The controlled production trial and frozen M4 publication architecture closed
+the former publication-necessity, Mirror-identity, and large-host Tokio-policy
+questions.
 
-1. Stable API/version compatibility policy before the first public release.
-2. Final distribution/package/release artifact strategy.
-3. Whether the stable release should introduce multi-user operator identity/RBAC or retain one root operator credential.
-4. Whether a future release should parse rsync statistics into structured metrics; M3 explicitly does not.
-5. Whether measured real workloads justify stronger per-Attempt cgroup containment beyond the accepted Linux process-group contract.
-6. Whether measured Run-log storage behavior justifies application-level compression beyond transparent filesystem compression.
-7. Whether real concurrent rsync + serving requires an explicit staging/snapshot/publication layer.
-8. If publication is required, whether Mirror should represent a logical published resource separately from a physical Node-owned data tree.
-9. What minimal lifecycle/verification hooks are justified by real publication/operations requirements.
-10. Whether large-core-count production hosts justify an explicit bounded Tokio worker policy for Server and Agent.
+Remaining questions are:
+
+1. Stable API/version compatibility policy before the first public release,
+   beyond the frozen M3->M4 forward-upgrade window.
+2. Final distribution/package/release artifact strategy after the M4 local
+   installer is implemented.
+3. Whether the stable release should introduce multi-user operator identity/RBAC
+   or retain one root operator credential.
+4. Whether a future release should parse rsync statistics into structured
+   metrics; M4 does not require it.
+5. Whether measured real workloads justify stronger per-Attempt cgroup
+   containment beyond the accepted Linux process-group contract.
+6. Whether measured Run-log storage behavior justifies application-level
+   compression beyond transparent filesystem compression.
+7. Whether real repositories justify a first-class verification/lifecycle phase.
+   M4 deliberately keeps verification inside trusted custom commands and does not
+   add a generic workflow engine.
+
+Publication itself is no longer an open question: D049-D072 are accepted.
 
 ## Development principle
 

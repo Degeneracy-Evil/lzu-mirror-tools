@@ -428,3 +428,36 @@ Retries remain Attempts inside one Run. Retry delay is represented by persistent
 Node observed state adds max_concurrent_runs reported by the Agent. This remains local policy observed by the Server, not central placement configuration.
 
 For complete M2 semantics, see m2-design.md.
+
+
+## 13. M4 publication model extension
+
+M4 does not add a new public resource.
+
+Mirror is now explicitly interpreted as the **logical published mirror
+resource**, not one concrete directory inode/tree. The owner Node realizes that
+logical resource using its local storage.
+
+Publication remains an internal durable commit phase of an Attempt.
+
+For Direct mode, `{target_dir}` remains the live target.
+
+For Atomic mode, each Attempt writes a fresh private candidate and the Agent
+publishes it only through the frozen contract in
+`m4-publication-design.md`. AttemptSucceeded is emitted only after visibility
+commit and required namespace durability complete.
+
+Atomic mode also freezes these model rules:
+
+- Atomic rsync uses fresh-generation materialization semantics rather than
+  Direct existing-destination semantics.
+- Published/previous generations may share hard-linked inodes and are immutable
+  from LMT's perspective.
+- Same-Node Mirror targets may not overlap.
+- Ownership Move requires a quiescent Mirror and the quiescent check plus owner
+  update are one Store transaction.
+- Publication is not a public resource, generic workflow phase, replica model,
+  or automatic cross-node migration mechanism.
+
+For exact recovery, fencing, GC, compatibility, and filesystem semantics, the
+frozen `m4-publication-design.md` is authoritative.

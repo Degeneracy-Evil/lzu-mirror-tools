@@ -23,8 +23,15 @@ Before making implementation changes, read at minimum:
 15. `docs/m3-implementation-plan.md`
 16. `docs/code-review.md`
 17. `docs/decisions.md`
+18. `docs/m4-design.md`
+19. `docs/m4-publication-design.md`
+20. `docs/m4-implementation-plan.md`
 
-M1 is an accepted baseline. For M2-specific semantics, **`docs/m2-design.md` is authoritative** if an older generic document still contains M1-era wording that conflicts with it. Do not resolve such conflicts by guessing; preserve M2 Design behavior and update the narrower document when appropriate.
+M1/M2/M3 are accepted baselines. For M4 publication semantics,
+**`docs/m4-publication-design.md` is authoritative**. For implementation order
+and remaining M4 choices, follow **`docs/m4-implementation-plan.md`**. If an
+older generic document conflicts with an accepted newer decision, do not guess:
+preserve the newer accepted contract and update the narrower stale document.
 
 ## 2. Scope
 
@@ -32,28 +39,33 @@ Implement the current milestone only.
 
 M1, M2, and M3 are accepted implementation baselines.
 
-**There is currently no authorized M4 implementation target.** LMT should enter a controlled production trial before M4 design is frozen.
+**M4 is the current implementation target.** The publication architecture is
+frozen in `docs/m4-publication-design.md`; implementation must follow
+`docs/m4-implementation-plan.md`.
 
-Until M4 is explicitly designed and documented:
+M4 work must:
 
 - preserve all accepted M1/M2/M3 behavior and fault tests;
-- do not introduce M4/M5 features opportunistically;
-- maintenance fixes must remain compatible with the accepted M3 contracts;
-- production-trial evidence may motivate later design changes, but those changes must be documented before implementation.
+- implement only the frozen M4 publication, installer/upgrade, Agent shutdown,
+  bounded-runtime, compatibility, and release-hardening scope;
+- not weaken publication write-ahead, fence, GC protected-set, or transactional
+  Move invariants for implementation convenience;
+- keep Direct mode backward-compatible through the supported M4 Server + M3
+  Agent rolling-upgrade window.
 
-Do not implement deferred features such as:
+Do not implement deferred M5 features such as:
 
 - generic plugin SDK;
-- automatic placement;
-- cross-node failover;
-- storage orchestration;
-- snapshot/publication engine;
+- automatic placement or cross-node failover;
+- multiple storage pools/orchestration;
+- filesystem-specific snapshot backends;
 - PostgreSQL/controller HA;
 - OIDC/RBAC;
 - container runner;
-- workflow/DAG system.
+- workflow/DAG system;
+- generic verification pipelines.
 
-unless the design documents are explicitly changed first.
+unless a later accepted design explicitly authorizes them.
 
 ## 3. Architecture boundaries
 
@@ -154,7 +166,7 @@ Do not allow design documents and implementation to intentionally drift.
 
 ## 9. Development workflow
 
-M3 is complete and accepted. Do not begin M4 implementation until M4 design documents explicitly authorize a new milestone. During the production trial, prefer small maintenance fixes and evidence collection over feature expansion.
+M3 is complete and accepted. M4 is now the active milestone. Work through `docs/m4-implementation-plan.md` in order; do not skip release gates or start M5 work opportunistically.
 
 Work in small vertical slices and logical commits.
 

@@ -20,8 +20,11 @@ Recommended reading order:
 16. [Development Roadmap](roadmap.md) — implementation milestones.
 17. [Code Review Guide](code-review.md) — invariants to enforce during review.
 18. [Architecture Decisions](decisions.md) — accepted decisions and remaining questions.
+19. [M4 Design](m4-design.md) — current production-architecture/release-hardening milestone.
+20. [M4 Publication Architecture](m4-publication-design.md) — frozen atomic-publication contract.
+21. [M4 Implementation Plan](m4-implementation-plan.md) — ordered M4 development plan and release gates.
 
-For the current milestone, `m3-design.md` is authoritative for M3-specific behavior. Accepted M1/M2 contracts remain regression baselines unless an explicit newer Architecture Decision changes them.
+For the current milestone, `m4-design.md`, the frozen `m4-publication-design.md`, and `m4-implementation-plan.md` are authoritative for M4 behavior. Accepted M1/M2/M3 contracts remain regression baselines unless an explicit newer Architecture Decision changes them.
 
 The documentation is intentionally detailed. LMT is a long-lived infrastructure project, so behavior should be designed and testable before implementation complexity accumulates.
 
@@ -52,5 +55,6 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 
 - [Production Trial Plan](production-trial.md) — host requirements, test phases, evidence collection, and publication/snapshot architecture watchlist.
 
-- [M4 design draft](m4-design.md) - post-trial publication, deployment, and runtime-hardening design.
-- [M4 publication architecture](m4-publication-design.md) - detailed post-trial atomic publication proposal.
+- [M4 Design](m4-design.md) — post-trial publication, deployment, and runtime-hardening design.
+- [M4 Publication Architecture](m4-publication-design.md) — frozen atomic publication contract.
+- [M4 Implementation Plan](m4-implementation-plan.md) — implementation order, compatibility profile, recovery/GC gates, installer, and runtime polish.

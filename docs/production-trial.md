@@ -1,8 +1,8 @@
 # Controlled Production Trial
 
-Status: active after M3 acceptance.
+Status: **complete**. Architecture-critical manual checks concluded on 2026-09-02.
 
-Purpose: validate the accepted M3 system on realistic Linux hosts before M4 design. This phase is evidence collection, not feature expansion.
+Purpose: validate the accepted M3 system on realistic Linux hosts before M4 design. This document now serves as the historical evidence record that motivated the frozen M4 publication architecture in `m4-publication-design.md`.
 
 ## 1. Test host
 
@@ -168,7 +168,7 @@ For performance observations also capture active Run/rsync counts, CPU, memory, 
 
 The purpose is to separate control-plane limits from disk/network/upstream limits.
 
-## 9. Questions before M4
+## 9. Questions that guided M4
 
 1. Is one Server operationally sufficient at real mirror scale?
 2. Does Server unavailability cause meaningful freshness problems?
@@ -181,7 +181,7 @@ The purpose is to separate control-plane limits from disk/network/upstream limit
 9. What lifecycle steps are actually required around synchronization?
 10. Which M3 operator workflows deserve M4 polish?
 
-M4 should be designed from these answers rather than hypothetical scalability concerns.
+These questions were used as evidence gates for M4. The publication and runtime-policy questions have since been resolved in the accepted M4 decisions; unresolved product questions remain tracked in `decisions.md`.
 
 ## 10. Trial findings
 

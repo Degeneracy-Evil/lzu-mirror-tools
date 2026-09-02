@@ -402,14 +402,16 @@ private:
 Each Attempt is built in a fresh `attempts/<run>-<attempt>/root` candidate.
 
 Immediately before an update commit, the Agent prepares one fixed private
-`exchange/` slot:
+`exchange/` slot while holding the per-Mirror publication lock:
 
-1. any stable previous generation currently in `exchange/` is renamed to a
+1. persist `preparing_exchange` durably with the candidate, published,
+   stable-previous, and planned rotation identities;
+2. only then rename any stable previous generation from `exchange/` to its
    uniquely named protected GC path;
-2. the fresh candidate is renamed into `exchange/`;
-3. the new candidate identity and all rotated paths are persisted in the durable
-   `ready_to_commit` spool record;
-4. the visibility commit is:
+3. rename the fresh candidate into `exchange/`;
+4. persist the resulting namespace identities durably as `ready_to_commit`;
+5. recheck cancellation and commit preconditions under the same lock;
+6. the visibility commit is:
 
 ~~~text
 RENAME_EXCHANGE(

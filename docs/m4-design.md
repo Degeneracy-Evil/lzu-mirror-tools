@@ -102,17 +102,20 @@ Conceptually:
 ~~~text
 Run
  |
- +-- Sync Attempt 1
- |      Failed
+ +-- Attempt 1
+ |     sync -> Failed
  |
- +-- Sync Attempt 2
- |      Succeeded
- |
- +-- Publication
-        Published
+ +-- Attempt 2
+       prepare candidate
+       -> sync
+       -> durable publication commit
+       -> Succeeded
  |
  +-- Run Succeeded
 ~~~
+
+Publication is part of the successful Attempt; it is not a separate public
+resource or Server-side state machine.
 
 ### Publication is not a new top-level user resource
 
@@ -130,13 +133,13 @@ M4 should use a fixed lifecycle:
 prepare candidate
       |
       v
-sync Attempts
+sync Attempt
       |
       v
-publish
+durable publication commit
       |
       v
-best-effort cleanup
+bounded GC / admission maintenance
 ~~~
 
 Repository-specific verification pipelines, arbitrary hooks, and DAG/workflow execution remain deferred.

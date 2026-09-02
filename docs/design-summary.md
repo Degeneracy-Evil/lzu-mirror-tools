@@ -306,6 +306,7 @@ These should be treated as non-negotiable unless an explicit future design decis
 12. Run logs are centralized but not SQLite BLOBs.
 13. Repository semantics stay out of Agent execution code.
 14. Complexity requires a demonstrated operational need.
+15. For M4 Atomic Mirrors, the private candidate is never exposed before the frozen write-ahead/visibility/durability contract permits publication; recovery evidence is fail-closed.
 
 ## 15. What is deliberately deferred
 
@@ -315,7 +316,7 @@ Not part of the initial architecture:
 - automatic placement;
 - cross-node failover;
 - storage orchestration;
-- snapshot/publication engine;
+- filesystem-specific snapshot publication backends;
 - PostgreSQL/controller HA;
 - OIDC/RBAC;
 - container runner;
@@ -327,15 +328,20 @@ These can be reconsidered after LZU and community deployments establish real req
 
 M1, M2, and M3 are accepted implementation baselines.
 
-M3 is accepted at `8d0c032c37d6bb34c1e398e6d68e31c20ef28881` and LMT may now enter a controlled LZU production trial.
+The controlled LZU production trial is complete. M4 is the active milestone.
+Its atomic-publication architecture is frozen after adversarial review.
 
-For M3 work, read:
+For M4 work, read:
 
-- `m3-design.md` as the authoritative behavioral specification;
-- `m3-implementation-plan.md` for M3.0 through M3.9 development order;
-- `operations/` for production-trial runbooks;
-- `code-review.md` for release-review gates.
+- `m4-design.md` for milestone scope;
+- `m4-publication-design.md` as the frozen publication contract;
+- `m4-implementation-plan.md` for implementation order and release gates;
+- `decisions.md` for D049-D072 and earlier accepted decisions;
+- `operations/` for existing M3 production assumptions that remain regression
+  baselines.
 
-M3 deliberately preserves the accepted scheduler/execution model and adds operational safety: credential lifecycle, Agent fencing, backup/restore, log lifecycle, bounded observability, CLI ergonomics, diagnostics, and service hardening.
+M4 preserves the accepted scheduler/control-plane architecture while adding
+atomic local publication, reproducible installation/upgrade, forward rolling
+compatibility, responsive Agent shutdown, and a bounded Tokio runtime policy.
 
 When implementation evidence exposes a bad assumption, update the design and Architecture Decisions explicitly before changing the contract in code.
