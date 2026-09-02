@@ -563,3 +563,19 @@ state_lock_busy
 ~~~
 
 API error codes are mapped to documented CLI exit categories.
+
+## 33. Fresh-install Node enrollment
+
+For M3 production-trial maintenance, the first operator-authenticated credential issue is also the Node bootstrap boundary:
+
+~~~text
+POST /api/v1alpha1/nodes/{node}/credentials
+~~~
+
+If `{node}` is a valid Node name but no Node record exists yet, the Server atomically creates an offline/unbound Node record and the requested credential.
+
+This endpoint does not create Mirror ownership or mark the Node online.
+
+The first successfully authenticated Agent poll later establishes observed state and the durable Agent installation binding.
+
+Unauthenticated Agent self-registration remains forbidden.

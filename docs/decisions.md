@@ -448,6 +448,18 @@ M3 does not add imperative CLI commands that mutate Mirror enabled state outside
 
 Operational CLI convenience must not create config drift.
 
+### D048 - first Agent credential issuance bootstraps the Node record
+
+Status: accepted after controlled-production-trial finding T001.
+
+A clean LMT control plane must be able to enroll its first Agent without legacy inline credentials.
+
+An operator-authenticated credential issue for a valid Node name atomically ensures the Node record exists and creates the new credential.
+
+The Node is still considered offline and has no Agent installation binding until the first successfully authenticated poll. The first valid poll establishes the durable binding according to D037.
+
+This does not permit unauthenticated Agent self-registration and does not move Mirror ownership out of TOML configuration.
+
 
 ## Current open questions
 

@@ -22,6 +22,8 @@ A failed reload keeps the previous credential active.
 
 Agent credentials are centrally issued and revoked.
 
+On a clean installation, issuing the first credential for a valid Node name also establishes that Node as an offline/unbound control-plane record. The Agent does not self-register; its first authenticated poll supplies observed state and establishes the durable installation binding.
+
 A Node may have more than one active credential so rotation can overlap safely.
 
 Typical workflow:

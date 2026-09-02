@@ -182,3 +182,41 @@ The purpose is to separate control-plane limits from disk/network/upstream limit
 10. Which M3 operator workflows deserve M4 polish?
 
 M4 should be designed from these answers rather than hypothetical scalability concerns.
+
+## 10. Trial findings
+
+### T001 - fresh-install Agent enrollment bootstrap gap
+
+Observed during the first n01 deployment on 2026-09-02.
+
+Accepted M3 behavior before the trial required `POST /nodes/{node}/credentials` to target an existing Node row. A fresh control plane has no Node rows, while a new Agent cannot poll until it has a credential. Configuration apply also does not establish Node rows.
+
+This creates a bootstrap cycle on a clean install.
+
+Resolution contract:
+
+- the first operator-authenticated credential issue for a valid Node name may create the Node record atomically with the credential;
+- the new Node remains offline/unbound until its first authenticated Agent poll;
+- first valid Agent poll establishes the durable Agent installation binding;
+- no unauthenticated Agent self-registration is introduced;
+- legacy inline credentials are not required for fresh installation.
+
+This is a trial-driven maintenance fix inside the accepted M3 architecture, not M4 scope.
+
+### T002 - shared /etc/lmt directory traversal
+
+Observed during the same deployment.
+
+A shared `/etc/lmt` directory owned `root:lmt` with mode `0750` prevents the separate `lmt-agent` service user from traversing the directory, even if its own files are `root:lmt-agent 0640`.
+
+Production-trial layout is therefore:
+
+~~~text
+/etc/lmt/                    root:root      0755
+/etc/lmt/server.toml         root:lmt       0640
+/etc/lmt/operator.token      root:lmt       0640
+/etc/lmt/agent.toml          root:lmt-agent 0640
+/etc/lmt/agent.token         root:lmt-agent 0640
+~~~
+
+Directory traversal is public; secret contents remain protected by file ownership/mode.

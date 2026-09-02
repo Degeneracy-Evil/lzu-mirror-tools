@@ -9,6 +9,7 @@ It is not yet a distribution packaging guide.
 Recommended ownership:
 
 ~~~text
+/etc/lmt/                     root:root      0755
 /etc/lmt/server.toml          root:lmt       0640
 /etc/lmt/operator.token       root:lmt       0640
 
@@ -104,3 +105,5 @@ Mirror documents live under `config/nodes/mirror01/mirrors/`:
 Review source URLs, target names, deletion semantics, time zones, timeouts, and
 the command executable before applying them. The `archive.example.org` sources
 are documentation placeholders.
+
+The shared `/etc/lmt` directory must be traversable by both service users. Keep the directory `root:root 0755`; protect secrets and service-specific configuration with the individual file modes above.
