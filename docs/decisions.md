@@ -480,55 +480,107 @@ The remaining questions are intentionally deferred beyond M3 unless production-t
 
 When choosing between a broader abstraction and a smaller design, prefer the smaller design until a real mirror workload demonstrates the need for the abstraction.
 
-
 ## Proposed M4 decisions
 
-These are design proposals and are not implementation authorization until the M4 architecture review is accepted.
+These remain design proposals. The adversarial M4 review requested changes, and
+this section now reflects revision 2.
 
 ### D049 - Mirror denotes the logical published mirror resource
 
 Status: proposed.
 
-Mirror identity is not tied to one concrete directory inode or historical synchronization tree. The current owner Node realizes the Mirror using local storage. Ownership Move does not imply data migration or deletion.
+Mirror identity is not tied to one concrete directory inode or historical
+synchronization tree.
 
-### D050 - Atomic publication is an Attempt commit phase, not a new public resource
+### D050 - Atomic publication is an Attempt commit phase
 
 Status: proposed.
 
-For atomic Mirrors, one Attempt consists of candidate preparation, synchronization, and a local atomic publication commit. AttemptSucceeded is emitted only after commit. No Publication table, public Publication state machine, or generic workflow engine is introduced.
+For atomic Mirrors, AttemptSucceeded is emitted only after synchronization,
+atomic visibility commit, and namespace durability complete. No public
+Publication resource/state machine is introduced.
 
 ### D051 - M4 atomic publication uses real-directory exchange
 
 Status: proposed.
 
-The M4 generic backend keeps the public target as a real directory and commits by Linux renameat2(RENAME_EXCHANGE). First publication uses a no-overwrite rename. Symlink-current, bind-mount, and filesystem-specific snapshot publication are not the M4 default.
+M4 uses fresh private candidates plus Linux renameat2(RENAME_EXCHANGE) for
+existing published directories and no-overwrite rename for first publication.
 
 ### D052 - Atomic candidates are fresh per Attempt
 
 Status: proposed.
 
-Every Attempt writes to a new private candidate. Interrupted/failed candidates are never reused by later Attempts. The current published tree is never the destination of future LMT synchronization in atomic mode.
+Failed/interrupted candidates are never reused by later Attempts and the
+currently published tree is never an LMT synchronization destination in atomic
+mode.
 
-### D053 - Built-in rsync may reuse published data through an LMT-owned link-dest basis
-
-Status: proposed.
-
-Atomic rsync uses a fresh destination hierarchy and an LMT-controlled --link-dest basis to reduce data duplication. Rsync options that conflict with fresh-candidate or hard-link isolation semantics are rejected in atomic mode.
-
-### D054 - One previous local published tree is retained internally
+### D053 - Atomic built-in rsync uses fresh-generation materialization semantics
 
 Status: proposed.
 
-After successful exchange, the old published tree becomes an internal previous generation. Older retired data is garbage-collected asynchronously. There is no automatic rollback API in M4.
+Atomic rsync intentionally differs from direct existing-destination semantics.
+It uses an LMT-controlled link-dest basis and accepts only an audited atomic
+rsync option profile.
 
-### D055 - Atomic publication capability is explicit
-
-Status: proposed.
-
-Agents advertise an atomic-exchange capability. Server must not dispatch an atomic spec to an Agent that has not advertised support. Mixed-version upgrades are Server-first.
-
-### D056 - Mirror targets may not overlap on one owner Node
+### D054 - Hard-linked atomic generations are immutable
 
 Status: proposed.
 
-Exact or ancestor/descendant target overlap on the same Node is rejected because independent Run lifecycles must not mutate or exchange the same serving subtree.
+Published/previous atomic generations may share inodes and are therefore
+immutable from LMT's perspective and must be treated as immutable by operators.
+Previous is a namespace generation, not an isolated snapshot.
+
+### D055 - M4 version compatibility is forward-only
+
+Status: proposed.
+
+Supported rolling upgrade is M3 Server+Agent -> M4 Server+M3 Agent Direct ->
+M4 Server+M4 Agent. M3 Server+M4 Agent is unsupported. Downgrade is offline
+restore/runbook, not in-place Server rollback.
+
+### D056 - Mirror targets may not overlap on one Node
+
+Status: proposed.
+
+Exact or ancestor/descendant target overlap on one owner Node is rejected.
+
+### D057 - Publication separates visibility from durability
+
+Status: proposed.
+
+Visibility commit is the successful atomic rename/exchange. AttemptSucceeded is
+not emitted until required parent-directory fsync completes. M4 guarantees
+atomic local visibility and daemon/process crash recovery, not recursive
+power-loss durability of all repository data.
+
+### D058 - Managed atomic published paths have one supported namespace writer
+
+Status: proposed.
+
+LMT is the only supported namespace writer for a managed atomic target.
+Inode/device checks are best-effort invariant detection, not compare-and-swap.
+
+### D059 - Move requires a quiescent Mirror
+
+Status: proposed.
+
+A Mirror with a Pending or Running Run cannot change owner Node. Move
+acknowledgement cannot override this safety gate.
+
+### D060 - Atomic GC and storage health are bounded correctness concerns
+
+Status: proposed.
+
+Stale private generations cannot accumulate indefinitely. GC backlog, cleanup
+failure, free-space health, and admission blocking are explicit operational
+semantics.
+
+### D061 - M4 upgrade is Server-first and downgrade is restore-based
+
+Status: proposed.
+
+Before M4 rollout, operators create a control-plane backup. Server upgrades
+first, old Agents continue Direct work, then Agents upgrade and advertise atomic
+capability. Returning to M3 uses offline restore of compatible pre-M4 state and
+matching binaries rather than binary rollback over M4 state.

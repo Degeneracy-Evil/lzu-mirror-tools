@@ -165,9 +165,9 @@ The selected M4 generic mechanism is:
 3. one previous tree retained internally;
 4. filesystem-specific snapshot/clone mechanisms remain future optimizations.
 
-The mechanism must satisfy all of these:
+The mechanism must satisfy the revised contract in `docs/m4-publication-design.md`. In particular, M4 distinguishes atomic visibility, namespace durability, and full power-loss data durability. The mechanism must satisfy all of these:
 
-- live serving tree is never partially updated by synchronization;
+- the private candidate is never exposed before one atomic visibility commit;
 - publication switch is atomic for pathname resolution;
 - Agent/Server crash after the switch is recoverable without accidentally switching back;
 - retry cannot overlap a writer with the published generation;

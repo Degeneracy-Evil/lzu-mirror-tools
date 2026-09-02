@@ -1,12 +1,16 @@
 # M4 Publication Architecture Design
 
-Status: **proposed for M4 design review**.
+Status: **proposed revision 2 after adversarial review**.
 
-This document is the detailed architecture proposal derived from the controlled LZU production trial. It is not an implementation authorization.
+This document is not frozen and does not authorize implementation.
 
-## 1. Evidence and problem statement
+The revision addresses the release blockers raised in the adversarial review:
+crash durability, fresh-generation rsync semantics, hard-link immutability,
+Move races, and forward-only version compatibility.
 
-The production trial demonstrated that the current direct model:
+## 1. Problem proven by the production trial
+
+The controlled LZU trial demonstrated that:
 
 ~~~text
 rsync -> serving tree <- nginx
@@ -14,104 +18,176 @@ rsync -> serving tree <- nginx
 
 is operationally reliable but not repository-atomic.
 
-In the real kernel.org + Nginx experiment, rsync replaced different files at different times. This means clients can observe a local serving tree composed from more than one synchronization generation.
+Different files become visible at different times, so clients may observe a local
+tree composed from more than one synchronization generation.
 
-The problem is therefore not process execution reliability. It is publication visibility.
+M4 solves this local publication problem only.
 
-M4 should solve exactly this problem without turning LMT into a workflow engine, storage orchestrator, or filesystem-specific platform.
+It does not turn LMT into a repository transaction engine, workflow system,
+storage orchestrator, or traffic manager.
 
 ## 2. Consistency contract
 
 Atomic publication provides this guarantee:
 
-> LMT never exposes the candidate synchronization tree through the configured published path before the publication commit. The published path changes from the previous complete local tree to the new complete local tree through one atomic namespace operation.
+> LMT does not expose the private candidate through the configured published
+> path before the visibility commit. The published pathname changes from the
+> previous complete local tree to the candidate complete local tree through one
+> atomic namespace operation.
 
-The guarantee is intentionally narrower than transactional repository sessions.
+The guarantee does not include:
 
-It does **not** guarantee:
+- multi-request client session consistency;
+- upstream point-in-time snapshot consistency;
+- recursive durability of all candidate file data across sudden power loss;
+- immediate invalidation of Nginx or another server's open-file cache;
+- atomicity across several Mirrors;
+- semantic repository validation beyond the configured synchronization command.
 
-- that a client making several HTTP requests is pinned to one generation;
-- that a request already holding an old file descriptor switches to the new generation;
-- that Nginx or another serving layer immediately invalidates its own open-file cache;
-- that the upstream rsync source itself is a point-in-time snapshot;
-- semantic repository validity beyond the synchronization program returning success;
-- atomicity across several different Mirrors.
+The guarantee is therefore:
 
-This distinction is fundamental.
+~~~text
+atomic local namespace visibility
++
+daemon/process crash recovery
+~~~
 
-LMT prevents a partially synchronized **local candidate** from becoming the live serving tree. It cannot manufacture source-side snapshot consistency or cross-request session consistency.
+not:
 
-Nginx has `open_file_cache off` by default. If an operator enables open-file caching, an old open descriptor may remain visible until Nginx revalidates it. That is serving-cache staleness, not candidate-tree leakage.
+~~~text
+full power-loss transactional repository durability
+~~~
 
-## 3. Mirror identity
+## 3. Three distinct commit concepts
 
-M4 should freeze this definition:
+M4 explicitly separates three boundaries.
 
-> A Mirror is the logical synchronized-and-published mirror resource.
+### 3.1 Synchronization completion
 
-A Mirror is not identified with one concrete directory inode or one historical synchronized tree.
+The configured process exits successfully and the candidate is complete according
+to that synchronization program.
 
-The current owner Node realizes that logical resource using local storage.
+No public path has changed yet.
 
-Consequences:
+### 3.2 Visibility commit
 
-- Mirror identity survives Run retries;
-- Mirror identity survives config-generation changes;
-- an ownership Move does not create a new Mirror;
-- a Move changes the owner of future synchronization/publication work only;
-- old data on the previous Node remains ordinary unmanaged physical data until an operator handles it.
+For an existing published tree:
 
-M4 does not introduce Replica or PhysicalMirror as first-class resources. They still have no independent v1 lifecycle.
+~~~text
+renameat2(RENAME_EXCHANGE)
+~~~
 
-## 4. Publication is not a top-level resource
+successfully exchanges the candidate pathname and the published pathname.
 
-The first M4 draft considered a durable Publication record nested under Run.
+This is the publication linearization point.
 
-The smaller design is better:
+For first publication, the equivalent visibility commit is a no-overwrite rename
+of the candidate into an absent published path.
 
-> publication commit is the final local phase of an Attempt.
+### 3.3 Namespace durability boundary
 
-An Attempt means one physical attempt to realize the Run on its owner Node.
+After the visibility commit, the Agent fsyncs the directory metadata needed to
+make the pathname update durable under normal local-filesystem semantics.
+
+AttemptSucceeded is not emitted until this boundary completes.
+
+This fsync is not a recursive fsync of a multi-terabyte repository.
+
+M4 therefore does not promise that every newly synchronized file byte survives
+an arbitrary sudden power loss merely because the Run had succeeded.
+
+## 4. Crash and power-loss contract
+
+### Daemon/process crash before visibility commit
+
+The old published tree remains visible.
+
+Recovery reconciles the durable Agent spool with the Server before any commit.
+
+A retry uses a fresh Attempt candidate.
+
+### Daemon/process crash after visibility commit but before namespace durability
+
+The candidate may already be visible at the published path.
+
+The durable spool records the candidate identity and the internal phase.
+
+On restart, the Agent identifies which pathname contains the candidate, completes
+the required directory fsync operations, and only then reports AttemptSucceeded.
+
+It must not re-run synchronization or automatically exchange back to the old tree.
+
+### Directory fsync error after visibility commit
+
+A post-visibility fsync failure is not treated as an ordinary retryable sync
+failure because publication may already be visible.
+
+The Attempt remains locally owned in an internal
+`visible_pending_durability` recovery phase.
+
+The Agent:
+
+- keeps the public Run non-terminal;
+- retries the durability operation;
+- reports critical health/diagnostic state;
+- blocks another atomic Attempt for that Mirror until the ambiguity is resolved.
+
+M4 does not invent a public Run state for this rare storage fault.
+
+### Sudden power loss
+
+M4 does not claim a full power-loss transaction.
+
+After reboot the Agent recovers from the filesystem state that survived:
+
+- if the candidate identity is at the published path, it completes namespace
+  durability/reconciliation and converges toward success;
+- if the candidate remains private, the visibility commit did not survive and
+  normal pre-commit reconciliation applies;
+- if identity evidence is inconsistent or missing, the Mirror enters a
+  fail-closed local publication-health condition and new atomic Attempts are
+  blocked until operator repair.
+
+M4 does not recursively fsync every candidate file and therefore makes no
+stronger data-durability claim.
+
+## 5. Mirror identity
+
+A Mirror is the logical synchronized-and-published mirror resource.
+
+It is not one concrete directory inode or one historical synchronized tree.
+
+The current owner Node realizes the Mirror using local storage.
+
+Ownership Move changes future control-plane ownership. It does not migrate data,
+delete the previous Node's data, redirect Nginx, or switch external traffic.
+
+## 6. Publication remains an Attempt commit phase
+
+Publication is not a top-level public resource.
 
 For direct mode:
 
 ~~~text
 Attempt
-  |
-  +-- execute process
-  |
-  +-- terminal result
+  -> execute process
+  -> terminal result
 ~~~
 
 For atomic mode:
 
 ~~~text
 Attempt
-  |
-  +-- prepare fresh candidate
-  |
-  +-- execute process into candidate
-  |
-  +-- publication commit
-  |
-  +-- terminal result
+  -> prepare fresh candidate
+  -> execute process into candidate
+  -> visibility commit
+  -> namespace durability boundary
+  -> terminal result
 ~~~
 
-The Agent reports `AttemptSucceeded` only after the publication commit is complete.
+The Agent reports AttemptSucceeded only after the durability boundary.
 
-Therefore the existing public projection remains valid:
-
-~~~text
-Attempt Succeeded -> Run Succeeded
-~~~
-
-No new public Run state, Publication resource, Publication scheduler, or generic phase/DAG model is required.
-
-The publication recovery phase exists only in the Agent durable spool because it is local execution ownership state.
-
-## 5. Public state machine remains small
-
-The public Attempt states remain:
+The public Attempt states remain unchanged:
 
 ~~~text
 Queued
@@ -125,165 +201,79 @@ Interrupted
 Rejected
 ~~~
 
-Atomic publication uses internal durable Agent phases such as:
+Internal durable phases are Agent-spool implementation state, not protocol
+lifecycle states.
 
-~~~text
-prepared
-executing
-ready_to_commit
-committed
-~~~
+## 7. Selected generic backend
 
-These are not wire-visible Attempt states.
+M4 keeps the public target as a real directory and uses Linux
+`renameat2(RENAME_EXCHANGE)` for updates.
 
-`Running` covers both process execution and publication commit.
-
-This avoids exposing implementation phases as user-visible lifecycle states.
-
-## 6. Publication linearization point
-
-For atomic mode, the publication linearization point is the successful atomic namespace switch.
-
-Before that operation:
-
-- old published tree remains authoritative;
-- candidate is private;
-- cancellation may prevent publication.
-
-After that operation:
-
-- new published tree is authoritative;
-- publication must never be automatically rolled back because Server state appears stale;
-- restart recovery must converge toward reporting success for that committed Attempt.
-
-The filesystem commit, not a later HTTP event, defines which tree is live.
-
-## 7. Selected generic backend: directory exchange
-
-M4 should implement one generic Linux publication backend first:
-
-> fresh candidate directory + `renameat2(RENAME_EXCHANGE)`.
-
-Assume:
+Example:
 
 ~~~text
 mirror_root      = /srv/mirrors
 publication_root = /srv/lmt-publication
-~~~
 
-A Mirror named `ubuntu` with target `ubuntu` uses:
-
-~~~text
 published:
 /srv/mirrors/ubuntu
 
 private:
-/srv/lmt-publication/ubuntu/
-├── attempts/
-│   └── <run>-<attempt>/
-│       ├── root/
-│       └── basis
-├── previous/
-└── gc-*/
+/srv/lmt-publication/ubuntu/attempts/<run>-<attempt>/root
 ~~~
 
-### Existing published tree
-
-After the candidate has completed successfully:
+After successful synchronization:
 
 ~~~text
 RENAME_EXCHANGE(
-  /srv/lmt-publication/ubuntu/attempts/<id>/root,
-  /srv/mirrors/ubuntu
+    candidate,
+    published
 )
 ~~~
 
-The operation atomically exchanges the two directory entries.
-
-After the exchange:
+After the visibility commit:
 
 ~~~text
-/srv/mirrors/ubuntu
-    = new published tree
-
-.../attempts/<id>/root
-    = old published tree
+published path = new tree
+candidate path = old published tree
 ~~~
 
-The public path remains a normal directory.
+First publication uses a no-overwrite rename into an absent target.
 
-### First publication
+The public pathname remains a normal directory.
 
-If the public target does not yet exist, publication uses a no-overwrite rename:
+## 8. Why directory exchange remains preferred
 
-~~~text
-candidate -> published
-~~~
+Compared with an atomic symlink pointer, directory exchange does not change the
+public target into a symlink and does not introduce serving-policy dependencies
+such as Nginx symlink restrictions.
 
-The operation must fail rather than unexpectedly replacing a path that appeared concurrently.
+Compared with bind mounts, it does not require CAP_SYS_ADMIN or mount lifecycle
+management.
 
-## 8. Why directory exchange is preferred
+Compared with Btrfs/ZFS snapshots, it keeps the M4 semantic contract independent
+of one storage stack.
 
-### Versus an atomic symlink pointer
-
-A symlink pointer is simpler to inspect after a crash, but it changes the public target from a real directory into a symlink.
-
-That introduces serving-policy dependencies such as Nginx `disable_symlinks`, changes the expectations of external tools, and makes migration of an existing live directory less elegant.
-
-Directory exchange keeps:
-
-~~~text
-/srv/mirrors/<target>
-~~~
-
-as a real directory forever.
-
-Existing direct-mode data can become the first basis without an offline symlink migration.
-
-### Versus bind mounts
-
-Bind-mount publication requires mount-management privileges and creates new interactions with mount namespaces, systemd sandboxing, propagation, and recovery.
-
-LMT does not need CAP_SYS_ADMIN merely to publish files.
-
-### Versus Btrfs/ZFS snapshots
-
-Btrfs and ZFS snapshots are excellent storage-specific optimization mechanisms.
-
-Btrfs snapshots are CoW subvolumes; ZFS snapshots provide atomic point-in-time dataset snapshots.
-
-However, making either one the M4 semantic foundation would couple the core architecture to storage selection and would require additional mount/dataset lifecycle management.
-
-The M4 semantic contract should remain filesystem-independent.
-
-Snapshot/reflink publication backends may be added later as optimizations if production measurements justify them.
+Filesystem-native CoW/snapshot backends remain possible future optimizations.
 
 ## 9. Filesystem requirements
 
 Atomic-exchange mode requires:
 
 - Linux;
-- a local filesystem with working atomic rename semantics;
 - `mirror_root` and `publication_root` on the same mounted filesystem;
-- `RENAME_EXCHANGE` support;
-- both roots writable where required by the Agent;
-- published targets must be ordinary directories or absent;
-- published targets must not be mount points;
-- `publication_root` must not be inside the publicly served `mirror_root`.
+- successful real probes for the required rename flags;
+- valid ordinary directory targets or an absent first-publication target;
+- `publication_root` outside the publicly served `mirror_root`;
+- local storage semantics suitable for the backend.
 
-The Agent should not infer support from filesystem names.
+The Agent probes behavior rather than trusting filesystem-name strings.
 
-It should perform a real preflight probe using disposable directories.
-
-If the probe fails, atomic work is rejected before synchronization starts.
-
-Direct publication remains available on unsupported storage.
-
-Network filesystems are out of scope for the M4 atomic-exchange backend.
+Network filesystems are outside the M4 atomic-exchange contract.
 
 ## 10. Agent storage configuration
 
-Agent configuration gains one explicit optional path:
+Atomic publication introduces one explicit private root:
 
 ~~~toml
 [storage]
@@ -292,541 +282,463 @@ publication_root = "/srv/lmt-publication"
 spool_dir = "/var/lib/lmt-agent/spool"
 ~~~
 
-`publication_root` is required only for Mirrors using atomic publication.
+No private `.lmt` hierarchy is placed under the served mirror root.
 
-No implicit `.lmt` directory is created inside the served mirror root.
-
-This protects private candidates from accidental HTTP exposure and follows the project's preference for visible configuration.
+A storage-safety reserve/admission policy must be frozen in the implementation
+plan before code is accepted.
 
 ## 11. Mirror configuration
 
-Publication is an explicit desired-state property:
+Publication is explicit desired state:
 
 ~~~toml
 [publication]
 mode = "atomic"
 ~~~
 
-Default remains:
+Absent publication configuration remains direct mode.
 
-~~~toml
-[publication]
-mode = "direct"
-~~~
+Changing direct <-> atomic is a high-impact config change because atomic rsync
+also has different destination semantics.
 
-or equivalently the section may be absent.
+Publication-mode changes require the Mirror to be quiescent.
 
-This preserves backward compatibility.
+## 12. Atomic rsync has fresh-generation materialization semantics
 
-Atomic mode requests a consistency guarantee, not a particular filesystem technology.
+This is an explicit M4 contract.
 
-The Agent's local capability determines whether it can satisfy that guarantee.
+Atomic rsync does **not** preserve direct mode's existing-destination semantics.
 
-## 12. Candidate semantics
+Each Attempt starts with an empty candidate hierarchy.
 
-Every Attempt receives a fresh candidate directory.
+The candidate represents a freshly materialized generation selected from the
+upstream by the configured rsync selection/preservation rules.
 
-A candidate is never reused by another Attempt.
+Therefore:
 
-An interrupted or failed candidate is never resumed as the destination of a later Attempt.
+- local files that exist only in the previous published tree do not carry
+  forward automatically;
+- excluded/protected old destination files do not survive merely because they
+  existed in the previous tree;
+- delete semantics against old destination contents are not the governing
+  model;
+- receiver-state options that depend on a preexisting candidate are not
+  equivalent to direct mode.
 
-This invariant is important for both crash reasoning and rsync hard-link safety.
+This semantic difference must be visible in documentation and config planning.
 
-For command Mirrors:
+Operators that require existing-destination behavior should use direct mode or
+a trusted custom command that explicitly materializes the desired candidate.
 
-~~~text
-{target_dir}
-~~~
+## 13. Built-in rsync and link-dest
 
-resolves to the fresh candidate in atomic mode.
+A full second physical copy is not acceptable for normal large mirrors.
 
-A new placeholder:
+For built-in atomic rsync, LMT controls an alternate basis using
+`--link-dest`.
 
-~~~text
-{published_dir}
-~~~
-
-may expose the current live path to trusted custom commands when explicitly needed.
-
-Custom commands remain trusted site code. LMT cannot prevent an arbitrary executable from intentionally modifying another writable path.
-
-## 13. Rsync candidate construction
-
-A full second physical copy of multi-terabyte mirrors is not acceptable as the normal M4 design.
-
-For built-in rsync, the Server should compile the candidate transfer using an LMT-controlled `--link-dest` basis.
-
-The Agent prepares an attempt-local basis path:
+Conceptually:
 
 ~~~text
 attempt/
-├── root/   # empty candidate
-└── basis
+├── root/     # fresh candidate
+└── basis     # reference to current published tree
 ~~~
 
-If a published tree exists, `basis` points to it.
+Rsync materializes the fresh candidate.
 
-If no published tree exists, `basis` is an empty directory.
+Files that are identical in all preserved attributes may be hard-linked from
+the basis.
 
-The immutable rsync argv can therefore always include:
+Changed or attribute-different files are independently materialized.
 
-~~~text
---link-dest=<attempt>/basis
-~~~
+This is an implementation of fresh-generation semantics, not an attempt to
+preserve direct-mode destination history.
 
-The destination `root/` is empty when rsync begins.
+## 14. Audited rsync profile
 
-Unchanged regular files can be hard-linked to the previous published tree, while changed files are created as new destination files.
+Atomic mode does not accept arbitrary rsync argv.
 
-This substantially reduces data duplication while keeping future LMT writes away from the published directory.
+Configuration may remain explicit `args = [...]`, but every option must belong
+to an audited M4 atomic allowlist/profile.
 
-## 14. Rsync compatibility boundary
+Unknown or unclassified options are rejected.
 
-Atomic rsync mode is not semantically identical to running arbitrary rsync options against an existing destination tree.
+The implementation plan must contain a complete compatibility table.
 
-M4 must validate options that conflict with the fresh-candidate model.
+At minimum, atomic mode must reject destination-history or LMT-owned alternate
+destination behavior such as:
 
-At minimum, atomic mode must reject user control over LMT-owned alternate-destination semantics such as:
-
-- `--link-dest`;
-- `--copy-dest`;
-- `--compare-dest`.
-
-It should also reject options whose semantics depend on mutating or preserving an existing destination inode/tree, including at least:
-
+- user-provided `--link-dest`, `--copy-dest`, `--compare-dest`;
 - `--inplace`;
-- `--append`;
-- `--append-verify`;
+- `--append` and `--append-verify`;
 - `--write-devices`;
-- `--existing` / `--ignore-non-existing`;
-- destination-newness preservation such as `--update` unless its atomic-mode semantics are explicitly defined.
+- `--existing`, `--ignore-non-existing`, `--ignore-existing`;
+- `--update`;
+- `--backup`, `--backup-dir`, and suffix-based destination backup behavior;
+- partial/resume options whose value depends on reusing a previous Attempt
+  destination;
+- deletion-limit/protection options whose intended semantics depend on
+  preexisting destination contents;
+- source-removal behavior.
 
-The implementation plan must contain an audited rsync compatibility table before code is accepted.
+Source-selection options such as include/exclude/filter/files-from may be
+supported only with the documented meaning that they define the contents of the
+fresh generation rather than preserving excluded local destination files.
 
-Mirrors that require incompatible destination semantics may remain in direct mode or use a trusted custom synchronization command designed for candidate output.
+The allowlist is a correctness boundary, not convenience validation.
 
-## 15. Published-tree immutability invariant
+## 15. Hard-link generation immutability is a first-class invariant
 
-In atomic mode:
+`--link-dest` can make current, previous, and candidate generations share an
+inode.
 
-> LMT never synchronizes future Runs into the currently published directory.
+Therefore:
 
-All future writes go to fresh candidates.
+> published and previous atomic generations are immutable from LMT's
+> perspective and must be treated as immutable by operators and serving tools.
 
-The published tree is effectively immutable from LMT's perspective until it is exchanged out.
+No LMT future Run writes into a published or previous tree.
 
-This is what makes hard-link sharing with `--link-dest` safe.
+The serving plane must be content-read-only.
 
-The serving plane should be read-only with respect to mirror content.
+Manual chmod/chown/xattr/ACL/content repair on a hard-linked published
+generation can affect several generations at once and is outside the atomic
+contract.
 
-Manual in-place administrator mutation of the published tree is outside the atomic-publication contract.
+`previous/` is not an isolated filesystem snapshot and must never be described
+as one.
 
-## 16. Detecting external replacement
+## 16. Single namespace writer is the correctness rule
 
-Before building a candidate, the Agent records the identity of the current published directory when it exists.
+The earlier design treated inode identity checks too strongly.
 
-Immediately before commit, it verifies that the published directory still has the same filesystem/device and inode identity.
+`stat -> verify -> RENAME_EXCHANGE` is not a compare-and-swap operation.
 
-If it changed unexpectedly, publication is rejected rather than exchanging against an object LMT did not synchronize against.
+M4 therefore freezes this invariant:
 
-This detects:
+> LMT is the only supported namespace writer for a managed atomic published
+> pathname.
 
-- manual replacement;
-- accidental second writers;
-- unexpected storage remount/replacement;
-- broken local invariants.
+Per-Mirror Agent locking prevents two LMT publication paths from racing.
 
-## 17. Crash recovery
+Pre-commit inode/device identity checks remain useful best-effort detection for
+manual replacement or invariant violation, but they are not the correctness
+primitive and cannot eliminate the external TOCTOU race.
 
-The Agent spool remains the durable local execution record.
+External replacement/rename of a managed atomic target is unsupported.
 
-For atomic Attempts it additionally records:
+## 17. Cancellation boundary
 
-- candidate path;
-- candidate device/inode identity;
-- prior published identity when present;
-- internal publication phase.
+Cancellation and commit are serialized by the Agent's durable Attempt ownership
+state.
 
-### Crash while process is executing
+Cancellation wins if it is durable locally before visibility commit.
 
-The candidate is not published.
+Once the visibility commit succeeds, publication wins and is never
+automatically rolled back because of a later cancellation.
 
-Recovery follows the existing Interrupted semantics.
+If the Agent is offline, a cancellation that exists only on the Server cannot
+retroactively undo an already completed visibility commit.
 
-A later retry uses a new Attempt and a new candidate.
+## 18. Retry behavior
 
-### Crash after process exit but before commit
+Before visibility commit, normal retry rules apply.
 
-If the spool durably reached `ready_to_commit`, the candidate contains a completed process result.
+Failed/TimedOut/Interrupted Attempts never publish their private candidate.
 
-The Agent must not blindly publish it immediately on startup.
+A retry always receives a fresh Attempt candidate.
 
-It first re-enters normal Server reconciliation so an already-persisted cancellation can win.
+A publication preflight rejection is non-retryable.
 
-If the Server redelivers the matching Start and no cancellation exists, the Agent may continue the same Attempt's commit without re-running synchronization.
+A failure before visibility commit may be retryable normally.
 
-### Crash during/after atomic exchange
+After visibility commit, the Agent must finish/recover the same commit rather
+than create another writer.
 
-Namespace exchange itself is atomic.
+## 19. Move is quiescent-only in M4
 
-Recovery compares the stored candidate inode identity with both possible pathnames.
+M4 deliberately chooses the small rule:
 
-If the candidate inode is now at the published path, publication committed.
+> A Mirror may move between Nodes only when it has no active non-terminal Run.
 
-The Agent converges toward `AttemptSucceeded` and must not create a duplicate writer or roll back the tree.
+`config plan` may show the desired Move, but `config apply` rejects it while
+the Mirror has a Pending or Running Run.
 
-If the candidate inode remains at the private candidate path, publication did not commit.
+`--acknowledge-moves` does not override this safety rule.
 
-If neither path matches the recorded identity, local publication invariants are broken and the Attempt must fail safely with a publication/storage diagnostic.
+Operators must wait for terminal state or explicitly cancel and wait for
+terminal reconciliation before applying the Move.
 
-## 18. Cancellation race
+This prevents an old owner in `ready_to_commit` or publication recovery from
+publishing after ownership has moved.
 
-Cancellation and publication commit must be serialized by the Agent's durable Attempt lock.
+M4 does not introduce leases, Move effective timestamps, traffic barriers, or
+cross-node publication coordination.
 
-The rule is:
+## 20. Previous generation and GC
 
-> cancellation wins if it becomes durable locally before the publication linearization point; publication wins once the atomic exchange has committed.
+After exchange, the old published tree is retained as one internal previous
+namespace generation.
 
-A cancellation that exists only on the Server but has not yet reached an offline Agent cannot retroactively undo a commit that already occurred.
+It is not an independent snapshot and there is no automatic rollback API.
 
-This is consistent with the existing at-least-once control protocol.
+Older retired private trees and abandoned candidates are garbage.
 
-## 19. Retry behavior
+GC is not allowed to become unbounded best effort.
 
-If synchronization fails before commit:
+M4 requires:
 
-- Attempt becomes Failed/TimedOut/Interrupted as today;
-- candidate is private;
-- retry policy may create Attempt N+1;
-- Attempt N+1 receives a fresh candidate.
+- bounded per-Mirror private-generation count;
+- GC backlog metrics;
+- GC failure metrics;
+- publication-storage free-space reporting;
+- health degradation when stale garbage cannot be reclaimed;
+- admission control that blocks new atomic Attempts when unresolved commit
+  state or unsafe GC/storage conditions exist.
 
-A structural publication preflight failure is Rejected and non-retryable.
+The exact free-space reserve policy and cleanup bounds are implementation-plan
+decisions and must be explicit rather than hidden heuristics.
 
-A runtime publication I/O failure after a successful process should use a new operational failure category such as `publication`.
-
-It may remain retryable under the normal Run policy because the retry is safe, although it may repeat synchronization work.
-
-## 20. Previous generation and cleanup
-
-M4 should keep exactly one immediate previous published tree as an internal safety generation.
-
-After a successful exchange:
-
-~~~text
-published = new
-candidate path = old published
-~~~
-
-The old published tree is normalized to:
-
-~~~text
-publication_root/<mirror>/previous/
-~~~
-
-Any older `previous` is moved to a garbage path and removed asynchronously.
-
-This provides:
-
-- a generous grace period for serving processes that may still hold old directory/file references;
-- useful incident forensics;
-- a simple emergency manual recovery source;
-- bounded steady-state retention.
-
-There is no automatic rollback API in M4.
-
-Cleanup is best-effort and is not part of Run success.
-
-Agent startup maintenance may remove stale garbage and candidates not referenced by a live spool record.
-
-Configuration pruning never deletes the currently published mirror tree.
+ENOSPC during candidate construction fails the Attempt without changing the
+published tree.
 
 ## 21. Serving-plane behavior
 
-An in-flight download that already opened an old file may continue reading the old inode after publication. Linux rename does not invalidate open file descriptors.
+An already-open file descriptor may continue reading the old inode after the
+directory exchange.
 
-New pathname resolution sees the public path before or after the directory-entry exchange.
+New pathname resolution sees the namespace before or after the atomic exchange.
 
-LMT does not promise that several HTTP requests from one client see the same generation.
+LMT does not pin multiple HTTP requests to one generation.
 
-Serving software can extend old-version visibility through its own caches.
+Serving software may extend old-version visibility through its own file cache.
 
-For Nginx, `open_file_cache` is off by default. Sites enabling it must choose cache validation intervals compatible with their desired freshness.
+Publication does not require Nginx reload/API integration and LMT remains
+outside the download path.
 
-Publication does not require Nginx reloads or API calls.
+## 22. Upstream consistency is separate
 
-LMT remains outside the download path.
+Atomic local publication does not prove that the upstream source was a
+point-in-time snapshot.
 
-## 22. Upstream consistency remains separate
+M4 does not introduce a generic Verify workflow merely to hide this limitation.
 
-Atomic local publication does not prove that the candidate is semantically self-consistent.
+A trusted custom command may perform its own candidate synchronization and
+validation before returning success.
 
-For example, an upstream repository may change while rsync is traversing it.
+A first-class verification phase remains evidence-driven future work.
 
-M4 does not introduce a generic Verify phase merely to hide this fact.
+## 23. Disable and remove semantics
 
-If a repository needs special verification today, a trusted custom synchronization command may perform:
+Disable prevents future Runs and leaves the published tree available.
 
-~~~text
-sync candidate
-verify candidate
-exit 0
-~~~
+Remove stops LMT management and never deletes the published mirror data.
 
-and LMT publishes only after that command exits successfully.
+Private publication garbage is an explicit maintenance concern and is not
+deleted merely because config pruning removed a Mirror.
 
-A first-class verification phase should be added only when real repositories justify a shared lifecycle abstraction.
+## 24. Target-overlap invariant
 
-## 23. Ownership Move semantics
+Managed Mirror targets on one Node may not overlap exactly or through
+ancestor/descendant relationships.
 
-Atomic publication remains Node-local.
-
-Moving:
-
-~~~text
-nodes/n01/mirrors/ubuntu.toml
-->
-nodes/n02/mirrors/ubuntu.toml
-~~~
-
-means future Runs belong to n02.
-
-It does not:
-
-- copy n01's publication tree;
-- delete n01's publication tree;
-- redirect Nginx;
-- move external traffic;
-- automatically publish on n02.
-
-The old n01 serving tree remains frozen data.
-
-The operator must ensure n02 has a successful publication before moving external serving traffic if that is required.
-
-## 24. Disable, remove, and mode changes
-
-Disable:
-
-- prevents future Runs;
-- leaves the published tree available.
-
-Remove:
-
-- removes managed control-plane desired state;
-- never deletes published mirror data.
-
-Changing direct -> atomic:
-
-- the existing real published directory may be used as the first basis;
-- no symlink migration is required.
-
-Changing atomic -> direct:
-
-- future Runs once again write into the live target;
-- the atomic consistency guarantee is lost;
-- this should be surfaced as a high-impact config-plan warning.
-
-Private publication-root cleanup is an explicit maintenance concern and must never be confused with config pruning.
-
-## 25. Target-overlap invariant
-
-On one Node, managed Mirror targets must not overlap.
-
-Invalid examples:
+For example these are invalid on one owner Node:
 
 ~~~text
-Mirror A target = ubuntu
-Mirror B target = ubuntu
-
-Mirror A target = ubuntu
-Mirror B target = ubuntu/pool
+ubuntu
+ubuntu/pool
 ~~~
 
-These create independent Run lifecycles that write/exchange the same serving subtree.
+The same target on different Nodes is valid because the physical roots differ.
 
-M4 config validation should reject exact and ancestor/descendant target overlap per owner Node.
+## 25. Protocol compatibility: forward-only rolling upgrade
 
-The same relative target on different Nodes is valid because the physical roots are different.
+M4 does not claim bidirectional mixed-version compatibility.
 
-## 26. Protocol capability negotiation
+The supported matrix is:
 
-Atomic publication requires a newer Agent.
+| Server | Agent | Direct | Atomic | Supported |
+|---|---|---:|---:|---|
+| M3 | M3 | yes | no | yes |
+| M4 | M3 | yes | no | yes during rolling upgrade |
+| M4 | M4 | yes | yes | yes |
+| M3 | M4 | no guarantee | no | no |
 
-The Agent should advertise an explicit capability such as:
+M4 Server must accept legacy M3 Agent poll bodies with no capability field.
+
+M4 Agent advertises publication capability explicitly.
+
+M4 Server dispatches atomic work only to Agents advertising the required
+capability.
+
+For Direct Mirrors dispatched to M3 Agents, M4 Server serializes the legacy
+ProcessRunSpec shape exactly. An optional publication extension must be omitted,
+not serialized as `null`.
+
+## 26. Upgrade and downgrade contract
+
+Upgrade is forward-only:
+
+~~~text
+backup control plane
+-> upgrade Server
+-> verify M3 Agents still run Direct Mirrors
+-> upgrade Agents
+-> verify atomic capability
+-> enable atomic Mirrors
+~~~
+
+M4 does not promise that an M3 Server can run safely on state produced by an M4
+control plane or communicate with an M4 Agent.
+
+Downgrade therefore means an offline recovery procedure, not binary rollback in
+place:
+
+- stop Server/Agents;
+- restore the pre-M4 control-plane backup using the existing restore contract;
+- install the matching older binaries/configuration;
+- preserve Mirror data;
+- reset/reconcile Agent spool according to the downgrade runbook.
+
+This matches LMT's existing forward-only migration philosophy.
+
+## 27. Capability negotiation
+
+Atomic publication uses an explicit Agent capability such as:
 
 ~~~text
 atomic_exchange_v1
 ~~~
 
-rather than inferring support from version strings.
+M4 poll decoding treats the capability field as optional/default-empty so M3
+Agents remain accepted by an M4 Server.
 
-The existing Node `capabilities_json` field can persist this observation.
+No capability is inferred from an Agent version string.
 
-A Server must never dispatch an atomic publication spec to an Agent that did not advertise the capability.
+## 28. ProcessRunSpec compatibility
 
-Because current v1alpha1 request structs reject unknown fields, the mixed-version upgrade contract should be:
+Atomic M4 Attempts require an optional publication extension in the immutable
+RunSpec.
 
-1. upgrade Server first;
-2. new Server accepts old Agent polls with missing optional capability fields;
-3. upgrade Agents;
-4. enable atomic publication only after capability is visible.
+For direct mode it is absent from serialized JSON.
 
-Direct-mode Mirrors remain executable by old Agents during the compatibility window.
+For atomic mode it includes the private candidate/publication information needed
+by the M4 Agent and is covered by the spec hash.
 
-## 27. ProcessRunSpec extension
+M4 Server never sends the extended atomic shape to an M3 Agent.
 
-The immutable execution spec should gain an optional publication description rather than a new action protocol.
+Because M3 Server + M4 Agent is outside the supported matrix, M4 does not distort
+the protocol merely to make reverse rollback appear compatible.
 
-Conceptually:
+## 29. Database impact
 
-~~~text
-ProcessRunSpec
-├── runner/program/args/cwd/timeout
-├── target_dir
-└── publication
-    ├── mode
-    ├── published_dir
-    ├── candidate_dir
-    ├── basis_dir
-    └── publication_root
-~~~
+No Publication table and no public Publication ID are required.
 
-For direct mode the optional publication section is omitted when serialized, preserving compatibility with older Agents.
+No public Run state is added.
 
-The spec hash covers publication paths and mode.
+Mirror configuration history records publication mode in canonical TOML.
 
-Server still decides.
+Attempt immutable spec history contains the exact atomic execution contract.
 
-Agent still executes one immutable local ownership unit.
+A new publication-specific failure/health category may be introduced in M4,
+with compatibility assessed only inside the supported forward-upgrade matrix.
 
-## 28. Database impact
+Any schema migration remains forward-only.
 
-No Publication table is required.
+## 30. Doctor and observability
 
-No public Publication ID is required.
+M4 observability should include:
 
-No new Run state is required.
-
-Mirror configuration history already persists publication mode through canonical TOML.
-
-Run/Attempt history already records the exact immutable spec.
-
-M4 may add publication-specific operational metadata only where it materially improves diagnosis.
-
-A `publication` failure kind is justified.
-
-This deliberately avoids creating a second lifecycle in SQLite.
-
-## 29. Observability
-
-Add operational evidence for:
-
-- publication commits succeeded/failed;
+- publication commit success/failure counters;
+- visibility-to-durability commit duration;
 - publication preflight rejection;
-- commit duration;
-- stale candidate/garbage cleanup failures;
-- current Agent publication capability.
+- GC backlog and cleanup failures;
+- publication-storage free bytes;
+- degraded publication-health state;
+- Agent atomic capability.
 
-Do not use Run IDs or Attempt IDs as Prometheus labels.
+Run/Attempt IDs remain structured-log fields, not Prometheus labels.
 
-Structured daemon logs should identify Run/Attempt IDs for incident correlation.
-
-`doctor` should test:
+`doctor` checks:
 
 - publication_root configured;
-- roots are writable;
+- publication_root is outside mirror_root;
+- required roots are writable;
 - roots are on the same mounted filesystem;
-- exchange probe succeeds;
-- published target type is valid;
-- private publication_root is not below the public mirror_root.
+- exchange/no-replace probes succeed;
+- target type is valid;
+- no unresolved local publication-health fault exists.
 
-## 30. Durability boundary
+## 31. Installation automation interaction
 
-The namespace commit should fsync the affected parent directories after rename so directory-entry changes are made durable according to normal local-filesystem semantics.
+The M4 local installer accepts publication storage explicitly.
 
-This does not recursively fsync every byte in a multi-terabyte candidate.
+It never guesses a private publication path and never places it under the served
+tree.
 
-M4 guarantees atomic local publication visibility and robust daemon/reboot recovery under normal filesystem guarantees.
+It does not modify Nginx, firewall, routing, Docker, Kubernetes, or storage
+formatting.
 
-It does not turn mirror synchronization into a fully synchronous power-loss transaction.
+The installer follows the forward-only Server-first upgrade contract.
 
-Sites requiring stronger storage durability should address that through the filesystem/storage layer.
+## 32. Rejected M4 alternatives
 
-## 31. M4 installation/upgrade automation interaction
+M4 does not add:
 
-The installer must understand the optional publication root.
-
-For Agent installation with atomic publication support, the operator supplies it explicitly:
-
-~~~text
---mirror-root /srv/mirrors
---publication-root /srv/lmt-publication
-~~~
-
-The installer:
-
-- creates both paths with correct ownership;
-- never guesses a publication root;
-- does not place private generations inside the served tree;
-- runs the same exchange preflight used by `doctor`;
-- does not modify Nginx.
-
-Upgrade remains Server-first when protocol fields/capabilities change.
-
-## 32. Rejected alternatives for M4
-
-Do not implement in this milestone:
-
-- a generic Publication resource/API;
-- workflow/DAG phases;
-- automatic repository-specific verification;
+- a public Publication resource/API;
+- generic phase/DAG execution;
 - automatic rollback;
-- filesystem-specific snapshot providers;
+- snapshot-specific semantic dependency;
 - bind-mount publication;
-- symlink-current publication;
-- cross-node publication migration;
-- replicated Mirrors;
-- traffic switching.
+- current-symlink publication;
+- cross-node data migration;
+- publication leases;
+- traffic switching;
+- generic repository verification.
 
-These may be revisited only with evidence.
+## 33. Acceptance requirements
 
-## 33. Acceptance model
+Automated acceptance must cover at least:
 
-Before M4 implementation is accepted, automated tests must cover at least:
-
-1. direct mode remains unchanged;
-2. fresh atomic first publication;
+1. direct mode unchanged;
+2. fresh first atomic publication;
 3. exchange from an existing live directory;
-4. candidate is never published on process failure;
-5. cancel before commit prevents exchange;
-6. crash before commit does not expose candidate;
-7. crash after exchange but before terminal event recovers as the same successful Attempt;
-8. retry uses a fresh candidate;
-9. old published identity changing underneath the Attempt blocks commit;
-10. target overlap is rejected;
-11. unsupported Agent capability blocks atomic dispatch;
-12. previous-generation cleanup never deletes current published tree;
-13. server-first mixed-version direct-mode compatibility;
-14. real XFS/ext4/Btrfs exchange probe where CI/integration infrastructure permits.
+4. process failure never exposes candidate;
+5. cancel before visibility commit prevents publication;
+6. crash before visibility commit does not expose candidate;
+7. crash after exchange but before directory fsync resumes the same commit;
+8. AttemptSucceeded is impossible before the durability boundary;
+9. retry always uses a fresh candidate;
+10. hard-link basis is never mutated by LMT atomic rsync;
+11. audited rsync profile rejects unclassified/incompatible options;
+12. fresh-generation semantics differ from direct mode exactly as documented;
+13. Move is rejected while Mirror is non-quiescent;
+14. target overlap is rejected;
+15. best-effort inode identity check is not treated as CAS;
+16. GC backlog degrades health and can block admission;
+17. M4 Server + M3 Agent Direct mode works;
+18. M4 Server never sends atomic spec to an M3 Agent;
+19. Direct ProcessRunSpec sent to M3 Agent contains no new publication field;
+20. supported XFS/ext4/Btrfs rename probes where integration infrastructure permits.
 
-Only a very small real-host smoke test is needed after automated coverage.
+A small real-host smoke test is sufficient after automated coverage.
 
 ## 34. External semantics relied upon
 
-The design relies on standard Linux/POSIX behaviors:
+The design relies on standard Linux and rsync behavior:
 
-- Linux `renameat2(RENAME_EXCHANGE)` atomically exchanges two existing pathnames;
-- rename does not invalidate already-open file descriptors;
-- rename cannot cross mounted filesystem boundaries;
-- durable directory-entry persistence requires fsync of containing directories;
-- rsync `--link-dest` hard-links unchanged files from an alternate destination and works best with a fresh destination hierarchy;
-- rsync `--inplace` deliberately preserves hard links and is therefore not part of the safe atomic-mode contract;
-- Nginx can cache open file descriptors when `open_file_cache` is enabled, while the directive is off by default.
+- `renameat2(RENAME_EXCHANGE)` atomically exchanges two existing pathnames;
+- rename cannot cross mount points;
+- open file descriptors are unaffected by rename;
+- directory fsync is required to persist directory-entry changes;
+- `--link-dest` hard-links unchanged files into a fresh destination hierarchy;
+- existing hard-linked destination entries can be affected by attribute
+  mutation, which is why atomic candidates begin fresh and published generations
+  are immutable.
 
 Reference documentation:
 
 - Linux rename(2): https://man7.org/linux/man-pages/man2/rename.2.html
 - Linux fsync(2): https://man7.org/linux/man-pages/man2/fsync.2.html
 - rsync(1): https://download.samba.org/pub/rsync/rsync.1
-- Nginx core module: https://nginx.org/en/docs/http/ngx_http_core_module.html
-- Btrfs subvolumes/snapshots: https://btrfs.readthedocs.io/en/latest/btrfs-subvolume.html
-- OpenZFS snapshots/clones: https://openzfs.github.io/openzfs-docs/Basic%20Concepts/Datasets/Snapshots%20and%20Clones.html
