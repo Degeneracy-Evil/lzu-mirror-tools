@@ -1,6 +1,7 @@
 pub mod config;
 mod executor;
 mod process_lock;
+mod publication;
 mod publication_fs;
 mod spool;
 
@@ -75,6 +76,7 @@ pub struct Agent {
     client: Client,
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     acceptance: Arc<Mutex<()>>,
+    publication_locks: publication::MirrorLocks,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -159,6 +161,7 @@ impl Agent {
             client: Client::builder().timeout(Duration::from_secs(35)).build()?,
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
+            publication_locks: publication::MirrorLocks::default(),
             shutdown,
         })
     }
@@ -283,13 +286,25 @@ impl Agent {
         if active.contains_key(&key) || active.len() >= self.config.execution.max_concurrent_runs as usize {
             return;
         }
-        if !self.config.runner.process.enabled || !safe_spec(&self.config.storage.mirror_root, &spec) {
+        let mut publication_guard = None;
+        let rejection = if !self.config.runner.process.enabled || !safe_spec(&self.config, &spec) {
+            Some("local policy rejected spec".to_owned())
+        } else {
+            match self.publication_admission(&spec).await {
+                Ok(guard) => {
+                    publication_guard = guard;
+                    None
+                }
+                Err(error) => Some(format!("publication admission blocked: {error}")),
+            }
+        };
+        if let Some(message) = rejection {
             let mut record = SpoolRecord::accepted(run_id, attempt, spec_hash, spec, now());
             record.terminal(
                 AttemptState::Rejected,
                 None,
                 Some(FailureKind::Rejected),
-                Some("local policy rejected spec".into()),
+                Some(message),
                 now(),
             );
             if write(&path, &record).await.is_ok() {
@@ -306,6 +321,7 @@ impl Agent {
         let (cancel, cancel_receiver) = watch::channel(false);
         active.insert(key.clone(), cancel);
         drop(active);
+        drop(publication_guard);
         let agent = self.clone();
         tokio::spawn(async move {
             let mut record = record;
@@ -326,6 +342,63 @@ impl Agent {
             }
             agent.active.lock().await.remove(&key);
         });
+    }
+
+    async fn publication_admission(
+        &self,
+        spec: &ProcessRunSpec,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let atomic = spec.publication.is_some();
+        let mut mirror = spec.publication.as_ref().map(|publication| publication.mirror.clone());
+        let paths = spool_paths(&self.config.storage.spool_dir).await?;
+        for path in paths
+            .iter()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        {
+            let record = read(path).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot prove publication spool {} safe for admission: {error}",
+                    path.display()
+                )
+            })?;
+            if mirror.is_none()
+                && record
+                    .publication
+                    .as_ref()
+                    .is_some_and(|publication| publication.published_dir == spec.target_dir)
+            {
+                mirror = record.publication.map(|publication| publication.mirror);
+            }
+        }
+        let Some(mirror) = mirror else {
+            return Ok(None);
+        };
+
+        // Abandon/fence takes the global acceptance lock before this same Mirror
+        // lock, so the discovery scan and locked re-scan cannot miss a new fence.
+        let guard = self.publication_locks.acquire(&mirror).await;
+        for path in spool_paths(&self.config.storage.spool_dir)
+            .await?
+            .into_iter()
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        {
+            let record = read(&path).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot prove publication spool {} safe for admission: {error}",
+                    path.display()
+                )
+            })?;
+            let Some(publication) = record.publication.as_ref().filter(|state| state.mirror == mirror) else {
+                continue;
+            };
+            if publication.phase == spool::PublicationPhase::AbandonedFenced {
+                bail!("Mirror {mirror} has a durable local writer fence");
+            }
+            if atomic && publication.phase.requires_namespace_recovery() {
+                bail!("Mirror {mirror} has unresolved publication recovery");
+            }
+        }
+        Ok(Some(guard))
     }
 
     async fn cancel(&self, run_id: String, attempt: u32, spec_hash: String) {
@@ -574,11 +647,48 @@ async fn spool_paths(root: &Path) -> std::io::Result<Vec<std::path::PathBuf>> {
     Ok(paths)
 }
 
-fn safe_spec(root: &Path, spec: &ProcessRunSpec) -> bool {
-    spec.runner == "process"
-        && spec.mirror_root == root.to_string_lossy()
-        && Path::new(&spec.target_dir).starts_with(root)
-        && spec.cwd.as_ref().is_none_or(|cwd| Path::new(cwd).starts_with(root))
+fn safe_spec(config: &Config, spec: &ProcessRunSpec) -> bool {
+    let mirror_root = &config.storage.mirror_root;
+    if spec.runner != "process" || spec.mirror_root != mirror_root.to_string_lossy() {
+        return false;
+    }
+    let Some(publication) = spec.publication.as_ref() else {
+        return path_below(mirror_root, &spec.target_dir)
+            && spec.cwd.as_ref().is_none_or(|cwd| path_within(mirror_root, cwd));
+    };
+    let Some(publication_root) = config.storage.publication_root.as_ref() else {
+        return false;
+    };
+    publication.publication_root == publication_root.to_string_lossy()
+        && spec.target_dir == publication.candidate_dir
+        && path_below(mirror_root, &publication.published_dir)
+        && [
+            &publication.candidate_dir,
+            &publication.basis_dir,
+            &publication.exchange_dir,
+            &publication.gc_dir,
+        ]
+        .into_iter()
+        .all(|path| path_below(publication_root, path))
+        && spec
+            .cwd
+            .as_ref()
+            .is_none_or(|cwd| path_within(publication_root, cwd) || path_within(mirror_root, cwd))
+}
+
+fn path_below(root: &Path, value: &str) -> bool {
+    let path = Path::new(value);
+    path != root && path_within(root, value)
+}
+
+fn path_within(root: &Path, value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && root.is_absolute()
+        && path.starts_with(root)
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
 pub fn now() -> String {
@@ -633,6 +743,7 @@ mod tests {
             client: Client::new(),
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
+            publication_locks: publication::MirrorLocks::default(),
             shutdown,
         }
     }
@@ -647,6 +758,39 @@ mod tests {
             mirror_root: root.to_string_lossy().into_owned(),
             target_dir: root.join("demo").to_string_lossy().into_owned(),
             publication: None,
+        }
+    }
+
+    fn atomic_spec(root: &Path, mirror: &str) -> ProcessRunSpec {
+        let mirror_root = root.join("mirrors");
+        let publication_root = root.join("publication");
+        let candidate = publication_root.join(format!("{mirror}/attempts/run-atomic-1"));
+        ProcessRunSpec {
+            runner: "process".into(),
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            cwd: None,
+            timeout_seconds: 10,
+            mirror_root: mirror_root.to_string_lossy().into_owned(),
+            target_dir: candidate.to_string_lossy().into_owned(),
+            publication: Some(Box::new(AtomicPublicationSpec {
+                mirror: mirror.into(),
+                publication_root: publication_root.to_string_lossy().into_owned(),
+                published_dir: mirror_root.join(mirror).to_string_lossy().into_owned(),
+                candidate_dir: candidate.to_string_lossy().into_owned(),
+                basis_dir: publication_root
+                    .join(format!("{mirror}/basis"))
+                    .to_string_lossy()
+                    .into_owned(),
+                exchange_dir: publication_root
+                    .join(format!("{mirror}/exchange"))
+                    .to_string_lossy()
+                    .into_owned(),
+                gc_dir: publication_root
+                    .join(format!("{mirror}/gc"))
+                    .to_string_lossy()
+                    .into_owned(),
+            })),
         }
     }
 
@@ -909,6 +1053,79 @@ mod tests {
             .expect_err("protected reset must fail closed");
         assert!(error.to_string().contains("protected publication recovery evidence"));
         assert!(fs::try_exists(path).await.expect("state existence"));
+    }
+
+    #[tokio::test]
+    async fn atomic_recovery_and_durable_fence_block_admission_including_direct_writer() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        let atomic = atomic_spec(directory.path(), "demo");
+        let mut record = SpoolRecord::accepted("run-atomic".into(), 1, "hash".into(), atomic.clone(), now());
+        record.publication.as_mut().expect("publication state").phase = spool::PublicationPhase::ReadyToCommit;
+        let path = state_path(&agent.config.storage.spool_dir, &record.run_id, record.attempt);
+        write(&path, &record).await.expect("recovery record");
+        assert!(agent.publication_admission(&atomic).await.is_err());
+
+        record.publication.as_mut().expect("publication state").phase = spool::PublicationPhase::AbandonedFenced;
+        record.terminal(
+            AttemptState::Failed,
+            None,
+            Some(FailureKind::InvalidResult),
+            Some("publication durability explicitly abandoned".into()),
+            now(),
+        );
+        write(&path, &record).await.expect("durable fence");
+        assert!(agent.publication_admission(&atomic).await.is_err());
+
+        let published = atomic
+            .publication
+            .as_ref()
+            .expect("publication spec")
+            .published_dir
+            .clone();
+        let mut direct = spec(&agent.config.storage.mirror_root, "/bin/true", Vec::new(), 10);
+        direct.target_dir = published;
+        assert!(agent.publication_admission(&direct).await.is_err());
+
+        direct.target_dir = agent
+            .config
+            .storage
+            .mirror_root
+            .join("unrelated")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            agent
+                .publication_admission(&direct)
+                .await
+                .expect("unrelated Direct admission")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn atomic_local_policy_confines_public_and_private_paths_to_configured_roots() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_sender, receiver) = watch::channel(false);
+        let mut agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+        agent.config.storage.publication_root = Some(directory.path().join("publication"));
+        let atomic = atomic_spec(directory.path(), "demo");
+        assert!(safe_spec(&agent.config, &atomic));
+
+        let mut escaped = atomic.clone();
+        escaped.publication.as_mut().expect("publication spec").exchange_dir = "/tmp/exchange".into();
+        assert!(!safe_spec(&agent.config, &escaped));
+        let mut public_escape = atomic;
+        public_escape
+            .publication
+            .as_mut()
+            .expect("publication spec")
+            .published_dir = "/tmp/public".into();
+        assert!(!safe_spec(&agent.config, &public_escape));
     }
 
     #[tokio::test]
