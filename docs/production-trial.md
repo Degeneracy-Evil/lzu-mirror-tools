@@ -334,3 +334,46 @@ Observed rsync log:
 The target tree matched the updated upstream contents, deletion propagated correctly, and the Mirror remained on generation 1 because only upstream data changed; LMT configuration did not.
 
 This establishes the normal incremental-sync baseline before fault injection.
+
+### T007 - Server restart during an active Attempt preserved execution
+
+Observed on n01 on 2026-09-02.
+
+Setup:
+
+- `local-smoke` was changed to generation 2 with rsync `--bwlimit=10240`.
+- a 512 MiB `large.bin` was added to the local upstream to keep the Attempt active long enough for fault injection.
+
+Run:
+
+~~~text
+Run ID: 01M1G56M6EDVWE8WQX07G8NJQ0
+Mirror generation: 2
+Attempt: 1
+created:  2026-09-02T04:14:28.046Z
+started:  2026-09-02T04:14:28.054Z
+finished: 2026-09-02T04:15:19.231Z
+final state: succeeded
+exit code: 0
+~~~
+
+Fault:
+
+`lmt-server` was restarted while Attempt 1 was actively transferring `large.bin`.
+
+Observed behavior:
+
+- `lmt-agent` stayed running.
+- The active rsync process group remained running across the Server restart.
+- After the Server returned, Agent reconciliation continued automatically.
+- The original Run remained the same Run ID.
+- The original Attempt remained Attempt 1; no Attempt 2 was created.
+- Final state was Succeeded with exit code 0.
+- Central Run logs were readable after the restart.
+- `large.bin` was fully present in the target tree.
+
+`pgrep` showed three rsync PIDs during execution. They were all in the same `lmt-agent.service` cgroup and the control plane recorded only one Attempt. This is consistent with rsync's internal multi-process execution rather than duplicate LMT dispatch. Future writer-count experiments should capture PPID/process-tree information as well as raw PID count.
+
+The `journalctl --since "5 minutes ago"` command used after completion returned no entries, so future fault experiments should use an explicit absolute time window around the injected fault rather than a relative window.
+
+This validates the accepted architectural property that Server/control-plane restart does not terminate an already-owned Agent execution.
