@@ -1,6 +1,7 @@
 pub mod config;
 mod executor;
 mod process_lock;
+mod publication_fs;
 mod spool;
 
 use std::{
@@ -26,6 +27,7 @@ use tokio::{
 use spool::{SpoolRecord, log_path, read, retire, state_path, write};
 
 const INSTALLATION_ID_FILE: &str = "agent-id";
+const ATOMIC_EXCHANGE_V1: &str = lmt_protocol::v1alpha1::ATOMIC_EXCHANGE_V1;
 
 pub async fn reset_spool(config: &Config, acknowledged: bool) -> anyhow::Result<u64> {
     if !acknowledged {
@@ -132,12 +134,13 @@ impl Agent {
             bail!("Agent token file is empty");
         }
         let instance = load_or_create_installation_id(&config.storage.spool_dir).await?;
+        let capabilities = publication_capabilities(&config).await;
         Ok(Self {
             config,
             token: Arc::new(RwLock::new(token)),
             instance: instance.into(),
             boot_id: ulid::Ulid::new().to_string().into(),
-            capabilities: Arc::from([]),
+            capabilities: capabilities.into(),
             _process_lock: Arc::new(process_lock),
             client: Client::builder().timeout(Duration::from_secs(35)).build()?,
             active: Arc::new(Mutex::new(HashMap::new())),
@@ -510,6 +513,24 @@ impl Agent {
     }
 }
 
+async fn publication_capabilities(config: &Config) -> Vec<String> {
+    let Some(publication_root) = config.storage.publication_root.clone() else {
+        return vec![];
+    };
+    let mirror_root = config.storage.mirror_root.clone();
+    match tokio::task::spawn_blocking(move || publication_fs::preflight(&mirror_root, &publication_root)).await {
+        Ok(Ok(())) => vec![ATOMIC_EXCHANGE_V1.into()],
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "Atomic publication preflight failed; capability disabled");
+            vec![]
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Atomic publication preflight task failed; capability disabled");
+            vec![]
+        }
+    }
+}
+
 fn available_bytes(path: &Path) -> anyhow::Result<u64> {
     let filesystem = statvfs(path)?;
     filesystem
@@ -654,6 +675,50 @@ mod tests {
         let failed_measurement = agent.capacity().await;
         assert_eq!(failed_measurement.mirror_root_free_bytes, None);
         assert_eq!(failed_measurement.active_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn atomic_capability_is_advertised_only_after_real_preflight() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mirror_root = directory.path().join("mirrors");
+        let publication_root = directory.path().join("publication");
+        let spool_dir = directory.path().join("spool");
+        let token_file = directory.path().join("token");
+        fs::create_dir(&mirror_root).await.expect("mirror root");
+        fs::create_dir(&publication_root).await.expect("publication root");
+        fs::write(&token_file, "secret\n").await.expect("token");
+        let config = Config {
+            node: config::Node { name: "node-a".into() },
+            server: config::Server {
+                url: "http://127.0.0.1:1".into(),
+                token_file: token_file.clone(),
+            },
+            storage: config::Storage {
+                mirror_root: mirror_root.clone(),
+                spool_dir,
+                publication_root: Some(publication_root),
+                publication_max_private_generations: Some(4),
+                publication_reserve_bytes: Some(1),
+            },
+            execution: config::Execution { max_concurrent_runs: 1 },
+            runner: config::Runner {
+                process: config::ProcessPolicy { enabled: true },
+            },
+            logging: None,
+        };
+        let (_shutdown, receiver) = watch::channel(false);
+        let agent = Agent::new(config.clone(), receiver).await.expect("preflighted Agent");
+        assert_eq!(agent.capabilities.as_ref(), &[ATOMIC_EXCHANGE_V1.to_owned()]);
+        drop(agent);
+
+        let mut invalid = config;
+        invalid.storage.spool_dir = directory.path().join("invalid-spool");
+        invalid.storage.publication_root = Some(mirror_root.join("missing"));
+        let (_shutdown, receiver) = watch::channel(false);
+        let agent = Agent::new(invalid, receiver)
+            .await
+            .expect("Direct-only Agent remains available");
+        assert!(agent.capabilities.is_empty());
     }
 
     #[tokio::test]
