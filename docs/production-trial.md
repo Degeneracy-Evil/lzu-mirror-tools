@@ -220,3 +220,32 @@ Production-trial layout is therefore:
 ~~~
 
 Directory traversal is public; secret contents remain protected by file ownership/mode.
+
+### T003 - Agent does not report mirror-root free space
+
+Observed on n01 after first authenticated Agent poll.
+
+`lmt node show n01` reported `mirror_root_free_bytes = null` even though the configured mirror root is on a mounted XFS filesystem with approximately 2.6 TiB free.
+
+Code inspection showed this is not an environmental failure: the Agent currently constructs every PollRequest with `capacity.mirror_root_free_bytes = None`.
+
+This contradicts the M3 observability/doctor contract and prevents useful disk-pressure diagnostics.
+
+Required maintenance fix:
+
+- measure available bytes for the configured `mirror_root` on every poll or at a safely bounded refresh interval;
+- report the value through the existing Capacity field;
+- measurement failure must not stop Agent polling; report `None` and emit an operational warning instead;
+- add a filesystem-backed test.
+
+Treat this as M3 production-trial maintenance, not M4 scope.
+
+### T004 - Tokio default worker count is excessive on very large hosts
+
+Observed on the 240-logical-CPU n01 host.
+
+Both lmt-server and lmt-agent showed roughly 240 runtime worker threads because the default multi-thread Tokio runtime scales its worker count from available CPUs.
+
+This is not currently a correctness problem and memory usage remained small, so no immediate runtime tuning is authorized.
+
+During the trial, measure whether a small explicit worker count would reduce operational overhead without hurting poll/log/control-plane latency. Do not choose a fixed value from intuition alone.

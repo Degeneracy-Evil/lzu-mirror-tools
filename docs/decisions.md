@@ -474,6 +474,7 @@ The remaining questions are intentionally deferred beyond M3 unless production-t
 7. Whether real concurrent rsync + serving requires an explicit staging/snapshot/publication layer.
 8. If publication is required, whether Mirror should represent a logical published resource separately from a physical Node-owned data tree.
 9. What minimal lifecycle/verification hooks are justified by real publication/operations requirements.
+10. Whether large-core-count production hosts justify an explicit bounded Tokio worker policy for Server and Agent.
 
 ## Development principle
 
