@@ -555,13 +555,11 @@ impl Store {
         let hash = token_hash(token);
         self.call(move |connection| {
             let transaction = connection.transaction()?;
-            let exists: bool =
-                transaction.query_row("SELECT EXISTS(SELECT 1 FROM nodes WHERE name=?1)", [&node], |row| {
-                    row.get(0)
-                })?;
-            if !exists {
-                return Err(StoreError::AttemptNotFound);
-            }
+            transaction.execute(
+                "INSERT INTO nodes(name,registered_at_ms,active_runs,capabilities_json)
+                 VALUES(?1,?2,0,'{}') ON CONFLICT(name) DO NOTHING",
+                params![node, now],
+            )?;
             transaction.execute(
                 "INSERT INTO node_credentials(node_name,credential_id,token_hash,created_at_ms,label)
                  VALUES(?1,?2,?3,?4,?5)",
@@ -3119,6 +3117,75 @@ mod tests {
         assert_eq!(
             store.get_run(&run.id).await.expect("run").expect("run").state,
             RunState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_issue_atomically_bootstraps_an_offline_unbound_node() {
+        let store = Store::open_in_memory().await.expect("open");
+
+        let issued = store
+            .issue_credential("node-a", "first", Some("bootstrap"), "first-secret", 10)
+            .await
+            .expect("issue first credential");
+        assert_eq!(issued.node, "node-a");
+        let node = store
+            .list_nodes()
+            .await
+            .expect("nodes")
+            .pop()
+            .expect("bootstrapped node");
+        assert_eq!(node.name, "node-a");
+        assert_eq!(node.agent_instance_id, None);
+        assert_eq!(node.bound_agent_id, None);
+        assert_eq!(node.agent_boot_id, None);
+        assert_eq!(node.last_seen_at_ms, None);
+        assert_eq!(node.active_runs, 0);
+        assert_eq!(node.max_concurrent_runs, 1);
+        assert!(
+            store
+                .authenticate_credential("first-secret")
+                .await
+                .expect("authenticate")
+                .is_some()
+        );
+
+        store
+            .observe_node(NodeObservation {
+                node: "node-a".into(),
+                agent_version: "test-agent".into(),
+                agent_instance_id: "installation-a".into(),
+                agent_boot_id: "boot-a".into(),
+                active_runs: 0,
+                max_concurrent_runs: 2,
+                mirror_root_free_bytes: Some(1_000),
+                mirror_root: "/srv/mirrors".into(),
+                observed_at_ms: 15,
+            })
+            .await
+            .expect("observe existing node");
+        store
+            .issue_credential("node-a", "rotation", None, "rotation-secret", 20)
+            .await
+            .expect("issue for existing node");
+        let existing = store.list_nodes().await.expect("existing node").pop().expect("node-a");
+        assert_eq!(existing.bound_agent_id.as_deref(), Some("installation-a"));
+        assert_eq!(existing.last_seen_at_ms, Some(15));
+        assert_eq!(existing.max_concurrent_runs, 2);
+
+        let error = store
+            .issue_credential("node-b", "second", None, "first-secret", 30)
+            .await
+            .expect_err("duplicate active token hash");
+        assert!(matches!(error, StoreError::Database(_)));
+        assert!(
+            store
+                .list_nodes()
+                .await
+                .expect("nodes after rollback")
+                .iter()
+                .all(|node| node.name != "node-b"),
+            "failed credential insertion committed its bootstrap Node"
         );
     }
 

@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use lmt_core::{AttemptEvent, ConfigBundle, RunId, canonicalize_bundle};
+use lmt_core::{AttemptEvent, ConfigBundle, NodeName, RunId, canonicalize_bundle};
 use lmt_protocol::v1alpha1::*;
 use lmt_store::{AttemptRecord, ChangeKind, ConfigPlan, NodeObservation, RunRecord, Store, StoreError};
 use rand_core::{OsRng, RngCore};
@@ -918,9 +918,7 @@ async fn issue_credential(
     Json(request): Json<CredentialIssueRequest>,
 ) -> Result<Response, Failure> {
     operator(&h, &s)?;
-    if !s.store.list_nodes().await?.iter().any(|node| node.name == name) {
-        return Err(Failure::not_found("node_not_found"));
-    }
+    let name = NodeName::new(name).map_err(|error| Failure::bad("invalid_node_name", error.to_string()))?;
     let mut secret = [0_u8; 32];
     OsRng.try_fill_bytes(&mut secret).map_err(|_| {
         Failure::new(
@@ -933,7 +931,7 @@ async fn issue_credential(
     let credential = s
         .store
         .issue_credential(
-            &name,
+            name.as_str(),
             &ulid::Ulid::new().to_string(),
             request.label.as_deref(),
             &token,
@@ -2096,6 +2094,99 @@ mod tests {
             .expect("cancel");
         }
         assert_eq!(cancel_state.metrics.cancellations_immediate.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn clean_install_credential_issue_then_authenticated_poll_establishes_binding() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = Store::open_in_memory().await.expect("store");
+        let mut state = AppState::new(
+            store.clone(),
+            directory.path().join("logs"),
+            "operator".into(),
+            Duration::from_secs(90),
+        );
+        state.poll_wait = Duration::ZERO;
+        state.clock = Arc::new(FakeClock(AtomicI64::new(10)));
+        let mut operator_headers = HeaderMap::new();
+        operator_headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer operator"));
+
+        let invalid = issue_credential(
+            State(state.clone()),
+            operator_headers.clone(),
+            AxumPath("!invalid".into()),
+            Json(CredentialIssueRequest { label: None }),
+        )
+        .await
+        .expect_err("invalid Node name");
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+        assert_eq!(invalid.code, "invalid_node_name");
+        assert!(store.list_nodes().await.expect("nodes after invalid issue").is_empty());
+
+        let response = issue_credential(
+            State(state.clone()),
+            operator_headers,
+            AxumPath("node-a".into()),
+            Json(CredentialIssueRequest {
+                label: Some("first install".into()),
+            }),
+        )
+        .await
+        .expect("issue first credential");
+        let issued: CredentialIssueResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 16_384).await.expect("body"))
+                .expect("issue response");
+
+        let before_poll = store
+            .list_nodes()
+            .await
+            .expect("nodes")
+            .pop()
+            .expect("bootstrapped node");
+        assert_eq!(before_poll.name, "node-a");
+        assert_eq!(before_poll.last_seen_at_ms, None);
+        assert_eq!(before_poll.bound_agent_id, None);
+        assert!(store.list_mirrors().await.expect("mirrors").is_empty());
+
+        let request = PollRequest {
+            protocol_version: "v1alpha1".into(),
+            agent_version: "test-agent".into(),
+            agent_instance_id: "installation-a".into(),
+            agent_boot_id: "boot-a".into(),
+            poll_sequence: 1,
+            running: vec![],
+            capacity: Capacity {
+                mirror_root_free_bytes: Some(1_000),
+                active_runs: 0,
+                max_concurrent_runs: 1,
+            },
+            mirror_root: "/srv/mirrors".into(),
+        };
+        let unauthenticated = poll(State(state.clone()), HeaderMap::new(), Json(request.clone()))
+            .await
+            .expect_err("unauthenticated poll");
+        assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            store.list_nodes().await.expect("nodes")[0].bound_agent_id,
+            None,
+            "unauthenticated Agent poll established a binding"
+        );
+
+        let mut agent_headers = HeaderMap::new();
+        agent_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", issued.token)).expect("authorization header"),
+        );
+        let response = poll(State(state), agent_headers, Json(request))
+            .await
+            .expect("authenticated first poll");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let after_poll = store.list_nodes().await.expect("nodes").pop().expect("bound node");
+        assert_eq!(after_poll.bound_agent_id.as_deref(), Some("installation-a"));
+        assert_eq!(after_poll.agent_instance_id.as_deref(), Some("installation-a"));
+        assert_eq!(after_poll.agent_boot_id.as_deref(), Some("boot-a"));
+        assert_eq!(after_poll.last_seen_at_ms, Some(10));
+        assert!(store.list_mirrors().await.expect("mirrors").is_empty());
     }
 
     #[tokio::test]
