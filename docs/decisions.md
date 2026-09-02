@@ -482,8 +482,9 @@ When choosing between a broader abstraction and a smaller design, prefer the sma
 
 ## Proposed M4 decisions
 
-These remain design proposals. The adversarial M4 review requested changes, and
-this section now reflects revision 2.
+These remain design proposals. The second M4 review found the core architecture
+acceptable but requested final recovery/GC boundary changes. This section now
+reflects revision 3.
 
 ### D049 - Mirror denotes the logical published mirror resource
 
@@ -584,3 +585,66 @@ Before M4 rollout, operators create a control-plane backup. Server upgrades
 first, old Agents continue Direct work, then Agents upgrade and advertise atomic
 capability. Returning to M3 uses offline restore of compatible pre-M4 state and
 matching binaries rather than binary rollback over M4 state.
+
+
+### D062 - ready-to-commit is a durable write-ahead publication record
+
+Status: proposed.
+
+Atomic visibility commit is forbidden until the Agent has durably persisted
+ready_to_commit with the candidate/prior-published identities and commit intent.
+Publication-recovery phases bypass generic restart-to-Interrupted normalization.
+
+### D063 - post-visibility durability ambiguity has explicit abandon/fence recovery
+
+Status: proposed.
+
+Persistent visible_pending_durability may be explicitly abandoned only through a
+high-risk operator action. The Run terminates Failed without rollback, the
+Attempt performs no later namespace operation, and a local publication fence
+plus recovery evidence remains until explicitly cleared.
+
+### D064 - publication recovery evidence survives spool reset/restore/downgrade
+
+Status: proposed.
+
+ready_to_commit, visible_pending_durability, committed_pending_report, and
+abandoned_fenced records are protected correctness state. Generic spool cleanup
+must refuse to delete them. Downgrade requires their prior resolution using M4
+semantics.
+
+### D065 - atomic GC has a frozen protected set and fail-closed admission gate
+
+Status: proposed.
+
+Current published, stable previous, every live/recoverable-spool path, and every
+path referenced by publication recovery/fence state are non-GCable. If GC cannot
+bring private-generation count below the hard bound or publication free space
+above reserve, new atomic Attempts remain blocked.
+
+### D066 - the fixed exchange slot determines previous-generation ownership
+
+Status: proposed.
+
+A fresh candidate is staged into one fixed private exchange slot immediately
+before commit. RENAME_EXCHANGE with the published target makes that same slot
+contain the immediately previous published tree after commit. Spool phase and
+inode identities disambiguate pre-commit crash states without a separate
+publication manifest.
+
+### D067 - quiescent Move is one transactional Store decision
+
+Status: proposed.
+
+The active-Run check and owner-node update occur in the same Store transaction as
+Move reconciliation. Concurrent Run creation either wins and rejects Move, or
+Move wins and no old-owner Run can be created.
+
+### D068 - M3 compatibility is tested from frozen historical artifacts
+
+Status: proposed.
+
+M4 compatibility gates consume verbatim M3 PollRequest, PollResponse, and Direct
+ProcessRunSpec fixtures captured from the accepted M3 baseline rather than
+serializing M4 structs into an imagined legacy shape. Downgrade also restores
+the matching pre-M4 authoritative TOML bundle.

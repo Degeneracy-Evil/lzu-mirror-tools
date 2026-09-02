@@ -1,12 +1,12 @@
 # M4 Publication Architecture Design
 
-Status: **proposed revision 2 after adversarial review**.
+Status: **proposed revision 3 after second architecture review**.
 
-This document is not frozen and does not authorize implementation.
+This document is a freeze candidate, but it does not authorize implementation.
 
-The revision addresses the release blockers raised in the adversarial review:
-crash durability, fresh-generation rsync semantics, hard-link immutability,
-Move races, and forward-only version compatibility.
+Revision 3 closes the remaining post-visibility recovery, write-ahead ordering,
+spool-protection, GC/admission, previous-generation reconstruction, transactional
+Move, and frozen-M3 compatibility-test boundaries raised by the second review.
 
 ## 1. Problem proven by the production trial
 
@@ -96,60 +96,173 @@ This fsync is not a recursive fsync of a multi-terabyte repository.
 M4 therefore does not promise that every newly synchronized file byte survives
 an arbitrary sudden power loss merely because the Run had succeeded.
 
-## 4. Crash and power-loss contract
+## 4. Crash, recovery, and write-ahead contract
 
-### Daemon/process crash before visibility commit
+### 4.1 Required write-ahead ordering
+
+Atomic publication must obey this ordering:
+
+~~~text
+1. synchronization process completes successfully
+2. candidate identity + prior published identity + commit intent are written
+   durably to Agent spool as ready_to_commit
+3. cancellation/preconditions are rechecked under the local Attempt commit lock
+4. visibility commit executes
+5. required parent-directory fsync operations complete
+6. Agent spool is written durably as committed/terminal-pending-report
+7. AttemptSucceeded is emitted to Server
+~~~
+
+The critical invariant is:
+
+> `ready_to_commit` must be durable before the visibility commit is allowed.
+
+Durable spool write means the record itself and the spool namespace update are
+persisted using the Agent's crash-safe file-publication procedure.
+
+If the daemon crashes after step 4 but before a later spool update, the durable
+`ready_to_commit` record plus stored path identities is sufficient to discover
+that visibility commit already happened.
+
+### 4.2 Recovery phases override generic Interrupted recovery
+
+The existing generic rule that a restarted Agent turns owned non-terminal process
+execution into Interrupted applies only to pre-commit execution phases.
+
+A spool record in any publication-recovery phase, including:
+
+~~~text
+ready_to_commit
+visible_pending_durability
+committed_pending_report
+~~~
+
+must not be normalized to Interrupted merely because the Agent restarted.
+
+Publication recovery reconciles the existing Attempt first.
+
+### 4.3 Daemon/process crash before visibility commit
 
 The old published tree remains visible.
 
-Recovery reconciles the durable Agent spool with the Server before any commit.
+If the durable phase is ordinary execution, existing Interrupted semantics apply.
 
-A retry uses a fresh Attempt candidate.
+If the durable phase is `ready_to_commit`, the Agent first reconciles with the
+Server so a cancellation already persisted by the Server can be delivered before
+commit.
 
-### Daemon/process crash after visibility commit but before namespace durability
+A later retry, if any, always uses a fresh Attempt candidate.
 
-The candidate may already be visible at the published path.
+### 4.4 Daemon/process crash after visibility commit
 
-The durable spool records the candidate identity and the internal phase.
+The candidate may already be visible at the published path while the durable spool
+still says `ready_to_commit` or `visible_pending_durability`.
 
-On restart, the Agent identifies which pathname contains the candidate, completes
-the required directory fsync operations, and only then reports AttemptSucceeded.
+Recovery compares stored filesystem identities with the fixed publication paths.
 
-It must not re-run synchronization or automatically exchange back to the old tree.
+If the candidate identity is at the published path, the visibility commit is
+treated as having happened. The Agent must:
 
-### Directory fsync error after visibility commit
+- never exchange back automatically;
+- never re-run synchronization for the same Attempt;
+- complete namespace durability/finalization;
+- converge toward AttemptSucceeded for the same Attempt.
 
-A post-visibility fsync failure is not treated as an ordinary retryable sync
-failure because publication may already be visible.
+### 4.5 Directory fsync failure after visibility commit
 
-The Attempt remains locally owned in an internal
-`visible_pending_durability` recovery phase.
+A post-visibility fsync failure is not an ordinary retryable sync failure because
+the new tree may already be public.
+
+The Attempt remains locally owned in:
+
+~~~text
+visible_pending_durability
+~~~
 
 The Agent:
 
 - keeps the public Run non-terminal;
 - retries the durability operation;
-- reports critical health/diagnostic state;
-- blocks another atomic Attempt for that Mirror until the ambiguity is resolved.
+- reports critical publication-health state;
+- blocks every new atomic Attempt for that Mirror;
+- blocks publication mode change;
+- keeps Move blocked while the Run remains non-terminal.
 
-M4 does not invent a public Run state for this rare storage fault.
+### 4.6 Explicit operator recovery and abandon/fence
 
-### Sudden power loss
+`visible_pending_durability` must have an operator-controlled termination path.
+
+The recovery choices are:
+
+~~~text
+visible_pending_durability
+├── durability later succeeds
+│     -> same Attempt Succeeded
+├── operator repairs storage
+│     -> retry durability
+└── explicit abandon/fence
+      -> same Attempt terminal Failed
+      -> no automatic rollback
+      -> local publication fence remains until separately cleared
+~~~
+
+Abandon/fence is a high-risk explicit operation against the affected Run/Attempt.
+It is never automatic.
+
+Its contract is:
+
+- it acknowledges that visibility may already have committed;
+- it does not claim namespace durability succeeded;
+- it writes a durable local `abandoned_fenced` record before terminal failure is
+  reported;
+- it terminates the public Run with a publication-durability failure category;
+- it guarantees no further namespace operation will be performed by that
+  abandoned Attempt;
+- it releases the Mirror from the public non-terminal Run so an operator may
+  perform controlled Move/recovery;
+- the old Node retains a local publication fence and recovery evidence until an
+  explicit fence-clear operation confirms the local publication paths are safe.
+
+A fence-clear operation is allowed only after doctor/preflight can establish a
+stable local namespace and no recoverable commit remains.
+
+The explicit abandon path exists to escape permanent EIO without lying that the
+Attempt succeeded or silently discarding evidence.
+
+### 4.7 Sudden power loss
 
 M4 does not claim a full power-loss transaction.
 
 After reboot the Agent recovers from the filesystem state that survived:
 
-- if the candidate identity is at the published path, it completes namespace
-  durability/reconciliation and converges toward success;
-- if the candidate remains private, the visibility commit did not survive and
-  normal pre-commit reconciliation applies;
-- if identity evidence is inconsistent or missing, the Mirror enters a
-  fail-closed local publication-health condition and new atomic Attempts are
-  blocked until operator repair.
+- candidate identity at published path -> recover post-visibility state;
+- candidate identity still private -> visibility commit did not survive;
+- inconsistent/missing identity evidence -> fail closed and require operator
+  publication recovery/fence handling.
 
 M4 does not recursively fsync every candidate file and therefore makes no
 stronger data-durability claim.
+
+### 4.8 Publication recovery evidence is protected operational state
+
+The following spool phases are correctness evidence, not disposable retry state:
+
+~~~text
+ready_to_commit
+visible_pending_durability
+committed_pending_report
+abandoned_fenced
+~~~
+
+Ordinary spool reset, restore cleanup, Agent replacement cleanup, or downgrade
+cleanup must not delete them.
+
+Any operation that would archive/reset Agent Attempt spool must first scan for
+protected publication evidence and fail closed when it exists.
+
+The operator must resolve the Attempt through normal publication recovery or the
+explicit abandon/fence procedure before destructive spool maintenance can
+proceed.
 
 ## 5. Mirror identity
 
@@ -219,26 +332,43 @@ published:
 /srv/mirrors/ubuntu
 
 private:
-/srv/lmt-publication/ubuntu/attempts/<run>-<attempt>/root
+/srv/lmt-publication/ubuntu/
+├── attempts/<run>-<attempt>/root
+├── exchange/
+└── gc/
 ~~~
 
-After successful synchronization:
+Each Attempt is built in a fresh `attempts/<run>-<attempt>/root` candidate.
+
+Immediately before an update commit, the Agent prepares one fixed private
+`exchange/` slot:
+
+1. any stable previous generation currently in `exchange/` is renamed to a
+   uniquely named protected GC path;
+2. the fresh candidate is renamed into `exchange/`;
+3. the new candidate identity and all rotated paths are persisted in the durable
+   `ready_to_commit` spool record;
+4. the visibility commit is:
 
 ~~~text
 RENAME_EXCHANGE(
-    candidate,
-    published
+    /srv/lmt-publication/ubuntu/exchange,
+    /srv/mirrors/ubuntu
 )
 ~~~
 
-After the visibility commit:
+After a successful exchange:
 
 ~~~text
 published path = new tree
-candidate path = old published tree
+exchange/      = immediately previous published tree
 ~~~
 
-First publication uses a no-overwrite rename into an absent target.
+Thus the fixed `exchange/` pathname is also the stable previous-generation slot
+after every completed/recovered commit.
+
+First publication uses a no-overwrite rename into an absent target and then
+establishes an empty/absent previous slot according to the same recovery rules.
 
 The public pathname remains a normal directory.
 
@@ -284,8 +414,18 @@ spool_dir = "/var/lib/lmt-agent/spool"
 
 No private `.lmt` hierarchy is placed under the served mirror root.
 
-A storage-safety reserve/admission policy must be frozen in the implementation
-plan before code is accepted.
+Atomic admission is fail-closed.
+
+Before creating a new candidate, the Agent must run GC and then reject admission
+when any of these remain true:
+
+- unresolved publication recovery/fence state exists for the Mirror;
+- the configured/documented hard bound on private generations is reached;
+- publication-root free space is below the explicit publication reserve.
+
+The exact numeric default for the generation bound and free-space reserve belongs
+to the implementation plan, but the gate behavior is architectural and is not a
+hidden heuristic.
 
 ## 11. Mirror configuration
 
@@ -467,41 +607,106 @@ the Mirror has a Pending or Running Run.
 
 `--acknowledge-moves` does not override this safety rule.
 
+The quiescent check and owner-node update must occur in the **same Store
+transaction** as the config reconciliation that performs the Move.
+
+Run creation and Move therefore race through one authoritative SQLite state
+transition. The only valid outcomes are:
+
+~~~text
+Move wins -> owner changes, no old-owner Run is created
+Run wins  -> active Run exists, Move is rejected
+~~~
+
+There is no valid interleaving in which an old-owner Run is created after a
+successful quiescent check but before ownership changes.
+
 Operators must wait for terminal state or explicitly cancel and wait for
 terminal reconciliation before applying the Move.
 
-This prevents an old owner in `ready_to_commit` or publication recovery from
-publishing after ownership has moved.
+An `abandoned_fenced` publication Attempt is terminal and performs no future
+namespace operation, so it no longer blocks the control-plane quiescent test.
+The old Node's local publication fence remains an operational condition until
+explicitly cleared.
 
 M4 does not introduce leases, Move effective timestamps, traffic barriers, or
 cross-node publication coordination.
 
-## 20. Previous generation and GC
+## 20. Previous generation, protected set, GC, and admission
 
-After exchange, the old published tree is retained as one internal previous
-namespace generation.
+### 20.1 Deterministic previous-generation ownership
 
-It is not an independent snapshot and there is no automatic rollback API.
+The fixed private `exchange/` pathname is the stable previous-generation slot
+after a successful or recovered update commit.
 
-Older retired private trees and abandoned candidates are garbage.
+The commit preparation may temporarily place the new candidate in `exchange/`
+before visibility commit. During that window the durable spool phase and stored
+inode identities distinguish candidate from previous.
 
-GC is not allowed to become unbounded best effort.
+After `RENAME_EXCHANGE(exchange, published)` succeeds, `exchange/`
+deterministically contains the old published tree.
 
-M4 requires:
+No separate publication manifest is required for previous-generation identity.
 
-- bounded per-Mirror private-generation count;
-- GC backlog metrics;
-- GC failure metrics;
-- publication-storage free-space reporting;
-- health degradation when stale garbage cannot be reclaimed;
-- admission control that blocks new atomic Attempts when unresolved commit
-  state or unsafe GC/storage conditions exist.
+### 20.2 GC protected set
 
-The exact free-space reserve policy and cleanup bounds are implementation-plan
-decisions and must be explicit rather than hidden heuristics.
+GC MUST NOT delete or mutate:
 
-ENOSPC during candidate construction fails the Attempt without changing the
-published tree.
+- the current published tree;
+- the stable previous generation in `exchange/`;
+- any candidate/path referenced by a live or recoverable spool record;
+- any path referenced by `ready_to_commit`;
+- any path referenced by `visible_pending_durability`;
+- any path referenced by `committed_pending_report`;
+- any path/evidence protected by `abandoned_fenced`;
+- any rotated old-previous path still referenced by an in-progress commit.
+
+Everything outside this protected set is eligible garbage only after normal
+ownership/age checks.
+
+### 20.3 Hard private-generation bound
+
+Private-generation accumulation is bounded.
+
+Before a new atomic Attempt is admitted:
+
+1. run eligible GC;
+2. recompute the protected and garbage sets;
+3. compare the remaining private-generation count with the hard bound;
+4. check the publication free-space reserve.
+
+If the hard bound is still reached, the new atomic Attempt is not created.
+
+If GC cannot restore the private state below the bound, admission remains
+blocked and health remains degraded.
+
+The gate is per owner Node/Mirror storage, not a Server-side estimate of remote
+filesystem usage.
+
+### 20.4 Space pressure
+
+Publication-storage free bytes are operational capacity.
+
+Below the explicit reserve, new atomic Attempts are blocked before candidate
+creation.
+
+The reserve does not promise that a future candidate will fit; link-dest can
+fall back to real copies and repository changes are not predictable.
+
+ENOSPC during pre-visibility candidate construction fails the Attempt without
+changing the published tree.
+
+Post-visibility storage/durability failures use publication recovery semantics
+rather than ordinary retry.
+
+### 20.5 Previous is not rollback state
+
+The previous generation is retained for serving-reference grace, diagnosis, and
+operator recovery.
+
+It is a hard-link-sharing namespace generation, not an isolated snapshot.
+
+M4 provides no automatic rollback API.
 
 ## 21. Serving-plane behavior
 
@@ -567,6 +772,21 @@ The supported matrix is:
 
 M4 Server must accept legacy M3 Agent poll bodies with no capability field.
 
+Compatibility tests must use frozen M3 wire fixtures captured from the accepted
+M3 implementation baseline, not JSON generated by M4 structs.
+
+At minimum the repository freezes verbatim fixtures for:
+
+~~~text
+M3 PollRequest JSON
+M3 PollResponse JSON
+M3 Direct ProcessRunSpec JSON
+~~~
+
+Those fixtures are immutable compatibility artifacts. Where practical, CI should
+also run an integration check against an Agent built from the accepted M3
+baseline, but the frozen wire fixtures are the minimum release gate.
+
 M4 Agent advertises publication capability explicitly.
 
 M4 Server dispatches atomic work only to Agents advertising the required
@@ -593,13 +813,24 @@ M4 does not promise that an M3 Server can run safely on state produced by an M4
 control plane or communicate with an M4 Agent.
 
 Downgrade therefore means an offline recovery procedure, not binary rollback in
-place:
+place.
+
+Before downgrade, the M4 tooling must prove there is no protected publication
+recovery evidence. If `ready_to_commit`, `visible_pending_durability`,
+`committed_pending_report`, or `abandoned_fenced` exists, downgrade is
+refused until M4 recovery/abandon procedures resolve it.
+
+A valid downgrade then requires:
 
 - stop Server/Agents;
 - restore the pre-M4 control-plane backup using the existing restore contract;
-- install the matching older binaries/configuration;
+- restore the matching pre-M4 authoritative TOML bundle/configuration;
+- install matching older binaries;
 - preserve Mirror data;
-- reset/reconcile Agent spool according to the downgrade runbook.
+- archive/reset only spool records proven safe for M3.
+
+This prevents M3 restore tooling from discarding publication evidence it does
+not understand and prevents M3 from parsing an M4 `[publication]` config.
 
 This matches LMT's existing forward-only migration philosophy.
 
@@ -720,7 +951,20 @@ Automated acceptance must cover at least:
 17. M4 Server + M3 Agent Direct mode works;
 18. M4 Server never sends atomic spec to an M3 Agent;
 19. Direct ProcessRunSpec sent to M3 Agent contains no new publication field;
-20. supported XFS/ext4/Btrfs rename probes where integration infrastructure permits.
+20. supported XFS/ext4/Btrfs rename probes where integration infrastructure permits;
+21. ready_to_commit is durably recorded before every visibility commit;
+22. restart recovery does not convert publication-recovery phases to Interrupted;
+23. persistent post-visibility fsync failure can be explicitly abandoned/fenced;
+24. reset-spool/restore/downgrade refuse protected publication evidence;
+25. GC never deletes the frozen protected set;
+26. hard private-generation bound blocks admission until GC recovers;
+27. previous generation is reconstructed deterministically through the fixed
+    exchange slot;
+28. Move apply versus manual/scheduled Run creation is transactional and has only
+    the two valid race outcomes;
+29. compatibility tests consume frozen M3 wire fixtures, not M4-generated legacy
+    structs;
+30. downgrade restores matching pre-M4 TOML as well as database/binaries.
 
 A small real-host smoke test is sufficient after automated coverage.
 
