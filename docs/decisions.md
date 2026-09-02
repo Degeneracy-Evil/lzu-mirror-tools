@@ -648,3 +648,15 @@ M4 compatibility gates consume verbatim M3 PollRequest, PollResponse, and Direct
 ProcessRunSpec fixtures captured from the accepted M3 baseline rather than
 serializing M4 structs into an imagined legacy shape. Downgrade also restores
 the matching pre-M4 authoritative TOML bundle.
+
+
+### D069 - pre-visibility abort restores the stable exchange slot
+
+Status: proposed.
+
+If commit preparation has moved the fresh candidate into the fixed exchange slot
+and rotated the former previous generation, but cancellation or another
+precondition wins before visibility commit, the Agent must restore the stable
+previous-generation layout before reporting a terminal Attempt. Failure to
+restore that private layout is a fail-closed local publication-recovery state
+that blocks new atomic admission.

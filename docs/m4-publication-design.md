@@ -153,6 +153,23 @@ commit.
 
 A later retry, if any, always uses a fresh Attempt candidate.
 
+If commit preparation has already staged the fresh candidate into the fixed
+`exchange/` slot and rotated the old previous generation to a protected GC
+path, but cancellation/precondition failure wins before visibility commit, the
+Agent must restore the stable private layout before terminalizing the Attempt:
+
+~~~text
+exchange/ candidate -> discarded/private garbage
+rotated prior previous -> exchange/
+fsync private publication parent
+then terminal Cancelled/Failed
+~~~
+
+If that private-layout restoration cannot be completed, the Attempt remains in
+a local pre-visibility recovery/fenced phase and new atomic admission stays
+blocked. The public serving tree is still unchanged, but LMT must not pretend
+the private publication state is clean.
+
 ### 4.4 Daemon/process crash after visibility commit
 
 The candidate may already be visible at the published path while the durable spool
