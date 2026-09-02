@@ -1,0 +1,1 @@
+{"runner":"process","program":"/usr/bin/rsync","args":["-aH","--delete","rsync://example.invalid/archive/","/srv/mirrors/example"],"cwd":null,"timeout_seconds":21600,"mirror_root":"/srv/mirrors","target_dir":"/srv/mirrors/example"}

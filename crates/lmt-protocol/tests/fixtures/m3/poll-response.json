@@ -1,0 +1,1 @@
+{"actions":[{"type":"start_attempt","run_id":"01M30000000000000000000003","attempt":1,"spec_hash":"sha256:m3-direct-fixture","spec":{"runner":"process","program":"/usr/bin/rsync","args":["-aH","--delete","rsync://example.invalid/archive/","/srv/mirrors/example"],"cwd":null,"timeout_seconds":21600,"mirror_root":"/srv/mirrors","target_dir":"/srv/mirrors/example"}}]}

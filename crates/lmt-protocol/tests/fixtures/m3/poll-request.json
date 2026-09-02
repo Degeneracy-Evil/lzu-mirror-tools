@@ -1,0 +1,1 @@
+{"protocol_version":"v1alpha1","agent_version":"0.1.0-alpha.1","agent_instance_id":"01M30000000000000000000000","agent_boot_id":"01M30000000000000000000001","poll_sequence":42,"running":[{"run_id":"01M30000000000000000000002","attempt":2,"state":"running"}],"capacity":{"mirror_root_free_bytes":1099511627776,"active_runs":1,"max_concurrent_runs":2},"mirror_root":"/srv/mirrors"}
