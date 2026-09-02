@@ -6,8 +6,9 @@ use std::{
 };
 
 use lmt_core::{
-    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, ProcessRunSpec, RetryDecision, RunId,
-    RunState, ScheduleRuntime, activate_schedule, project_attempt_event,
+    AttemptEvent, AttemptState, CanonicalBundle, FailureKind, MirrorDocument, ProcessRunSpec, PublicationMode,
+    RetryDecision, RunId, RunState, ScheduleRuntime, activate_schedule, project_attempt_event,
+    publication_mode_from_toml,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -63,6 +64,12 @@ pub enum ChangeKind {
     Move,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PublicationChange {
+    DirectToAtomic,
+    AtomicToDirect,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ConfigChange {
     pub kind: ChangeKind,
@@ -71,6 +78,7 @@ pub struct ConfigChange {
     pub to_generation: Option<u64>,
     pub from_node: Option<String>,
     pub to_node: Option<String>,
+    pub publication_change: Option<PublicationChange>,
 }
 
 #[derive(Debug, Clone)]
@@ -1592,7 +1600,7 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
         row.get(0)
     })?;
     let mut statement = connection.prepare(
-        "SELECT m.name,m.managed,m.owner_node,m.current_generation,g.config_hash FROM mirrors m
+        "SELECT m.name,m.managed,m.owner_node,m.current_generation,g.config_hash,g.config_toml FROM mirrors m
          JOIN mirror_generations g ON g.mirror_name=m.name AND g.generation=m.current_generation",
     )?;
     let current = statement
@@ -1603,11 +1611,12 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
                 row.get::<_, String>(2)?,
                 row.get::<_, u64>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut changes = Vec::new();
-    for (name, managed, node, generation, hash) in &current {
+    for (name, managed, node, generation, hash, current_toml) in &current {
         let parsed = lmt_core::MirrorName::new(name).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
         match bundle.mirrors.get(&parsed) {
             None if *managed => changes.push(ConfigChange {
@@ -1617,6 +1626,7 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
                 to_generation: None,
                 from_node: Some(node.clone()),
                 to_node: None,
+                publication_change: None,
             }),
             Some(next) if !managed || next.config_hash != *hash || next.owner_node.as_str() != node => {
                 let kind = if *managed && next.owner_node.as_str() != node {
@@ -1631,6 +1641,7 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
                     to_generation: Some(generation + 1),
                     from_node: Some(node.clone()),
                     to_node: Some(next.owner_node.to_string()),
+                    publication_change: publication_change(current_toml, &next.document)?,
                 });
             }
             _ => {}
@@ -1645,6 +1656,7 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
                 to_generation: Some(1),
                 from_node: None,
                 to_node: Some(mirror.owner_node.to_string()),
+                publication_change: None,
             });
         }
     }
@@ -1653,6 +1665,16 @@ fn plan_with_connection(connection: &Connection, bundle: &CanonicalBundle) -> Re
         base_revision,
         bundle_hash: bundle.bundle_hash.clone(),
         changes,
+    })
+}
+
+fn publication_change(current_toml: &str, next: &MirrorDocument) -> Result<Option<PublicationChange>, StoreError> {
+    let current =
+        publication_mode_from_toml(current_toml).map_err(|error| StoreError::InvalidConfig(error.to_string()))?;
+    Ok(match (current, next.publication_mode()) {
+        (PublicationMode::Direct, PublicationMode::Atomic) => Some(PublicationChange::DirectToAtomic),
+        (PublicationMode::Atomic, PublicationMode::Direct) => Some(PublicationChange::AtomicToDirect),
+        _ => None,
     })
 }
 
@@ -2060,6 +2082,22 @@ mod tests {
         .expect("valid")
     }
 
+    fn publication_bundle(node: &str, mode: PublicationMode) -> CanonicalBundle {
+        let publication = match mode {
+            PublicationMode::Direct => String::new(),
+            PublicationMode::Atomic => "[publication]\nmode='atomic'\n".into(),
+        };
+        canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: format!("nodes/{node}/mirrors/demo.toml"),
+                contents: format!(
+                    "[mirror]\nname='demo'\ntarget='demo'\n[sync]\ntype='command'\nprogram='/bin/true'\n{publication}"
+                ),
+            }],
+        })
+        .expect("valid publication bundle")
+    }
+
     #[tokio::test]
     async fn offline_restore_normalizes_execution_without_erasing_schedule_state() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -2408,6 +2446,33 @@ mod tests {
             store.apply(&changed, 0, "stale", 20).await,
             Err(StoreError::RevisionConflict { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn plan_preserves_publication_mode_direction_alongside_move() {
+        let store = Store::open_in_memory().await.expect("open");
+        let direct = publication_bundle("node-a", PublicationMode::Direct);
+        store.apply(&direct, 0, "direct", 1).await.expect("apply Direct");
+
+        let atomic_move = publication_bundle("node-b", PublicationMode::Atomic);
+        let move_plan = store.plan(&atomic_move).await.expect("plan Atomic Move");
+        assert_eq!(move_plan.changes[0].kind, ChangeKind::Move);
+        assert_eq!(
+            move_plan.changes[0].publication_change,
+            Some(PublicationChange::DirectToAtomic)
+        );
+        store
+            .apply(&atomic_move, move_plan.base_revision, "atomic", 2)
+            .await
+            .expect("apply Atomic Move");
+
+        let direct_again = publication_bundle("node-b", PublicationMode::Direct);
+        let direct_plan = store.plan(&direct_again).await.expect("plan Direct");
+        assert_eq!(direct_plan.changes[0].kind, ChangeKind::Update);
+        assert_eq!(
+            direct_plan.changes[0].publication_change,
+            Some(PublicationChange::AtomicToDirect)
+        );
     }
 
     #[tokio::test]

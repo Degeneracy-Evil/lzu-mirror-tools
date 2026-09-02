@@ -55,6 +55,15 @@ impl MirrorDocument {
     }
 }
 
+pub fn publication_mode_from_toml(source: &str) -> Result<PublicationMode, ConfigError> {
+    toml::from_str::<MirrorDocument>(source)
+        .map(|document| document.publication_mode())
+        .map_err(|error| ConfigError::InvalidToml {
+            path: "<stored mirror generation>".into(),
+            message: error.to_string(),
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MirrorConfig {
@@ -178,6 +187,14 @@ pub enum ConfigError {
     UnsupportedPlaceholder(String),
     #[error("atomic publication requires an Agent publication root")]
     MissingPublicationRoot,
+    #[error("mirror targets overlap on Node {node}: {first} and {second}")]
+    TargetOverlap {
+        node: NodeName,
+        first: MirrorName,
+        second: MirrorName,
+    },
+    #[error("atomic rsync option {option:?} is invalid: {reason}")]
+    AtomicRsyncOption { option: String, reason: &'static str },
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +293,7 @@ pub fn canonicalize_bundle(bundle: &ConfigBundle) -> Result<CanonicalBundle, Vec
             Err(error) => errors.push(error),
         }
     }
+    errors.extend(target_overlap_errors(&mirrors));
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -365,7 +383,11 @@ fn validate_document(document: &MirrorDocument) -> Result<(), ConfigError> {
             }
         }
         SyncConfig::Rsync { source, .. } if source.is_empty() => return Err(ConfigError::EmptyRsyncSource),
-        SyncConfig::Rsync { .. } => {}
+        SyncConfig::Rsync { args, .. } => {
+            if document.publication_mode() == PublicationMode::Atomic {
+                validate_atomic_rsync_args(args)?;
+            }
+        }
     }
     if !(1..=604_800).contains(&document.run.timeout_seconds) {
         return Err(ConfigError::InvalidTimeout);
@@ -378,6 +400,149 @@ fn validate_document(document: &MirrorDocument) -> Result<(), ConfigError> {
     }
     if let Some(schedule) = &document.schedule {
         schedule.validate().map_err(ConfigError::InvalidSchedule)?;
+    }
+    Ok(())
+}
+
+fn target_overlap_errors(mirrors: &BTreeMap<MirrorName, CanonicalMirror>) -> Vec<ConfigError> {
+    let entries: Vec<_> = mirrors.iter().collect();
+    let mut errors = Vec::new();
+    for (index, (first_name, first)) in entries.iter().enumerate() {
+        for (second_name, second) in entries.iter().skip(index + 1) {
+            if first.owner_node != second.owner_node {
+                continue;
+            }
+            let first_target = Path::new(&first.document.mirror.target);
+            let second_target = Path::new(&second.document.mirror.target);
+            if first_target.starts_with(second_target) || second_target.starts_with(first_target) {
+                errors.push(ConfigError::TargetOverlap {
+                    node: first.owner_node.clone(),
+                    first: (*first_name).clone(),
+                    second: (*second_name).clone(),
+                });
+            }
+        }
+    }
+    errors
+}
+
+#[derive(Clone, Copy)]
+enum AtomicRsyncOptionKind {
+    Flag,
+    Value,
+    Rejected(&'static str),
+}
+
+fn atomic_rsync_long_option(name: &str) -> Option<AtomicRsyncOptionKind> {
+    use AtomicRsyncOptionKind::{Flag, Rejected, Value};
+    match name {
+        "archive" | "recursive" | "links" | "perms" | "times" | "group" | "owner" | "devices" | "specials"
+        | "hard-links" | "acls" | "xattrs" | "numeric-ids" | "prune-empty-dirs" | "compress" | "whole-file"
+        | "checksum" | "size-only" | "ignore-times" | "protect-args" | "itemize-changes" | "stats"
+        | "human-readable" | "verbose" | "quiet" | "progress" | "copy-links" | "safe-links" | "copy-unsafe-links" => {
+            Some(Flag)
+        }
+        "include" | "exclude" | "filter" | "include-from" | "exclude-from" | "files-from" | "max-size" | "min-size"
+        | "bwlimit" | "timeout" | "contimeout" | "block-size" | "checksum-choice" | "compress-choice" => Some(Value),
+        "delete"
+        | "delete-before"
+        | "delete-during"
+        | "delete-delay"
+        | "delete-after"
+        | "delete-excluded"
+        | "max-delete"
+        | "force"
+        | "ignore-errors"
+        | "existing"
+        | "ignore-existing"
+        | "ignore-non-existing"
+        | "update" => Some(Rejected(
+            "fresh-generation Atomic publication has no existing destination history",
+        )),
+        "inplace"
+        | "append"
+        | "append-verify"
+        | "write-devices"
+        | "link-dest"
+        | "copy-dest"
+        | "compare-dest"
+        | "backup"
+        | "backup-dir"
+        | "suffix"
+        | "partial"
+        | "partial-dir"
+        | "remove-source-files"
+        | "remove-sent-files"
+        | "dry-run"
+        | "list-only" => Some(Rejected(
+            "option conflicts with LMT-owned Atomic candidate materialization",
+        )),
+        _ => None,
+    }
+}
+
+fn validate_atomic_rsync_args(args: &[String]) -> Result<(), ConfigError> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if let Some(long) = argument.strip_prefix("--") {
+            let (name, inline_value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match atomic_rsync_long_option(name) {
+                Some(AtomicRsyncOptionKind::Flag) if inline_value.is_none() => {}
+                Some(AtomicRsyncOptionKind::Flag) => {
+                    return Err(ConfigError::AtomicRsyncOption {
+                        option: argument.clone(),
+                        reason: "flag does not accept a value",
+                    });
+                }
+                Some(AtomicRsyncOptionKind::Value) if inline_value.is_some_and(|value| !value.is_empty()) => {}
+                Some(AtomicRsyncOptionKind::Value)
+                    if inline_value.is_none() && index + 1 < args.len() && !args[index + 1].starts_with('-') =>
+                {
+                    index += 1;
+                }
+                Some(AtomicRsyncOptionKind::Value) => {
+                    return Err(ConfigError::AtomicRsyncOption {
+                        option: argument.clone(),
+                        reason: "option requires a value",
+                    });
+                }
+                Some(AtomicRsyncOptionKind::Rejected(reason)) => {
+                    return Err(ConfigError::AtomicRsyncOption {
+                        option: argument.clone(),
+                        reason,
+                    });
+                }
+                None => {
+                    return Err(ConfigError::AtomicRsyncOption {
+                        option: argument.clone(),
+                        reason: "option is not in the audited Atomic profile",
+                    });
+                }
+            }
+        } else if let Some(short) = argument.strip_prefix('-') {
+            if short.is_empty()
+                || short.chars().any(|option| {
+                    !matches!(
+                        option,
+                        'a' | 'r' | 'l' | 'p' | 't' | 'g' | 'o' | 'D' | 'H' | 'A' | 'X' | 'z' | 's' | 'v' | 'q'
+                    )
+                })
+            {
+                return Err(ConfigError::AtomicRsyncOption {
+                    option: argument.clone(),
+                    reason: "short option is not in the audited Atomic profile",
+                });
+            }
+        } else {
+            return Err(ConfigError::AtomicRsyncOption {
+                option: argument.clone(),
+                reason: "positional arguments are owned by LMT",
+            });
+        }
+        index += 1;
     }
     Ok(())
 }
@@ -530,6 +695,85 @@ mod tests {
         assert!(publication.candidate_dir.ends_with(&format!("{run_id}-2/root")));
         assert_eq!(publication.exchange_dir, "/srv/publication/example/exchange");
         assert_eq!(publication.gc_dir, "/srv/publication/example/gc");
+    }
+
+    #[test]
+    fn same_node_targets_cannot_overlap_but_cross_node_targets_may_match() {
+        for second_target in ["archive", "archive/pool"] {
+            let overlapping = ConfigBundle {
+                files: vec![
+                    BundleFile {
+                        path: "nodes/node-a/mirrors/first.toml".into(),
+                        contents:
+                            "[mirror]\nname='first'\ntarget='archive'\n[sync]\ntype='command'\nprogram='/bin/true'\n"
+                                .into(),
+                    },
+                    BundleFile {
+                        path: "nodes/node-a/mirrors/second.toml".into(),
+                        contents: format!(
+                            "[mirror]\nname='second'\ntarget='{second_target}'\n[sync]\ntype='command'\nprogram='/bin/true'\n"
+                        ),
+                    },
+                ],
+            };
+            assert!(
+                canonicalize_bundle(&overlapping)
+                    .expect_err("overlap")
+                    .iter()
+                    .any(|error| matches!(error, ConfigError::TargetOverlap { .. }))
+            );
+        }
+
+        let separate_nodes = ConfigBundle {
+            files: vec![
+                BundleFile {
+                    path: "nodes/node-a/mirrors/first.toml".into(),
+                    contents: "[mirror]\nname='first'\ntarget='archive'\n[sync]\ntype='command'\nprogram='/bin/true'\n"
+                        .into(),
+                },
+                BundleFile {
+                    path: "nodes/node-b/mirrors/second.toml".into(),
+                    contents:
+                        "[mirror]\nname='second'\ntarget='archive'\n[sync]\ntype='command'\nprogram='/bin/true'\n"
+                            .into(),
+                },
+            ],
+        };
+        assert!(canonicalize_bundle(&separate_nodes).is_ok());
+    }
+
+    #[test]
+    fn atomic_rsync_profile_is_allowlisted_and_rejects_history_or_owned_options() {
+        let accepted = [
+            "-aH",
+            "--numeric-ids",
+            "--exclude=tmp/***",
+            "--files-from",
+            "manifest.txt",
+            "--bwlimit=10m",
+            "--timeout",
+            "60",
+            "--checksum",
+            "--stats",
+        ]
+        .map(str::to_owned);
+        validate_atomic_rsync_args(&accepted).expect("audited profile");
+
+        for option in [
+            "--delete",
+            "--inplace",
+            "--link-dest=/old",
+            "--mystery",
+            "-an",
+            "source/",
+        ] {
+            let error = validate_atomic_rsync_args(&[option.into()]).expect_err("rejected option");
+            assert!(matches!(error, ConfigError::AtomicRsyncOption { .. }));
+        }
+        assert!(
+            validate_atomic_rsync_args(&["--timeout".into(), "--delete".into()]).is_err(),
+            "an option requiring a value consumed a rejected option"
+        );
     }
 
     #[test]

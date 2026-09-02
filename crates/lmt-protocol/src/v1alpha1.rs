@@ -133,6 +133,13 @@ pub enum ChangeAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationChange {
+    DirectToAtomic,
+    AtomicToDirect,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigChange {
     pub action: ChangeAction,
@@ -141,6 +148,8 @@ pub struct ConfigChange {
     pub to_generation: Option<u64>,
     pub from_node: Option<String>,
     pub to_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_change: Option<PublicationChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

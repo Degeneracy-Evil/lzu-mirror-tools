@@ -1746,6 +1746,10 @@ fn change_views(v: Vec<lmt_store::ConfigChange>) -> Vec<ConfigChange> {
             to_generation: c.to_generation,
             from_node: c.from_node,
             to_node: c.to_node,
+            publication_change: c.publication_change.map(|change| match change {
+                lmt_store::PublicationChange::DirectToAtomic => PublicationChange::DirectToAtomic,
+                lmt_store::PublicationChange::AtomicToDirect => PublicationChange::AtomicToDirect,
+            }),
         })
         .collect()
 }

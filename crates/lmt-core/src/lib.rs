@@ -8,7 +8,7 @@ mod state;
 pub use config::{
     BundleFile, CanonicalBundle, ConfigBundle, ConfigError, MirrorConfig, MirrorDocument, ProcessRunner,
     PublicationConfig, PublicationMode, RunPolicy, RunSpecContext, SyncConfig, canonicalize_bundle,
-    compile_process_run_spec,
+    compile_process_run_spec, publication_mode_from_toml,
 };
 pub use ids::{AgentInstanceId, AttemptNo, MirrorName, NodeName, RequestId, RunId};
 pub use schedule::{
