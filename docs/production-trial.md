@@ -249,3 +249,54 @@ Both lmt-server and lmt-agent showed roughly 240 runtime worker threads because 
 This is not currently a correctness problem and memory usage remained small, so no immediate runtime tuning is authorized.
 
 During the trial, measure whether a small explicit worker count would reduce operational overhead without hurting poll/log/control-plane latency. Do not choose a fixed value from intuition alone.
+
+### T005 - first complete real-host Run succeeded
+
+Observed on n01 on 2026-09-02 after T001 and T003 maintenance fixes.
+
+Environment:
+
+~~~text
+host: n01.cluster.test
+OS: Ubuntu 24.04 LTS
+filesystem: XFS on /mnt/data
+mirror_root: /mnt/data/lmt-trial/mirrors
+Agent max_concurrent_runs: 2
+~~~
+
+Mirror:
+
+~~~text
+name: local-smoke
+owner: n01
+sync: local rsync
+generation: 1
+config revision: 1
+~~~
+
+Run:
+
+~~~text
+Run ID: 01M1G4XJMG3FW0SX87SVGKXYAA
+trigger: manual
+Attempt: 1
+final state: succeeded
+exit code: 0
+created:  2026-09-02T04:09:31.535Z
+accepted: 2026-09-02T04:09:31.538Z
+started:  2026-09-02T04:09:31.544Z
+finished: 2026-09-02T04:09:31.590Z
+~~~
+
+Observed behavior:
+
+- Pending Run was dispatched immediately to the online n01 Agent.
+- Attempt 1 transitioned through accepted/running to succeeded.
+- Central Run log contained rsync itemized output.
+- Target files were present with expected contents.
+- Agent spool retained only the process lock and durable Agent installation ID after terminal reconciliation.
+- Server status reported no pending/running Runs and retained successful Run history.
+- `run_logs_stored_bytes` reported 190 bytes.
+- `mirror_root_free_bytes` reported 2,846,064,881,664 bytes, confirming the T003 capacity fix on the real XFS mirror root.
+
+This establishes the first real-host normal-operation baseline before restart/retry/cancellation/network/disk/publication-consistency fault experiments.
