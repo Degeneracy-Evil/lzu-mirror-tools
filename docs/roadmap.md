@@ -125,14 +125,22 @@ Scope:
 
 M3 is accepted for a controlled LZU production trial. The active trial plan and architecture evidence checklist are documented in docs/production-trial.md. Do not begin M4 design solely from hypothetical requirements; collect trial evidence first.
 
-## M4 - Production/community release hardening
+## M4 - Production architecture and release hardening
+
+Status: **design in progress** after the controlled LZU production trial.
+
+Authoritative draft: `docs/m4-design.md`.
 
 Goal:
 
-> make LMT maintainable by operators outside the original authors.
+> close the evidence-backed production gaps before the stable-release push.
 
 Scope:
 
+- repository publication consistency;
+- idempotent installation/upgrade automation;
+- Agent long-poll shutdown responsiveness;
+- bounded Tokio runtime policy on very large hosts;
 - stable installation/upgrade guide;
 - compatibility window between CLI/server/Agent versions;
 - supported deployment layout;
@@ -153,8 +161,7 @@ Only implement these if real requirements justify them:
 - OCI/container runner;
 - automatic placement;
 - multiple storage roots/pools;
-- snapshot/publication abstractions;
-- repository validation pipelines;
+- repository-specific validation pipelines;
 - richer resource scheduling;
 - PostgreSQL/multi-controller mode;
 - OIDC/RBAC;
