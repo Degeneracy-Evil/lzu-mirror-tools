@@ -116,16 +116,11 @@ Run
 
 ### Publication is not a new top-level user resource
 
-Publication has durable state and recovery requirements, but operators do not independently create or schedule Publications.
+The detailed design in `docs/m4-publication-design.md` refines this further.
 
-The current design direction is therefore:
+Publication commit is the final durable local phase of an Attempt, not a separate Server-side resource or state machine.
 
-- Mirror remains a public resource;
-- Run remains a public resource;
-- Attempt remains execution history;
-- Publication is a durable phase/record nested under the Run.
-
-This follows the existing rule that a concept becomes top-level only when it has an independent lifecycle.
+The Agent reports AttemptSucceeded only after the atomic publication commit. This preserves the existing Run/Attempt projection and keeps publication recovery inside the Agent spool, where local execution ownership already lives.
 
 ### Fixed lifecycle, not a workflow engine
 
@@ -163,11 +158,12 @@ Atomic publication should be explicit configuration, not a silent behavior chang
 
 Do not implement until the mechanism is frozen.
 
-The candidate mechanisms are:
+The selected M4 generic mechanism is:
 
-1. immutable generation directories plus an atomic published pointer;
-2. atomic directory exchange;
-3. filesystem-native snapshot/clone publication.
+1. fresh private candidate tree;
+2. atomic directory exchange using Linux renameat2(RENAME_EXCHANGE);
+3. one previous tree retained internally;
+4. filesystem-specific snapshot/clone mechanisms remain future optimizations.
 
 The mechanism must satisfy all of these:
 
@@ -267,3 +263,7 @@ Freeze M4 in this order:
 8. implementation plan and acceptance tests.
 
 Only after items 1-7 are reviewed should M4 implementation begin.
+
+## 9. Detailed publication design
+
+The current detailed proposal is `docs/m4-publication-design.md`. Review and freeze that document before implementation planning.

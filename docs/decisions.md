@@ -479,3 +479,56 @@ The remaining questions are intentionally deferred beyond M3 unless production-t
 ## Development principle
 
 When choosing between a broader abstraction and a smaller design, prefer the smaller design until a real mirror workload demonstrates the need for the abstraction.
+
+
+## Proposed M4 decisions
+
+These are design proposals and are not implementation authorization until the M4 architecture review is accepted.
+
+### D049 - Mirror denotes the logical published mirror resource
+
+Status: proposed.
+
+Mirror identity is not tied to one concrete directory inode or historical synchronization tree. The current owner Node realizes the Mirror using local storage. Ownership Move does not imply data migration or deletion.
+
+### D050 - Atomic publication is an Attempt commit phase, not a new public resource
+
+Status: proposed.
+
+For atomic Mirrors, one Attempt consists of candidate preparation, synchronization, and a local atomic publication commit. AttemptSucceeded is emitted only after commit. No Publication table, public Publication state machine, or generic workflow engine is introduced.
+
+### D051 - M4 atomic publication uses real-directory exchange
+
+Status: proposed.
+
+The M4 generic backend keeps the public target as a real directory and commits by Linux renameat2(RENAME_EXCHANGE). First publication uses a no-overwrite rename. Symlink-current, bind-mount, and filesystem-specific snapshot publication are not the M4 default.
+
+### D052 - Atomic candidates are fresh per Attempt
+
+Status: proposed.
+
+Every Attempt writes to a new private candidate. Interrupted/failed candidates are never reused by later Attempts. The current published tree is never the destination of future LMT synchronization in atomic mode.
+
+### D053 - Built-in rsync may reuse published data through an LMT-owned link-dest basis
+
+Status: proposed.
+
+Atomic rsync uses a fresh destination hierarchy and an LMT-controlled --link-dest basis to reduce data duplication. Rsync options that conflict with fresh-candidate or hard-link isolation semantics are rejected in atomic mode.
+
+### D054 - One previous local published tree is retained internally
+
+Status: proposed.
+
+After successful exchange, the old published tree becomes an internal previous generation. Older retired data is garbage-collected asynchronously. There is no automatic rollback API in M4.
+
+### D055 - Atomic publication capability is explicit
+
+Status: proposed.
+
+Agents advertise an atomic-exchange capability. Server must not dispatch an atomic spec to an Agent that has not advertised support. Mixed-version upgrades are Server-first.
+
+### D056 - Mirror targets may not overlap on one owner Node
+
+Status: proposed.
+
+Exact or ancestor/descendant target overlap on the same Node is rejected because independent Run lifecycles must not mutate or exchange the same serving subtree.
