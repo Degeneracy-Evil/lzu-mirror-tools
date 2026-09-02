@@ -377,3 +377,83 @@ Observed behavior:
 The `journalctl --since "5 minutes ago"` command used after completion returned no entries, so future fault experiments should use an explicit absolute time window around the injected fault rather than a relative window.
 
 This validates the accepted architectural property that Server/control-plane restart does not terminate an already-owned Agent execution.
+
+### T008 - Agent restart interrupted Attempt 1 and retried safely
+
+Observed on n01 on 2026-09-02.
+
+Setup:
+
+- `local-smoke` moved to generation 3.
+- `max_attempts = 2` and `retry_delay_seconds = 2`.
+- a new 1 GiB `agent-restart.bin` forced a long-running rsync transfer.
+
+Run:
+
+~~~text
+Run ID: 01M1G79FZA18JEC5DD6J2QPFD4
+Mirror generation: 3
+~~~
+
+Attempt 1:
+
+~~~text
+accepted: 2026-09-02T04:50:59.181Z
+started:  2026-09-02T04:50:59.186Z
+finished: 2026-09-02T04:51:20.463Z
+state: interrupted
+failure_kind: interrupted
+failure_message: agent shutdown
+~~~
+
+Fault:
+
+`systemctl restart lmt-agent` was issued while Attempt 1 was actively transferring data.
+
+Observed process ownership before restart:
+
+~~~text
+PGID 1084713
+1084713 <- lmt-agent
+1084714 <- 1084713
+1084718 <- 1084714
+~~~
+
+After restart the old process group was gone. Attempt 2 used a new rsync process group:
+
+~~~text
+PGID 1085469
+1085469 <- new lmt-agent
+1085470 <- 1085469
+1085471 <- 1085470
+~~~
+
+Node identity behavior:
+
+- durable `bound_agent_id` remained `01M1G410MVMX2V7PZGJF032BVA`;
+- `agent_instance_id` remained the same durable installation identity;
+- `agent_boot_id` changed after daemon restart;
+- Node returned online with active_runs=1.
+
+Retry behavior:
+
+- Attempt 1 terminal reconciliation reached Server as Interrupted.
+- After the configured 2-second retry delay, Server created Attempt 2 in the same Run.
+- Attempt 2 used the same immutable spec hash as Attempt 1.
+- No second Run was created.
+
+Attempt 2:
+
+~~~text
+accepted: 2026-09-02T04:51:22.468Z
+started:  2026-09-02T04:51:22.473Z
+finished: 2026-09-02T04:53:04.784Z
+state: succeeded
+exit code: 0
+~~~
+
+Run final state: Succeeded.
+
+Attempt 1 log recorded rsync termination by signal. Attempt 2 removed the interrupted rsync temporary partial file and completed the full transfer. After terminal reconciliation, Agent spool again contained only the durable Agent ID and process lock.
+
+This validates the intended Agent-restart safety contract: graceful daemon shutdown terminates the supervised process group, records Interrupted durably, preserves installation identity, and retries through a new Attempt without overlapping writers.
