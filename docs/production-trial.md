@@ -300,3 +300,37 @@ Observed behavior:
 - `mirror_root_free_bytes` reported 2,846,064,881,664 bytes, confirming the T003 capacity fix on the real XFS mirror root.
 
 This establishes the first real-host normal-operation baseline before restart/retry/cancellation/network/disk/publication-consistency fault experiments.
+
+### T006 - incremental rsync update/delete succeeded
+
+Observed on n01 on 2026-09-02 after the first successful local-smoke Run.
+
+Upstream changes:
+
+- modified `hello.txt`;
+- added `new.txt`;
+- removed `subdir/nested.txt`.
+
+Run:
+
+~~~text
+Run ID: 01M1G52PSYCAG2GXFWWE5V8ZQ2
+Mirror generation: 1
+Attempt: 1
+final state: succeeded
+exit code: 0
+created:  2026-09-02T04:12:19.646Z
+finished: 2026-09-02T04:12:19.697Z
+~~~
+
+Observed rsync log:
+
+~~~text
+>f.st...... hello.txt
+>f+++++++++ new.txt
+*deleting   subdir/nested.txt
+~~~
+
+The target tree matched the updated upstream contents, deletion propagated correctly, and the Mirror remained on generation 1 because only upstream data changed; LMT configuration did not.
+
+This establishes the normal incremental-sync baseline before fault injection.
