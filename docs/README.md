@@ -53,7 +53,7 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 
 ## Controlled production trial
 
-- [Production Trial Plan](production-trial.md) — host requirements, test phases, evidence collection, and publication/snapshot architecture watchlist.
+- [Production Trial Record](production-trial.md) — completed host/fault evidence that motivated M4 publication design.
 
 - [M4 Design](m4-design.md) — post-trial publication, deployment, and runtime-hardening design.
 - [M4 Publication Architecture](m4-publication-design.md) — frozen atomic publication contract.

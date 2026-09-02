@@ -1,6 +1,6 @@
 # M4 Design Draft
 
-Status: design in progress. Implementation is not authorized by this document.
+Status: **design complete**. M4 implementation proceeds through `m4-implementation-plan.md`.
 
 M4 is the first milestone designed from controlled-production-trial evidence rather than hypothetical requirements.
 
@@ -161,7 +161,7 @@ Atomic publication should be explicit configuration, not a silent behavior chang
 
 Status: **frozen** in `docs/m4-publication-design.md`.
 
-Do not implement until the full M4 implementation plan is reviewed and accepted.
+Implementation must follow the accepted `m4-implementation-plan.md`; this frozen publication contract remains authoritative on semantic conflicts.
 
 The selected M4 generic mechanism is:
 

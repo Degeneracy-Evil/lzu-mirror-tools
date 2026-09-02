@@ -123,11 +123,11 @@ Scope:
 - read-only status API polish;
 - configuration examples for representative mirror types.
 
-M3 is accepted for a controlled LZU production trial. The active trial plan and architecture evidence checklist are documented in docs/production-trial.md. Do not begin M4 design solely from hypothetical requirements; collect trial evidence first.
+M3 entered and completed the controlled LZU production trial documented in `docs/production-trial.md`. Its evidence is now incorporated into the accepted M4 design.
 
 ## M4 - Production architecture and release hardening
 
-Status: **design in progress** after the controlled LZU production trial. The publication architecture is frozen; implementation planning is next.
+Status: **implementation active** after the controlled LZU production trial. Publication architecture is frozen and the implementation sequence is accepted.
 
 Authoritative design: `docs/m4-design.md`.
 

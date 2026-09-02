@@ -3,7 +3,7 @@
 Status: **frozen for M4 implementation planning**.
 
 Publication architecture is accepted after three adversarial review rounds.
-Implementation is not authorized until the M4 implementation plan is reviewed.
+Implementation is authorized only through the accepted `m4-implementation-plan.md`; this document remains the authoritative publication contract.
 
 The frozen design includes the final pre-namespace write-ahead phase,
 full-writer fencing, and publication-lock serialization requested in the final
