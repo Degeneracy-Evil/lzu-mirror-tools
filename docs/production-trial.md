@@ -457,3 +457,43 @@ Run final state: Succeeded.
 Attempt 1 log recorded rsync termination by signal. Attempt 2 removed the interrupted rsync temporary partial file and completed the full transfer. After terminal reconciliation, Agent spool again contained only the durable Agent ID and process lock.
 
 This validates the intended Agent-restart safety contract: graceful daemon shutdown terminates the supervised process group, records Interrupted durably, preserves installation identity, and retries through a new Attempt without overlapping writers.
+
+### T009 - active Run cancellation terminated execution without retry
+
+Observed on n01 on 2026-09-02.
+
+Run:
+
+~~~text
+Run ID: 01M1G7H38PVG3GJTXTDSVQD9M2
+Mirror generation: 3
+Attempt: 1
+cancel requested: 2026-09-02T04:55:25.799Z
+finished: 2026-09-02T04:55:26.315Z
+Attempt state: cancelled
+Run state: cancelled
+~~~
+
+Observed behavior:
+
+- cancellation was delivered to the active Attempt;
+- rsync reported termination by signal;
+- the rsync process group disappeared;
+- no Attempt 2 was created despite `max_attempts = 2`;
+- after an additional five seconds the Run remained Cancelled;
+- Agent spool returned to only the durable Agent ID and process lock.
+
+This validates that operator cancellation suppresses retry and closes the active writer.
+
+### Trial scope reduction after initial fault coverage
+
+After T005-T009, the manual trial should focus only on architecture-critical paths rather than exhaustively exercising every state-machine branch.
+
+Remaining high-value manual checks before moving to multi-node/real-mirror work:
+
+1. one genuine synchronization failure followed by Server-managed retry;
+2. one backup/verify/offline-restore rehearsal;
+3. one multi-node ownership/binding test when n02 is introduced;
+4. later, one real repository concurrent-sync/serving publication-consistency experiment.
+
+Lower-value permutations are covered by automated tests unless production evidence suggests otherwise.
