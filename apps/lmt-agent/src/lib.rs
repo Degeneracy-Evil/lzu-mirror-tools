@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use config::Config;
 use lmt_core::{AttemptState, FailureKind, NodeName, ProcessRunSpec};
 use lmt_protocol::v1alpha1::{AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse};
@@ -406,6 +406,32 @@ impl Agent {
             if atomic && publication.phase.requires_namespace_recovery() {
                 bail!("Mirror {mirror} has unresolved publication recovery");
             }
+        }
+        if let Some(publication) = spec.publication.as_ref() {
+            let max_private_generations = self
+                .config
+                .storage
+                .publication_max_private_generations
+                .context("Atomic publication generation bound is not configured")?;
+            let reserve_bytes = self
+                .config
+                .storage
+                .publication_reserve_bytes
+                .context("Atomic publication free-space reserve is not configured")?;
+            let report = publication::gc_and_check_locked(
+                publication,
+                &self.config.storage.spool_dir,
+                max_private_generations,
+                reserve_bytes,
+            )
+            .await?;
+            tracing::debug!(
+                mirror,
+                removed_generations = report.removed_generations,
+                remaining_private_generations = report.remaining_private_generations,
+                publication_free_bytes = report.publication_free_bytes,
+                "Atomic publication admission passed"
+            );
         }
         Ok(Some(guard))
     }

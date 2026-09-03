@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use lmt_core::{AttemptState, FailureKind};
+use nix::sys::statvfs::statvfs;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
@@ -33,6 +34,166 @@ impl MirrorLocks {
         };
         lock.lock_owned().await
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AdmissionReport {
+    pub removed_generations: u32,
+    pub remaining_private_generations: u32,
+    pub publication_free_bytes: u64,
+}
+
+struct OwnedGenerationEntry {
+    cleanup_path: PathBuf,
+    contains_generation: bool,
+}
+
+pub async fn gc_and_check_locked(
+    publication: &lmt_core::AtomicPublicationSpec,
+    spool_dir: &Path,
+    max_private_generations: u32,
+    reserve_bytes: u64,
+) -> anyhow::Result<AdmissionReport> {
+    let private = PathBuf::from(&publication.publication_root).join(&publication.mirror);
+    let attempts = private.join("attempts");
+    let gc = PathBuf::from(&publication.gc_dir);
+    if gc.parent() != Some(private.as_path())
+        || Path::new(&publication.exchange_dir).parent() != Some(private.as_path())
+    {
+        bail!("Atomic private layout does not match the configured Mirror namespace");
+    }
+    let protected = protected_paths(spool_dir, &publication.mirror).await?;
+    let mut entries = owned_generation_entries(&attempts, false).await?;
+    entries.extend(owned_generation_entries(&gc, true).await?);
+    let garbage: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            !protected
+                .iter()
+                .any(|path| path.starts_with(&entry.cleanup_path) || entry.cleanup_path.starts_with(path))
+        })
+        .map(|entry| entry.cleanup_path.clone())
+        .collect();
+    for entry in &garbage {
+        tokio::fs::remove_dir_all(entry)
+            .await
+            .with_context(|| format!("remove unprotected publication generation {}", entry.display()))?;
+    }
+    for directory in [&attempts, &gc] {
+        if directory.exists() {
+            let directory = directory.clone();
+            tokio::task::spawn_blocking(move || publication_fs::fsync_directory(&directory)).await??;
+        }
+    }
+
+    let mut remaining = u32::try_from(
+        entries
+            .iter()
+            .filter(|entry| entry.contains_generation && !garbage.contains(&entry.cleanup_path))
+            .count(),
+    )
+    .unwrap_or(u32::MAX);
+    if Path::new(&publication.exchange_dir).exists() {
+        remaining = remaining.saturating_add(1);
+    }
+    if remaining >= max_private_generations {
+        bail!(
+            "private generation bound reached for Mirror {}: {remaining} >= {max_private_generations}",
+            publication.mirror
+        );
+    }
+    let root = PathBuf::from(&publication.publication_root);
+    let free = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let filesystem = statvfs(&root)?;
+        filesystem
+            .blocks_available()
+            .checked_mul(filesystem.fragment_size())
+            .context("publication available-byte count overflowed u64")
+    })
+    .await??;
+    if free < reserve_bytes {
+        bail!(
+            "publication free-space reserve not met for Mirror {}: {free} < {reserve_bytes}",
+            publication.mirror
+        );
+    }
+    Ok(AdmissionReport {
+        removed_generations: u32::try_from(garbage.len()).unwrap_or(u32::MAX),
+        remaining_private_generations: remaining,
+        publication_free_bytes: free,
+    })
+}
+
+async fn protected_paths(spool_dir: &Path, mirror: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let mut protected = Vec::new();
+    let mut entries = tokio::fs::read_dir(spool_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let record = crate::spool::read(&path)
+            .await
+            .with_context(|| format!("cannot construct GC protected set from {}", path.display()))?;
+        let Some(state) = record.publication.as_ref().filter(|state| state.mirror == mirror) else {
+            continue;
+        };
+        protected.push(PathBuf::from(&state.candidate_dir));
+        protected.push(PathBuf::from(&state.basis_dir));
+        if let Some(rotated) = &state.rotated_previous_path {
+            protected.push(PathBuf::from(rotated));
+        }
+    }
+    Ok(protected)
+}
+
+async fn owned_generation_entries(root: &Path, gc: bool) -> anyhow::Result<Vec<OwnedGenerationEntry>> {
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut owned = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let file_type = entry.file_type().await?;
+        let name = entry.file_name();
+        let name = name.to_str().context("publication generation name is not UTF-8")?;
+        let identity = if gc {
+            name.strip_prefix("previous-").unwrap_or("")
+        } else {
+            name
+        };
+        let Some((run_id, attempt)) = identity.rsplit_once('-') else {
+            bail!("unrecognized private publication entry {}", path.display());
+        };
+        let parsed_run = run_id.parse::<ulid::Ulid>();
+        let parsed_attempt = attempt.parse::<u32>();
+        let valid_run = parsed_run.is_ok_and(|parsed| parsed.to_string() == run_id);
+        let valid_attempt = parsed_attempt.is_ok_and(|attempt| attempt > 0);
+        if !file_type.is_dir() || !valid_run || !valid_attempt {
+            bail!("unrecognized private publication entry {}", path.display());
+        }
+        let contains_generation = if gc {
+            true
+        } else {
+            match tokio::fs::symlink_metadata(path.join("root")).await {
+                Ok(metadata) if metadata.file_type().is_dir() => true,
+                Ok(_) => bail!(
+                    "Atomic Attempt generation root is not a directory at {}",
+                    path.display()
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        owned.push(OwnedGenerationEntry {
+            cleanup_path: path,
+            contains_generation,
+        });
+    }
+    owned.sort_by(|left, right| left.cleanup_path.cmp(&right.cleanup_path));
+    Ok(owned)
 }
 
 pub async fn prepare_candidate(record: &SpoolRecord, locks: &MirrorLocks) -> anyhow::Result<()> {
@@ -653,6 +814,66 @@ mod tests {
             publication_fs::identity(Path::new(&next.publication.as_ref().expect("state").candidate_dir))
                 .expect("candidate identity")
         );
+    }
+
+    #[tokio::test]
+    async fn gc_deletes_only_owned_unprotected_generations_and_enforces_admission_gates() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let protected_run = ulid::Ulid::new().to_string();
+        let (_path, protected_record) = atomic_record_without_candidate(directory.path(), &protected_run).await;
+        prepare_candidate(&protected_record, &MirrorLocks::default())
+            .await
+            .expect("protected candidate");
+        let publication = protected_record.publication.as_ref().expect("publication state");
+        let publication_spec = protected_record
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.publication.as_deref())
+            .expect("publication spec");
+        let private = PathBuf::from(&publication.publication_root).join("demo");
+        let garbage_attempt = private.join(format!("attempts/{}-1", ulid::Ulid::new()));
+        let garbage_gc = private.join(format!("gc/previous-{}-1", ulid::Ulid::new()));
+        tokio::fs::create_dir_all(&garbage_attempt)
+            .await
+            .expect("garbage Attempt");
+        tokio::fs::create_dir_all(&garbage_gc).await.expect("garbage GC");
+        tokio::fs::create_dir_all(&publication.exchange_dir)
+            .await
+            .expect("stable previous");
+        tokio::fs::write(Path::new(&publication.exchange_dir).join("keep"), b"previous")
+            .await
+            .expect("previous marker");
+
+        let report = gc_and_check_locked(publication_spec, &directory.path().join("spool"), 4, 0)
+            .await
+            .expect("GC admission");
+        assert_eq!(report.removed_generations, 2);
+        assert_eq!(report.remaining_private_generations, 2);
+        assert!(!garbage_attempt.exists());
+        assert!(!garbage_gc.exists());
+        assert!(Path::new(&publication.candidate_dir).exists());
+        assert!(Path::new(&publication.exchange_dir).join("keep").exists());
+        assert!(
+            gc_and_check_locked(publication_spec, &directory.path().join("spool"), 2, 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            gc_and_check_locked(publication_spec, &directory.path().join("spool"), 4, u64::MAX)
+                .await
+                .is_err()
+        );
+
+        let unknown = private.join("gc/operator-data");
+        tokio::fs::create_dir_all(&unknown)
+            .await
+            .expect("unknown private entry");
+        assert!(
+            gc_and_check_locked(publication_spec, &directory.path().join("spool"), 4, 0)
+                .await
+                .is_err()
+        );
+        assert!(unknown.exists(), "unknown entry was destructively removed");
     }
 
     #[tokio::test]
