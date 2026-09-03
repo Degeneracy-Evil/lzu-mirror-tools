@@ -43,6 +43,12 @@ pub async fn execute(
     let Some(spec) = record.spec.as_ref() else {
         return;
     };
+    if record.publication.is_some()
+        && let Err(error) = publication::prepare_candidate(record, &publication_locks).await
+    {
+        persist_preparation_failure(path, record, error, &spool_lock).await;
+        return;
+    }
     if let Err(error) = prctl::set_child_subreaper(true) {
         persist_spawn_failure(
             path,
@@ -158,6 +164,30 @@ async fn finalize(path: &Path, record: &mut SpoolRecord, outcome: Outcome, publi
             now(),
         ),
         Outcome::Cancelled => record.terminal(AttemptState::Cancelled, None, None, None, now()),
+    }
+    let _ = write(path, record).await;
+}
+
+async fn persist_preparation_failure(
+    path: &Path,
+    record: &mut SpoolRecord,
+    error: anyhow::Error,
+    spool_lock: &Mutex<()>,
+) {
+    let _guard = spool_lock.lock().await;
+    if let Ok(latest) = read(path).await {
+        record.cancel_requested |= latest.cancel_requested;
+    }
+    if record.cancel_requested {
+        record.terminal(AttemptState::Cancelled, None, None, None, now());
+    } else {
+        record.terminal(
+            AttemptState::Failed,
+            None,
+            Some(FailureKind::InvalidResult),
+            Some(error.to_string()),
+            now(),
+        );
     }
     let _ = write(path, record).await;
 }

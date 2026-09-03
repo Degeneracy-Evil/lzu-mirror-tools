@@ -722,7 +722,10 @@ mod tests {
         AtomicPublicationSpec, AttemptNo, BundleFile, ConfigBundle, MirrorName, RunId, RunSpecContext,
         canonicalize_bundle, compile_process_run_spec,
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::{
+        os::unix::fs::MetadataExt,
+        sync::atomic::{AtomicBool, Ordering},
+    };
 
     fn test_agent(root: &Path, shutdown: watch::Receiver<bool>, server_url: String) -> Agent {
         std::fs::create_dir_all(root).expect("test root");
@@ -1457,6 +1460,93 @@ mod tests {
         )
         .await;
         assert_eq!(failed.state, AttemptState::Failed);
+    }
+
+    #[tokio::test]
+    async fn atomic_rsync_materializes_fresh_generation_and_hard_links_immutable_basis() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mirror_root = directory.path().join("mirrors");
+        let published = mirror_root.join("demo");
+        let source = directory.path().join("source");
+        fs::create_dir_all(&published).await.expect("published");
+        fs::create_dir_all(&source).await.expect("source");
+        fs::write(source.join("hello.txt"), b"hello\n")
+            .await
+            .expect("source fixture");
+        std::fs::hard_link(source.join("hello.txt"), published.join("hello.txt")).expect("matching basis file");
+        fs::write(published.join("local-only"), b"must not carry forward")
+            .await
+            .expect("destination-only file");
+        let previous_inode = std::fs::metadata(published.join("hello.txt"))
+            .expect("previous file metadata")
+            .ino();
+        let bundle = canonicalize_bundle(&ConfigBundle {
+            files: vec![BundleFile {
+                path: "nodes/node-a/mirrors/demo.toml".into(),
+                contents: format!(
+                    "[mirror]\nname='demo'\ntarget='demo'\n[publication]\nmode='atomic'\n[sync]\ntype='rsync'\nsource='{}/'\nargs=['--archive']\n",
+                    source.display()
+                ),
+            }],
+        })
+        .expect("Atomic bundle");
+        let mirror = MirrorName::new("demo").expect("mirror");
+        let publication_root = directory.path().join("publication");
+        let compiled = compile_process_run_spec(
+            &bundle.mirrors[&mirror].document,
+            &RunSpecContext {
+                mirror_name: &mirror,
+                run_id: RunId::new(),
+                attempt_no: AttemptNo::new(1).expect("attempt"),
+                node_name: &NodeName::new("node-a").expect("node"),
+                mirror_root: &mirror_root,
+                publication_root: Some(&publication_root),
+            },
+        )
+        .expect("compile Atomic rsync");
+        assert!(
+            compiled
+                .args
+                .iter()
+                .any(|argument| argument.starts_with("--link-dest="))
+        );
+        let state = directory.path().join("rsync-atomic.json");
+        let mut record = SpoolRecord::accepted(
+            "01K00000000000000000000006".into(),
+            1,
+            "hash-atomic".into(),
+            compiled,
+            now(),
+        );
+        write(&state, &record).await.expect("write Atomic state");
+        let (_shutdown, shutdown_receiver) = watch::channel(false);
+        let (_cancel, cancel_receiver) = watch::channel(false);
+        executor::execute(
+            &state,
+            &mut record,
+            shutdown_receiver,
+            cancel_receiver,
+            Arc::new(Mutex::new(())),
+            publication::MirrorLocks::default(),
+        )
+        .await;
+
+        assert_eq!(record.state, AttemptState::Succeeded);
+        let publication = record.publication.as_ref().expect("publication state");
+        assert!(!published.join("local-only").exists());
+        assert_eq!(
+            std::fs::metadata(published.join("hello.txt"))
+                .expect("published file metadata")
+                .ino(),
+            previous_inode,
+            "unchanged file was not hard-linked from the immutable basis"
+        );
+        assert_eq!(
+            std::fs::metadata(Path::new(&publication.exchange_dir).join("hello.txt"))
+                .expect("previous generation file")
+                .ino(),
+            previous_inode
+        );
     }
 
     #[derive(Clone)]

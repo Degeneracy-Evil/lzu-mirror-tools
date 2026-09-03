@@ -35,6 +35,48 @@ impl MirrorLocks {
     }
 }
 
+pub async fn prepare_candidate(record: &SpoolRecord, locks: &MirrorLocks) -> anyhow::Result<()> {
+    let publication = record
+        .publication
+        .as_ref()
+        .context("Atomic record has no publication state")?;
+    let mirror = publication.mirror.clone();
+    let candidate = PathBuf::from(&publication.candidate_dir);
+    let basis = PathBuf::from(&publication.basis_dir);
+    let published = PathBuf::from(&publication.published_dir);
+    let _guard = locks.acquire(&mirror).await;
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        if publication_fs::identity_if_exists(&candidate)?.is_some()
+            || publication_fs::identity_if_exists(&basis)?.is_some()
+        {
+            bail!("fresh Atomic Attempt candidate or basis already exists");
+        }
+        let attempt = candidate.parent().context("candidate has no Attempt directory")?;
+        if basis.parent() != Some(attempt) {
+            bail!("candidate and basis do not share one Attempt directory");
+        }
+        std::fs::create_dir_all(attempt).context("create Atomic Attempt directory")?;
+        std::fs::create_dir(&candidate).context("create fresh Atomic candidate")?;
+        if publication_fs::identity_if_exists(&published)?.is_some() {
+            publication_fs::validate_published_target(&published)?;
+            symlink(&published, &basis).context("create immutable rsync basis reference")?;
+        } else {
+            std::fs::create_dir(&basis).context("create empty first-publication basis")?;
+            publication_fs::fsync_directory(&basis)?;
+        }
+        publication_fs::fsync_directory(&candidate)?;
+        publication_fs::fsync_directory(attempt)?;
+        if let Some(parent) = attempt.parent() {
+            publication_fs::fsync_directory(parent)?;
+        }
+        Ok(())
+    })
+    .await??;
+    Ok(())
+}
+
 pub async fn commit(path: &Path, record: &mut SpoolRecord, locks: &MirrorLocks) -> anyhow::Result<()> {
     let mirror = record
         .publication
@@ -464,14 +506,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     async fn atomic_record(root: &Path, run_id: &str) -> (PathBuf, SpoolRecord) {
-        let mirror_root = root.join("mirrors");
-        let private_root = root.join("publication");
-        let mirror_private = private_root.join("demo");
-        let candidate = mirror_private.join(format!("attempts/{run_id}-1/root"));
+        let (path, record) = atomic_record_without_candidate(root, run_id).await;
+        let candidate = PathBuf::from(&record.publication.as_ref().expect("publication state").candidate_dir);
         tokio::fs::create_dir_all(&candidate).await.expect("candidate");
         tokio::fs::write(candidate.join("generation"), run_id)
             .await
             .expect("candidate contents");
+        (path, record)
+    }
+
+    async fn atomic_record_without_candidate(root: &Path, run_id: &str) -> (PathBuf, SpoolRecord) {
+        let mirror_root = root.join("mirrors");
+        let private_root = root.join("publication");
+        let mirror_private = private_root.join("demo");
+        let candidate = mirror_private.join(format!("attempts/{run_id}-1/root"));
         tokio::fs::create_dir_all(&mirror_root).await.expect("mirror root");
         let spool = root.join("spool");
         tokio::fs::create_dir_all(&spool).await.expect("spool");
@@ -523,6 +571,37 @@ mod tests {
         drop(first);
         same.await.expect("same-mirror waiter");
         assert!(entered_same.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn candidate_admission_is_fresh_and_basis_never_aliases_the_destination() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (_path, record) = atomic_record_without_candidate(directory.path(), "run-1").await;
+        let publication = record.publication.as_ref().expect("publication state");
+        prepare_candidate(&record, &MirrorLocks::default())
+            .await
+            .expect("first-publication candidate");
+        assert!(Path::new(&publication.candidate_dir).is_dir());
+        assert!(Path::new(&publication.basis_dir).is_dir());
+        assert!(prepare_candidate(&record, &MirrorLocks::default()).await.is_err());
+
+        tokio::fs::create_dir_all(&publication.published_dir)
+            .await
+            .expect("published generation");
+        let (_path, next) = atomic_record_without_candidate(directory.path(), "run-2").await;
+        prepare_candidate(&next, &MirrorLocks::default())
+            .await
+            .expect("update candidate");
+        let basis = PathBuf::from(&next.publication.as_ref().expect("publication state").basis_dir);
+        assert_eq!(
+            tokio::fs::read_link(&basis).await.expect("basis symlink"),
+            PathBuf::from(&publication.published_dir)
+        );
+        assert_ne!(
+            publication_fs::identity(&basis).expect("basis link identity"),
+            publication_fs::identity(Path::new(&next.publication.as_ref().expect("state").candidate_dir))
+                .expect("candidate identity")
+        );
     }
 
     #[tokio::test]
