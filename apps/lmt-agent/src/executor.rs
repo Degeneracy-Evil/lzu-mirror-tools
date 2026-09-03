@@ -21,6 +21,7 @@ use tokio::{
 
 use crate::{
     now,
+    publication::{self, MirrorLocks},
     spool::{SpoolRecord, read, write},
 };
 
@@ -37,6 +38,7 @@ pub async fn execute(
     mut shutdown: watch::Receiver<bool>,
     mut cancel: watch::Receiver<bool>,
     spool_lock: Arc<Mutex<()>>,
+    publication_locks: MirrorLocks,
 ) {
     let Some(spec) = record.spec.as_ref() else {
         return;
@@ -99,8 +101,31 @@ pub async fn execute(
     if let Ok(latest) = read(path).await {
         record.cancel_requested |= latest.cancel_requested;
     }
+    finalize(path, record, outcome, &publication_locks).await;
+}
+
+async fn finalize(path: &Path, record: &mut SpoolRecord, outcome: Outcome, publication_locks: &MirrorLocks) {
     match outcome {
         _ if record.cancel_requested => record.terminal(AttemptState::Cancelled, None, None, None, now()),
+        Outcome::Process(Ok(status)) if status.success() && record.publication.is_some() => {
+            if let Err(error) = publication::commit(path, record, publication_locks).await {
+                tracing::error!(%error, run_id=%record.run_id, attempt=record.attempt, "Atomic publication commit deferred");
+                if record
+                    .publication
+                    .as_ref()
+                    .is_some_and(|state| state.phase == crate::spool::PublicationPhase::Executing)
+                {
+                    record.terminal(
+                        AttemptState::Failed,
+                        status.code(),
+                        Some(FailureKind::InvalidResult),
+                        Some(error.to_string()),
+                        now(),
+                    );
+                    let _ = write(path, record).await;
+                }
+            }
+        }
         Outcome::Process(Ok(status)) if status.success() => {
             record.terminal(AttemptState::Succeeded, status.code(), None, None, now())
         }

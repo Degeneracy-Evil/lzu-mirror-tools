@@ -26,6 +26,17 @@ pub fn identity(path: &Path) -> anyhow::Result<FileIdentity> {
     })
 }
 
+pub fn identity_if_exists(path: &Path) -> anyhow::Result<Option<FileIdentity>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
 pub fn exchange(left: &Path, right: &Path) -> anyhow::Result<()> {
     rename(left, right, RenameFlags::RENAME_EXCHANGE).context("RENAME_EXCHANGE")
 }
@@ -70,6 +81,17 @@ pub fn validate_published_target(path: &Path) -> anyhow::Result<()> {
     let parent = path.parent().context("published target has no parent")?;
     if metadata.dev() != fs::metadata(parent)?.dev() || listed_mount_point(path)? {
         bail!("published target {} is a mount point", path.display());
+    }
+    Ok(())
+}
+
+pub fn validate_private_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("stat private directory {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "private publication path {} is not an ordinary directory",
+            path.display()
+        );
     }
     Ok(())
 }

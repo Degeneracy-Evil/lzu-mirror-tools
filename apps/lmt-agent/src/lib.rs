@@ -334,6 +334,7 @@ impl Agent {
                 agent.shutdown.clone(),
                 cancel_receiver,
                 agent.acceptance.clone(),
+                agent.publication_locks.clone(),
             )
             .await;
             tracing::info!(run_id=%record.run_id, sequence=record.sequence, "execution reached terminal reconciliation");
@@ -457,12 +458,20 @@ impl Agent {
                 continue;
             };
             if record.requires_publication_recovery() {
-                tracing::warn!(
-                    run_id=%record.run_id,
-                    attempt=record.attempt,
-                    phase=?record.publication.as_ref().map(|publication| publication.phase),
-                    "publication recovery evidence bypassed generic Interrupted normalization"
-                );
+                let acceptance = self.acceptance.lock().await;
+                if let Err(error) = publication::recover(&path, &mut record, &self.publication_locks).await {
+                    tracing::warn!(
+                        %error,
+                        run_id=%record.run_id,
+                        attempt=record.attempt,
+                        phase=?record.publication.as_ref().map(|publication| publication.phase),
+                        "publication recovery deferred; generic Interrupted normalization bypassed"
+                    );
+                }
+                drop(acceptance);
+                if record.state.is_terminal() {
+                    let _ = self.reconcile(&path, &mut record).await;
+                }
                 continue;
             }
             if !record.state.is_terminal() && record.cancel_requested {
@@ -492,7 +501,11 @@ impl Agent {
         {
             if let Ok(mut record) = read(&path).await {
                 if record.requires_publication_recovery() {
-                    continue;
+                    let acceptance = self.acceptance.lock().await;
+                    if let Err(error) = publication::recover(&path, &mut record, &self.publication_locks).await {
+                        tracing::debug!(%error, "background publication recovery deferred");
+                    }
+                    drop(acceptance);
                 }
                 if let Err(error) = self.reconcile(&path, &mut record).await {
                     tracing::debug!(%error, "background reconciliation deferred");
@@ -832,11 +845,12 @@ mod tests {
             .mirror_root_free_bytes
             .expect("filesystem-backed available bytes");
         let filesystem = statvfs(&mirror_root).expect("statvfs");
-        let total_free = filesystem
-            .blocks_free()
+        let filesystem_capacity = filesystem
+            .blocks()
             .checked_mul(filesystem.fragment_size())
-            .expect("total free bytes");
-        assert!(reported <= total_free, "reported space includes reserved blocks");
+            .expect("filesystem capacity bytes");
+        assert!(filesystem.blocks_available() <= filesystem.blocks_free());
+        assert!(reported <= filesystem_capacity);
         assert_eq!(reported % filesystem.fragment_size(), 0);
         assert_eq!(capacity.active_runs, 0);
         assert_eq!(capacity.max_concurrent_runs, 4);
@@ -1292,7 +1306,15 @@ mod tests {
         );
         write(&state, &record).await.expect("write");
         let (_cancel, cancel_receiver) = watch::channel(false);
-        executor::execute(&state, &mut record, receiver, cancel_receiver, Arc::new(Mutex::new(()))).await;
+        executor::execute(
+            &state,
+            &mut record,
+            receiver,
+            cancel_receiver,
+            Arc::new(Mutex::new(())),
+            publication::MirrorLocks::default(),
+        )
+        .await;
         assert_eq!(record.state, AttemptState::TimedOut);
         let log = fs::read_to_string(log_path(&state)).await.expect("log");
         assert!(log.contains("[stdout] out"));
@@ -1338,6 +1360,7 @@ mod tests {
             shutdown_receiver,
             cancel_receiver,
             Arc::new(Mutex::new(())),
+            publication::MirrorLocks::default(),
         )
         .await;
 
@@ -1401,6 +1424,7 @@ mod tests {
             shutdown_receiver,
             cancel_receiver,
             Arc::new(Mutex::new(())),
+            publication::MirrorLocks::default(),
         )
         .await;
         assert_eq!(record.state, AttemptState::Succeeded);
@@ -1429,6 +1453,7 @@ mod tests {
             shutdown_receiver,
             cancel_receiver,
             Arc::new(Mutex::new(())),
+            publication::MirrorLocks::default(),
         )
         .await;
         assert_eq!(failed.state, AttemptState::Failed);

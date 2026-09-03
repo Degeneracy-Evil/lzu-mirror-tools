@@ -59,6 +59,12 @@ pub struct PublicationState {
     pub rotated_previous_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotated_previous_identity: Option<FileIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_visibility_terminal_state: Option<AttemptState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_visibility_failure_kind: Option<FailureKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_visibility_message: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,6 +107,9 @@ impl SpoolRecord {
             exchange_identity: None,
             rotated_previous_path: None,
             rotated_previous_identity: None,
+            pre_visibility_terminal_state: None,
+            pre_visibility_failure_kind: None,
+            pre_visibility_message: None,
         });
         Self {
             run_id,
@@ -169,9 +178,13 @@ impl SpoolRecord {
     }
 
     pub fn has_protected_publication_evidence(&self) -> bool {
-        self.publication
-            .as_ref()
-            .is_some_and(|publication| publication.phase.is_protected())
+        self.publication.as_ref().is_some_and(|publication| {
+            publication.phase.is_protected()
+                && !(publication.phase == PublicationPhase::CommittedPendingReport
+                    && self.state == AttemptState::Succeeded
+                    && self.acknowledged_sequence >= self.sequence
+                    && self.log_complete_acknowledged)
+        })
     }
 
     pub fn requires_publication_recovery(&self) -> bool {
@@ -341,5 +354,31 @@ mod tests {
             reopened.publication.expect("publication state").candidate_identity,
             Some(FileIdentity { device: 7, inode: 11 })
         );
+    }
+
+    #[test]
+    fn committed_evidence_retires_only_after_terminal_and_log_acknowledgements() {
+        let mut record = SpoolRecord::accepted(
+            "run-1".into(),
+            1,
+            "hash".into(),
+            atomic_spec(),
+            "2026-09-03T00:00:00Z".into(),
+        );
+        record.publication.as_mut().expect("publication state").phase = PublicationPhase::CommittedPendingReport;
+        record.terminal(
+            AttemptState::Succeeded,
+            Some(0),
+            None,
+            None,
+            "2026-09-03T00:01:00Z".into(),
+        );
+        assert!(!record.ready_for_cleanup());
+        record.acknowledged_sequence = record.sequence;
+        record.log_complete_acknowledged = true;
+        assert!(record.ready_for_cleanup());
+
+        record.publication.as_mut().expect("publication state").phase = PublicationPhase::AbandonedFenced;
+        assert!(!record.ready_for_cleanup());
     }
 }
