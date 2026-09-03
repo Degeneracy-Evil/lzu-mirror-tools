@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use lmt_agent::{
     Agent, PublicationStatus, abandon_publication, clear_publication_fence,
     config::{Config, Logging, LoggingFormat},
-    publication_status, reset_spool, retry_publication_durability,
+    preflight_publication, publication_status, reset_spool, retry_publication_durability,
 };
 use tokio::{fs, sync::watch};
 
@@ -29,6 +29,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum PublicationCommand {
+    Preflight,
     Status {
         #[arg(long)]
         mirror: String,
@@ -96,6 +97,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_publication_command(config: &Config, command: PublicationCommand) -> anyhow::Result<()> {
     match command {
+        PublicationCommand::Preflight => {
+            preflight_publication(config).await?;
+            println!("Atomic publication filesystem preflight passed");
+        }
         PublicationCommand::Status { mirror } => {
             let statuses = publication_status(config, &mirror).await?;
             if statuses.is_empty() {

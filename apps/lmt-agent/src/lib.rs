@@ -88,7 +88,7 @@ pub async fn retry_publication_durability(
 ) -> anyhow::Result<PublicationStatus> {
     validate_publication_identity(mirror, run_id, attempt)?;
     let _process_lock = maintenance_lock(config).await?;
-    publication_preflight(config).await?;
+    preflight_publication(config).await?;
     let path = state_path(&config.storage.spool_dir, run_id, attempt);
     let record = publication::retry_durability(
         &path,
@@ -137,7 +137,7 @@ pub async fn clear_publication_fence(
 ) -> anyhow::Result<()> {
     validate_publication_identity(mirror, run_id, attempt)?;
     let _process_lock = maintenance_lock(config).await?;
-    publication_preflight(config).await?;
+    preflight_publication(config).await?;
     let path = state_path(&config.storage.spool_dir, run_id, attempt);
     publication::clear_fence(
         &path,
@@ -156,7 +156,7 @@ async fn maintenance_lock(config: &Config) -> anyhow::Result<process_lock::Proce
     process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))
 }
 
-async fn publication_preflight(config: &Config) -> anyhow::Result<()> {
+pub async fn preflight_publication(config: &Config) -> anyhow::Result<()> {
     let mirror_root = config.storage.mirror_root.clone();
     let publication_root = config
         .storage
