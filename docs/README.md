@@ -59,6 +59,10 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 
 - [M3 Code Review Round 2 — 2026-09-01](reviews/m3-review-round2-2026-09-01.md) — acceptance review of hardening commit `8d0c032c37d6bb34c1e398e6d68e31c20ef28881`; M3 accepted for controlled production trial.
 
+- [M4 Code Review — 2026-09-03](reviews/m4-review-2026-09-03.md) — blocking review of implementation baseline `e115130519bdd5098569321af1db2397d9ec2eb7`; two P0s and one P1 required closure.
+
+- [M4 Code Review Round 2 — 2026-09-03](reviews/m4-review-round2-2026-09-03.md) — acceptance review of `7eaeaff92f17e3184543bdf32e50d99881f7d70d`; M4 accepted.
+
 ## Controlled production trial
 
 - [Production Trial Record](production-trial.md) — completed host/fault evidence that motivated M4 publication design.

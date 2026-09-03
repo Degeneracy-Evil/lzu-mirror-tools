@@ -127,9 +127,9 @@ M3 entered and completed the controlled LZU production trial documented in `docs
 
 ## M4 - Production architecture and release hardening
 
-Status: **implementation complete; acceptance review pending**. Publication
-architecture remains frozen and the release gates are automated where local CI
-can exercise them.
+Status: **accepted** at implementation baseline
+`7eaeaff92f17e3184543bdf32e50d99881f7d70d`. Publication architecture remains
+frozen; release gates are automated where local CI can exercise them.
 
 Authoritative design: `docs/m4-design.md`.
 

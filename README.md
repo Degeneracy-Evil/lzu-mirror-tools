@@ -6,7 +6,7 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M4 implementation complete; release validation in progress.**
+**Current phase: M4 accepted; ready as the next production baseline.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
@@ -26,6 +26,8 @@ The controlled production trial is complete. M4 implements the frozen atomic
 publication architecture, local idempotent installation/upgrade, forward M3 to
 M4 compatibility, prompt Agent shutdown, bounded daemon runtimes, and
 publication diagnostics. M4 does not introduce M5 orchestration features.
+
+M4 is accepted at implementation baseline `7eaeaff92f17e3184543bdf32e50d99881f7d70d`. See the [M4 second review](docs/reviews/m4-review-round2-2026-09-03.md).
 
 ## What LMT does
 
