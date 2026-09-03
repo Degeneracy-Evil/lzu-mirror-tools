@@ -8,7 +8,10 @@ mod spool;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool as SyncFlag, Ordering as AtomicOrdering},
+    },
     time::Duration,
 };
 
@@ -77,6 +80,7 @@ pub struct Agent {
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     acceptance: Arc<Mutex<()>>,
     publication_locks: publication::MirrorLocks,
+    control_plane_synchronized: Arc<SyncFlag>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -162,6 +166,7 @@ impl Agent {
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
             publication_locks: publication::MirrorLocks::default(),
+            control_plane_synchronized: Arc::new(SyncFlag::new(false)),
             shutdown,
         })
     }
@@ -218,7 +223,9 @@ impl Agent {
                 .send()
                 .await
             {
-                Ok(response) if response.status() == StatusCode::NO_CONTENT => {}
+                Ok(response) if response.status() == StatusCode::NO_CONTENT => {
+                    self.control_plane_synchronized.store(true, AtomicOrdering::Release);
+                }
                 Ok(response) if response.status().is_success() => {
                     for action in response.json::<PollResponse>().await?.actions {
                         match action {
@@ -235,6 +242,7 @@ impl Agent {
                             } => self.cancel(run_id, attempt, spec_hash).await,
                         }
                     }
+                    self.control_plane_synchronized.store(true, AtomicOrdering::Release);
                 }
                 Ok(response) => tracing::warn!(status=%response.status(), "poll rejected"),
                 Err(error) => tracing::warn!(%error, "poll failed"),
@@ -459,7 +467,9 @@ impl Agent {
             };
             if record.requires_publication_recovery() {
                 let acceptance = self.acceptance.lock().await;
-                if let Err(error) = publication::recover(&path, &mut record, &self.publication_locks).await {
+                if let Err(error) =
+                    publication::recover_before_control_plane(&path, &mut record, &self.publication_locks).await
+                {
                     tracing::warn!(
                         %error,
                         run_id=%record.run_id,
@@ -502,7 +512,12 @@ impl Agent {
             if let Ok(mut record) = read(&path).await {
                 if record.requires_publication_recovery() {
                     let acceptance = self.acceptance.lock().await;
-                    if let Err(error) = publication::recover(&path, &mut record, &self.publication_locks).await {
+                    let recovery = if self.control_plane_synchronized.load(AtomicOrdering::Acquire) {
+                        publication::recover(&path, &mut record, &self.publication_locks).await
+                    } else {
+                        publication::recover_before_control_plane(&path, &mut record, &self.publication_locks).await
+                    };
+                    if let Err(error) = recovery {
                         tracing::debug!(%error, "background publication recovery deferred");
                     }
                     drop(acceptance);
@@ -760,6 +775,7 @@ mod tests {
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
             publication_locks: publication::MirrorLocks::default(),
+            control_plane_synchronized: Arc::new(SyncFlag::new(false)),
             shutdown,
         }
     }

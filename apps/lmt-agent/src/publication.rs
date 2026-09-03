@@ -132,6 +132,57 @@ pub async fn recover(path: &Path, record: &mut SpoolRecord, locks: &MirrorLocks)
     }
 }
 
+pub async fn recover_before_control_plane(
+    path: &Path,
+    record: &mut SpoolRecord,
+    locks: &MirrorLocks,
+) -> anyhow::Result<()> {
+    let mirror = record
+        .publication
+        .as_ref()
+        .context("publication recovery record has no publication state")?
+        .mirror
+        .clone();
+    let _guard = locks.acquire(&mirror).await;
+    match record.publication.as_ref().map(|state| state.phase) {
+        Some(PublicationPhase::PreparingExchange) => {
+            if let Err(error) = prepare_namespace(path, record).await {
+                return restore_then_terminal(
+                    path,
+                    record,
+                    AttemptState::Failed,
+                    Some(FailureKind::InvalidResult),
+                    error.to_string(),
+                )
+                .await;
+            }
+            Ok(())
+        }
+        Some(PublicationPhase::PreVisibilityRecovery) => {
+            let publication = record.publication.as_ref().context("publication state missing")?;
+            restore_then_terminal(
+                path,
+                record,
+                publication
+                    .pre_visibility_terminal_state
+                    .unwrap_or(AttemptState::Failed),
+                publication
+                    .pre_visibility_failure_kind
+                    .or(Some(FailureKind::InvalidResult)),
+                publication
+                    .pre_visibility_message
+                    .clone()
+                    .unwrap_or_else(|| "publication private namespace recovered after an earlier failure".into()),
+            )
+            .await
+        }
+        Some(PublicationPhase::VisiblePendingDurability) => finish_visible(path, record).await,
+        Some(PublicationPhase::CommittedPendingReport) => ensure_committed_terminal(path, record).await,
+        Some(PublicationPhase::Executing | PublicationPhase::ReadyToCommit | PublicationPhase::AbandonedFenced)
+        | None => Ok(()),
+    }
+}
+
 async fn prepare(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {
     persist_preparing(path, record).await?;
     if let Err(error) = prepare_namespace(path, record).await {
@@ -814,6 +865,42 @@ mod tests {
         assert_eq!(
             publication_fs::identity(Path::new(&publication.candidate_dir)).expect("restored candidate"),
             candidate_before
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_ready_waits_for_control_plane_then_honors_delivered_cancellation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let locks = MirrorLocks::default();
+        let (initial_path, mut initial) = atomic_record(directory.path(), "run-old").await;
+        commit(&initial_path, &mut initial, &locks)
+            .await
+            .expect("initial publication");
+        let (path, mut record) = atomic_record(directory.path(), "run-new").await;
+        prepare(&path, &mut record).await.expect("ready before restart");
+        let publication = record.publication.as_ref().expect("publication state").clone();
+        let published_before = publication_fs::identity(Path::new(&publication.published_dir)).expect("published");
+
+        recover_before_control_plane(&path, &mut record, &locks)
+            .await
+            .expect("pre-poll recovery");
+        assert_eq!(record.state, AttemptState::Running);
+        assert_eq!(
+            record.publication.as_ref().expect("publication state").phase,
+            PublicationPhase::ReadyToCommit
+        );
+        assert_eq!(
+            publication_fs::identity(Path::new(&publication.published_dir)).expect("still-old published"),
+            published_before
+        );
+
+        record.cancel_requested = true;
+        write(&path, &record).await.expect("Server-delivered cancellation");
+        recover(&path, &mut record, &locks).await.expect("post-poll recovery");
+        assert_eq!(record.state, AttemptState::Cancelled);
+        assert_eq!(
+            publication_fs::identity(Path::new(&publication.published_dir)).expect("unchanged published"),
+            published_before
         );
     }
 }
