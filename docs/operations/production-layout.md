@@ -1,8 +1,7 @@
 # Production-Trial Layout
 
-This document defines the M3 production-trial filesystem and service assumptions.
-
-It is not yet a distribution packaging guide.
+This document defines the production filesystem and service assumptions retained
+through M4. See `install-upgrade.md` for the distribution installation path.
 
 ## Server
 
@@ -37,9 +36,13 @@ Recommended ownership:
 /var/lib/lmt-agent/spool/     lmt-agent      0700
 
 /srv/mirrors/                 site policy
+/srv/lmt-publication/         lmt-agent      0700 (Atomic-capable Agents only)
 ~~~
 
 mirror_root must be writable by the Agent execution user and readable by the serving stack.
+
+For Atomic mode, publication_root is private Agent state outside mirror_root but
+on the same mounted local filesystem. It must not be served by Nginx.
 
 The Agent should normally run as a dedicated non-root user.
 
@@ -100,6 +103,8 @@ Mirror documents live under `config/nodes/mirror01/mirrors/`:
 
 - `rsync-simple.toml` demonstrates minimal periodic rsync;
 - `rsync-production.toml` demonstrates delete, hard-link, numeric-ID, and cron settings;
+- `rsync-atomic.toml` is disabled by default and demonstrates the audited
+  fresh-generation Atomic rsync profile;
 - `command-hook.toml` is disabled by default and demonstrates an explicit site command.
 
 Review source URLs, target names, deletion semantics, time zones, timeouts, and

@@ -59,6 +59,12 @@ lmt_backup_last_success_timestamp_seconds
 lmt_backup_failures_total
 lmt_log_expired_total
 lmt_auth_failures_total
+lmt_agents_atomic_publication_capable
+lmt_publication_commits_total{outcome}
+lmt_publication_visibility_to_durability_milliseconds_total
+lmt_publication_visibility_to_durability_samples_total
+lmt_publication_preflight_rejections_total
+lmt_publication_gc_failures_total
 ~~~
 
 Bounded entity labels are allowed for Mirror/Node state:
@@ -70,6 +76,12 @@ lmt_mirror_due{mirror}
 lmt_node_online{node}
 lmt_node_last_seen_timestamp_seconds{node}
 lmt_node_mirror_root_free_bytes{node}
+lmt_agent_publication_root_free_bytes{node}
+lmt_agent_publication_gc_backlog_generations{node}
+lmt_agent_publication_degraded{node}
+lmt_agent_publication_fenced_records{node}
+lmt_agent_publication_recovery_records{node}
+lmt_agent_publication_admission_blocked{node,reason}
 ~~~
 
 Never label by Run ID, Attempt number, credential ID, or free-form error messages.
@@ -100,6 +112,8 @@ Representative alerts:
 - repeated Run failures;
 - mirror-root free space low;
 - central log/database filesystem low;
+- Atomic capability missing or publication root below reserve;
+- publication recovery/fence state or persistent GC failure;
 - no recent successful backup.
 
 Exact site thresholds belong to deployment configuration.

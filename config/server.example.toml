@@ -1,3 +1,5 @@
+# M4 rolling upgrades replace the Server before Agents. No publication
+# filesystem is configured on the Server; that state is local to each Agent.
 bind = "127.0.0.1:8080"
 database_path = "/var/lib/lmt/lmt.db"
 log_dir = "/var/lib/lmt/logs"

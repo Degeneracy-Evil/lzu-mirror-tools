@@ -1,0 +1,20 @@
+[mirror]
+name = "rsync-atomic"
+enabled = false
+target = "rsync-atomic"
+
+[publication]
+mode = "atomic"
+
+[schedule]
+interval = "6h"
+
+[sync]
+type = "rsync"
+source = "rsync://archive.example.org/project/"
+args = ["--archive", "--hard-links", "--numeric-ids", "--stats"]
+
+[run]
+timeout_seconds = 10800
+max_attempts = 3
+retry_delay_seconds = 600

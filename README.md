@@ -6,7 +6,7 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M1, M2, and M3 accepted; LMT is ready for a controlled LZU production trial.**
+**Current phase: M4 implementation complete; release validation in progress.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
@@ -20,7 +20,12 @@ M3 is frozen in:
 1. [M3 Design](docs/m3-design.md)
 2. [M3 Implementation Plan](docs/m3-implementation-plan.md)
 
-M3 is accepted at implementation baseline `8d0c032c37d6bb34c1e398e6d68e31c20ef28881`. See the [M3 second review](docs/reviews/m3-review-round2-2026-09-01.md). LMT may enter a controlled LZU production trial. M4 has not yet been designed or authorized.
+M3 is accepted at implementation baseline `8d0c032c37d6bb34c1e398e6d68e31c20ef28881`. See the [M3 second review](docs/reviews/m3-review-round2-2026-09-01.md).
+
+The controlled production trial is complete. M4 implements the frozen atomic
+publication architecture, local idempotent installation/upgrade, forward M3 to
+M4 compatibility, prompt Agent shutdown, bounded daemon runtimes, and
+publication diagnostics. M4 does not introduce M5 orchestration features.
 
 ## What LMT does
 
@@ -94,8 +99,11 @@ Start with:
 
 1. [Design Summary](docs/design-summary.md)
 2. [Documentation Index](docs/README.md)
-3. [M3 Design](docs/m3-design.md)
-4. [M3 Implementation Plan](docs/m3-implementation-plan.md)
+3. [M4 Design](docs/m4-design.md)
+4. [M4 Publication Architecture](docs/m4-publication-design.md)
+5. [M4 Implementation Plan](docs/m4-implementation-plan.md)
+6. [Atomic Publication Operations](docs/operations/atomic-publication.md)
+7. [Installation and Upgrade](docs/operations/install-upgrade.md)
 
 All architecture, state-machine, protocol, database, scheduler, API, testing, and code-review contracts live under `docs/`.
 

@@ -18,5 +18,6 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --all-features --locked
       - run: sh packaging/tests/install.sh
+      - run: sh packaging/tests/release.sh
       - run: git diff --exit-code
       - run: git diff --cached --exit-code

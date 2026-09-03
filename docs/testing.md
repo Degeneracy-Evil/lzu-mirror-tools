@@ -405,6 +405,20 @@ M3 adds tests for:
 
 Every accepted M1/M2 fault test remains a gate.
 
+## 27. M4 release gates
+
+M4 additionally freezes and tests the accepted M3 wire fixtures, every Atomic
+write-ahead/namespace crash boundary, full-writer fences, protected-set GC and
+admission, transactional Move/mode races, the complete Atomic rsync option
+classification, prompt poll cancellation, four-worker daemon runtimes, bounded
+publication diagnostics, installer idempotency, and deterministic release
+archive contents.
+
+Normal CI runs `packaging/tests/install.sh` and `packaging/tests/release.sh`.
+The latter uses fixture executables, verifies the complete essential archive
+manifest, and proves repeated packaging produces the same bytes. Producing an
+actual distribution archive builds the locked release profile first.
+
 ## 24. Historical migration fixtures
 
 Starting with M3, migration tests use a frozen accepted-v2 artifact.

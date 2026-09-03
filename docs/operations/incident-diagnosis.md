@@ -118,4 +118,15 @@ Mirror data is not part of control-plane restore and should not be deleted as pa
 
 If an operational state cannot be resolved through documented APIs/runbooks, capture doctor output and daemon logs first.
 
+For an Atomic publication incident, stop the local Agent and capture:
+
+~~~text
+lmt-agent --config /etc/lmt/agent.toml doctor
+lmt-agent --config /etc/lmt/agent.toml publication status --mirror MIRROR
+~~~
+
+Follow `atomic-publication.md` for exact retry-durability, abandon/fence, and
+fence-clear semantics. Do not delete protected spool records or manually rename
+the published/exchange directories.
+
 A missing operator workflow should become a product/design issue rather than an undocumented SQLite mutation.

@@ -8,11 +8,9 @@ token_file = "/etc/lmt/agent.token"
 [storage]
 mirror_root = "/srv/mirrors"
 spool_dir = "/var/lib/lmt-agent/spool"
-# Atomic publication requires all three explicit settings below. Keep them
-# absent for a Direct-only Agent. See agent.atomic.example.toml.
-# publication_root = "/srv/lmt-publication"
-# publication_max_private_generations = 4
-# publication_reserve_bytes = 10737418240
+publication_root = "/srv/lmt-publication"
+publication_max_private_generations = 4
+publication_reserve_bytes = 10737418240
 
 [execution]
 max_concurrent_runs = 1

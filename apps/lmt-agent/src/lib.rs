@@ -1397,6 +1397,10 @@ mod tests {
         let production: Config =
             toml::from_str(include_str!("../../../config/agent.example.toml")).expect("production Agent example");
         assert!(production.logging.is_some());
+        let atomic_production: Config = toml::from_str(include_str!("../../../config/agent.atomic.example.toml"))
+            .expect("Atomic production Agent example");
+        assert!(atomic_production.storage.publication_root.is_some());
+        assert_eq!(atomic_production.storage.publication_max_private_generations, Some(4));
         let invalid = format!(
             "{}\n[logging]\nlevel='info'\nformat='xml'\n",
             source.replace("typo=true\n", "")

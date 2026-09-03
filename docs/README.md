@@ -47,6 +47,14 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 - [Observability](operations/observability.md)
 - [Incident Diagnosis](operations/incident-diagnosis.md)
 
+## M4 release operations
+
+- [Atomic Publication](operations/atomic-publication.md) - Direct/Atomic
+  guarantees, storage requirements, rsync profile, serving caveats, and local
+  recovery/fence workflow.
+- [Installation and Upgrade](operations/install-upgrade.md) - release archive,
+  idempotent local installer, Server-first rollout, and restore-based downgrade.
+
 - [M3 Code Review — 2026-09-01](reviews/m3-review-2026-09-01.md) — blocking review of implementation candidate `73d90897733a1a2e98aa655c3dda0f562ed33d33`; focused hardening required before production-trial acceptance.
 
 - [M3 Code Review Round 2 — 2026-09-01](reviews/m3-review-round2-2026-09-01.md) — acceptance review of hardening commit `8d0c032c37d6bb34c1e398e6d68e31c20ef28881`; M3 accepted for controlled production trial.

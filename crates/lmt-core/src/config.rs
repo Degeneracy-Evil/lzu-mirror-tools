@@ -792,6 +792,10 @@ mod tests {
                 include_str!("../../../config/nodes/mirror01/mirrors/rsync-production.toml"),
             ),
             (
+                "rsync-atomic.toml",
+                include_str!("../../../config/nodes/mirror01/mirrors/rsync-atomic.toml"),
+            ),
+            (
                 "command-hook.toml",
                 include_str!("../../../config/nodes/mirror01/mirrors/command-hook.toml"),
             ),
@@ -803,6 +807,6 @@ mod tests {
         })
         .collect();
         let canonical = canonicalize_bundle(&ConfigBundle { files }).expect("valid examples");
-        assert_eq!(canonical.mirrors.len(), 4);
+        assert_eq!(canonical.mirrors.len(), 5);
     }
 }
