@@ -234,6 +234,7 @@ pub enum PollAction {
     StartAttempt {
         run_id: String,
         attempt_no: u32,
+        mirror_name: String,
         spec_hash: String,
         spec: ProcessRunSpec,
     },
@@ -942,7 +943,7 @@ impl Store {
             }
             let redelivery = transaction
                 .query_row(
-                    "SELECT a.run_id,a.attempt_no,a.spec_hash,a.spec_json
+                    "SELECT a.run_id,a.attempt_no,r.mirror_name,a.spec_hash,a.spec_json
                      FROM attempts a JOIN runs r ON r.id=a.run_id
                      WHERE r.owner_node=?1 AND r.state IN('pending','running')
                        AND a.state='queued' AND a.dispatch_count>0
@@ -1001,14 +1002,14 @@ impl Store {
             let source = DispatchSource {
                 run_id: run_id.clone(),
                 attempt_no,
-                mirror_name,
+                mirror_name: mirror_name.clone(),
                 mirror_generation: generation,
                 config_toml,
             };
             let Some((spec, spec_hash, policy)) = compile(&source)? else {
                 return unavailable_dispatch(transaction);
             };
-            persist_dispatch(transaction, run_id, attempt_no, spec_hash, spec, policy, now)
+            persist_dispatch(transaction, source, spec_hash, spec, policy, now)
         })
         .await
     }
@@ -1915,13 +1916,18 @@ fn unavailable_dispatch(transaction: Transaction<'_>) -> Result<Option<PollActio
 
 fn persist_dispatch(
     transaction: Transaction<'_>,
-    run_id: String,
-    attempt_no: u32,
+    source: DispatchSource,
     spec_hash: String,
     spec: ProcessRunSpec,
     policy: RunPolicySnapshot,
     now: i64,
 ) -> Result<Option<PollAction>, StoreError> {
+    let DispatchSource {
+        run_id,
+        attempt_no,
+        mirror_name,
+        ..
+    } = source;
     transaction.execute(
         "UPDATE runs SET max_attempts=?2,retry_delay_ms=?3 WHERE id=?1 AND trigger='scheduled'",
         params![run_id, policy.max_attempts, policy.retry_delay_ms],
@@ -1941,17 +1947,19 @@ fn persist_dispatch(
     Ok(Some(PollAction::StartAttempt {
         run_id,
         attempt_no,
+        mirror_name,
         spec_hash,
         spec,
     }))
 }
 
 fn map_poll_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<PollAction> {
-    let spec_json: String = row.get(3)?;
+    let spec_json: String = row.get(4)?;
     Ok(PollAction::StartAttempt {
         run_id: row.get(0)?,
         attempt_no: row.get(1)?,
-        spec_hash: row.get(2)?,
+        mirror_name: row.get(2)?,
+        spec_hash: row.get(3)?,
         spec: serde_json::from_str(&spec_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(spec_json.len(), rusqlite::types::Type::Text, Box::new(error))
         })?,

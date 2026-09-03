@@ -19,8 +19,8 @@ use anyhow::{Context, bail};
 use config::Config;
 use lmt_core::{AttemptNo, AttemptState, FailureKind, MirrorName, NodeName, ProcessRunSpec, RunId};
 use lmt_protocol::v1alpha1::{
-    AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse, PublicationAdmissionBlockReason,
-    PublicationHealth,
+    AgentAction, Capacity, EventRequest, EventResponse, ExecutionIdentity, OwnedAttempt, PollRequest, PollResponse,
+    PublicationAdmissionBlockReason, PublicationHealth,
 };
 use nix::sys::statvfs::statvfs;
 use reqwest::{Client, StatusCode};
@@ -35,6 +35,7 @@ use spool::{SpoolRecord, log_path, read, retire, state_path, write};
 
 const INSTALLATION_ID_FILE: &str = "agent-id";
 const ATOMIC_EXCHANGE_V1: &str = lmt_protocol::v1alpha1::ATOMIC_EXCHANGE_V1;
+const EXECUTION_IDENTITY_V1: &str = lmt_protocol::v1alpha1::EXECUTION_IDENTITY_V1;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PublicationStatus {
@@ -46,6 +47,18 @@ pub struct PublicationStatus {
     pub attempt_state: AttemptState,
     pub acknowledged_sequence: u64,
     pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum AbandonReconciliation {
+    Reconciled,
+    Pending(String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PublicationAbandonResult {
+    pub status: PublicationStatus,
+    pub reconciliation: AbandonReconciliation,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -364,14 +377,14 @@ pub async fn abandon_publication(
     attempt: u32,
     spec_hash: &str,
     acknowledged_visible_risk: bool,
-) -> anyhow::Result<PublicationStatus> {
+) -> anyhow::Result<PublicationAbandonResult> {
     if !acknowledged_visible_risk {
         bail!("publication abandon requires --acknowledge-visible-publication-risk");
     }
     validate_publication_identity(mirror, run_id, attempt)?;
     let _process_lock = maintenance_lock(config).await?;
     let path = state_path(&config.storage.spool_dir, run_id, attempt);
-    let record = publication::abandon(
+    let mut record = publication::abandon(
         &path,
         mirror,
         run_id,
@@ -380,7 +393,75 @@ pub async fn abandon_publication(
         &publication::MirrorLocks::default(),
     )
     .await?;
-    status_from_record(record)
+    let reconciliation = match reconcile_abandoned_terminal(config, &path, &mut record).await {
+        Ok(()) => AbandonReconciliation::Reconciled,
+        Err(error) => AbandonReconciliation::Pending(error.to_string()),
+    };
+    Ok(PublicationAbandonResult {
+        status: status_from_record(record)?,
+        reconciliation,
+    })
+}
+
+async fn reconcile_abandoned_terminal(config: &Config, path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {
+    let token = fs::read_to_string(&config.server.token_file).await?;
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("Agent token file is empty");
+    }
+    let instance = load_or_create_installation_id(&config.storage.spool_dir).await?;
+    let client = Client::builder().timeout(Duration::from_secs(35)).build()?;
+    while record.acknowledged_sequence < record.sequence {
+        let event_sequence = if record.acknowledged_sequence == 0 && record.sequence > 1 {
+            1
+        } else {
+            record.sequence
+        };
+        let event = EventRequest {
+            event_sequence,
+            state: if event_sequence == 1 {
+                AttemptState::Accepted
+            } else {
+                record.state
+            },
+            agent_instance_id: instance.clone(),
+            accepted_at: record.accepted_at.clone(),
+            started_at: record.started_at.clone(),
+            finished_at: record.finished_at.clone(),
+            exit_code: record.exit_code,
+            failure_kind: record.failure_kind,
+            failure_message: record.failure_message.clone(),
+        };
+        let response = client
+            .post(format!(
+                "{}/api/v1alpha1/agent/attempts/{}/{}/events",
+                config.server.url, record.run_id, record.attempt
+            ))
+            .bearer_auth(token)
+            .json(&event)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!(
+                "Server rejected terminal reconciliation with HTTP {}",
+                response.status()
+            );
+        }
+        let response: EventResponse = response.json().await?;
+        if response.accepted_event_sequence < event_sequence {
+            bail!(
+                "Server acknowledged event sequence {} below sent sequence {event_sequence}",
+                response.accepted_event_sequence
+            );
+        }
+        let mut latest = read(path).await?;
+        latest.acknowledged_sequence = latest
+            .acknowledged_sequence
+            .max(response.accepted_event_sequence.min(latest.sequence));
+        write(path, &latest).await?;
+        *record = latest;
+    }
+    Ok(())
 }
 
 pub async fn clear_publication_fence(
@@ -657,8 +738,12 @@ impl Agent {
                                 run_id,
                                 attempt,
                                 spec_hash,
+                                execution_identity,
                                 spec,
-                            } => self.accept(run_id, attempt, spec_hash, spec).await,
+                            } => {
+                                self.accept_with_identity(run_id, attempt, spec_hash, execution_identity, spec)
+                                    .await
+                            }
                             AgentAction::CancelAttempt {
                                 run_id,
                                 attempt,
@@ -796,12 +881,19 @@ impl Agent {
         })
     }
 
-    async fn accept(&self, run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec) {
+    async fn accept_with_identity(
+        &self,
+        run_id: String,
+        attempt: u32,
+        spec_hash: String,
+        execution_identity: Option<ExecutionIdentity>,
+        spec: ProcessRunSpec,
+    ) {
         let acceptance = self.acceptance.lock().await;
         let key = format!("{run_id}-{attempt}");
         let path = state_path(&self.config.storage.spool_dir, &run_id, attempt);
         if let Ok(mut existing) = read(&path).await {
-            if existing.spec_hash != spec_hash {
+            if existing.spec_hash != spec_hash || existing.execution_identity != execution_identity {
                 tracing::error!(%run_id, attempt, expected=%existing.spec_hash, received=%spec_hash,
                     "protocol integrity error: conflicting StartAttempt preserved original ownership");
                 return;
@@ -818,7 +910,7 @@ impl Agent {
         let rejection = if !self.config.runner.process.enabled || !safe_spec(&self.config, &spec) {
             Some("local policy rejected spec".to_owned())
         } else {
-            match self.publication_admission(&spec).await {
+            match self.publication_admission(execution_identity.as_ref(), &spec).await {
                 Ok(guard) => {
                     publication_guard = guard;
                     None
@@ -827,7 +919,8 @@ impl Agent {
             }
         };
         if let Some(message) = rejection {
-            let mut record = SpoolRecord::accepted(run_id, attempt, spec_hash, spec, now());
+            let mut record =
+                SpoolRecord::accepted_with_identity(run_id, attempt, spec_hash, execution_identity, spec, now());
             record.terminal(
                 AttemptState::Rejected,
                 None,
@@ -841,7 +934,7 @@ impl Agent {
             }
             return;
         }
-        let record = SpoolRecord::accepted(run_id, attempt, spec_hash, spec, now());
+        let record = SpoolRecord::accepted_with_identity(run_id, attempt, spec_hash, execution_identity, spec, now());
         if let Err(error) = write(&path, &record).await {
             tracing::error!(%error, "failed to persist acceptance");
             return;
@@ -874,35 +967,29 @@ impl Agent {
         });
     }
 
+    #[cfg(test)]
+    async fn accept(&self, run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec) {
+        self.accept_with_identity(run_id, attempt, spec_hash, None, spec).await;
+    }
+
     async fn publication_admission(
         &self,
+        execution_identity: Option<&ExecutionIdentity>,
         spec: &ProcessRunSpec,
     ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         let atomic = spec.publication.is_some();
-        let mut mirror = spec.publication.as_ref().map(|publication| publication.mirror.clone());
-        let paths = spool_paths(&self.config.storage.spool_dir).await?;
-        for path in paths
-            .iter()
-            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        let mirror = execution_identity
+            .map(|identity| identity.mirror.clone())
+            .or_else(|| spec.publication.as_ref().map(|publication| publication.mirror.clone()));
+        if let (Some(identity), Some(publication)) = (execution_identity, spec.publication.as_ref())
+            && identity.mirror != publication.mirror
         {
-            let record = read(path).await.map_err(|error| {
-                anyhow::anyhow!(
-                    "cannot prove publication spool {} safe for admission: {error}",
-                    path.display()
-                )
-            })?;
-            if mirror.is_none()
-                && record
-                    .publication
-                    .as_ref()
-                    .is_some_and(|publication| publication.published_dir == spec.target_dir)
-            {
-                mirror = record.publication.map(|publication| publication.mirror);
-            }
+            bail!("execution identity does not match Atomic publication Mirror");
         }
         let Some(mirror) = mirror else {
             return Ok(None);
         };
+        MirrorName::new(&mirror)?;
 
         // Abandon/fence takes the global acceptance lock before this same Mirror
         // lock, so the discovery scan and locked re-scan cannot miss a new fence.
@@ -1200,23 +1287,23 @@ impl Agent {
 
 async fn publication_capabilities(config: &Config, telemetry: &PublicationTelemetry) -> Vec<String> {
     let Some(publication_root) = config.storage.publication_root.clone() else {
-        return vec![];
+        return vec![EXECUTION_IDENTITY_V1.into()];
     };
     let mirror_root = config.storage.mirror_root.clone();
     match tokio::task::spawn_blocking(move || publication_fs::preflight(&mirror_root, &publication_root)).await {
         Ok(Ok(())) => {
             telemetry.preflight(true);
-            vec![ATOMIC_EXCHANGE_V1.into()]
+            vec![ATOMIC_EXCHANGE_V1.into(), EXECUTION_IDENTITY_V1.into()]
         }
         Ok(Err(error)) => {
             telemetry.preflight(false);
             tracing::warn!(%error, "Atomic publication preflight failed; capability disabled");
-            vec![]
+            vec![EXECUTION_IDENTITY_V1.into()]
         }
         Err(error) => {
             telemetry.preflight(false);
             tracing::warn!(%error, "Atomic publication preflight task failed; capability disabled");
-            vec![]
+            vec![EXECUTION_IDENTITY_V1.into()]
         }
     }
 }
@@ -1290,7 +1377,7 @@ pub fn now() -> String {
 mod tests {
     use super::*;
     use axum::{
-        Router,
+        Json, Router,
         body::Bytes,
         extract::State,
         http::{HeaderMap, HeaderValue, StatusCode},
@@ -1594,7 +1681,10 @@ mod tests {
         };
         let (_shutdown, receiver) = watch::channel(false);
         let agent = Agent::new(config.clone(), receiver).await.expect("preflighted Agent");
-        assert_eq!(agent.capabilities.as_ref(), &[ATOMIC_EXCHANGE_V1.to_owned()]);
+        assert_eq!(
+            agent.capabilities.as_ref(),
+            &[ATOMIC_EXCHANGE_V1.to_owned(), EXECUTION_IDENTITY_V1.to_owned()]
+        );
         drop(agent);
 
         let mut invalid = config;
@@ -1604,7 +1694,7 @@ mod tests {
         let agent = Agent::new(invalid, receiver)
             .await
             .expect("Direct-only Agent remains available");
-        assert!(agent.capabilities.is_empty());
+        assert_eq!(agent.capabilities.as_ref(), &[EXECUTION_IDENTITY_V1.to_owned()]);
     }
 
     #[tokio::test]
@@ -1807,7 +1897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atomic_recovery_and_durable_fence_block_admission_including_direct_writer() {
+    async fn mirror_fence_blocks_changed_target_and_move_back_but_allows_unrelated_mirror() {
         let directory = tempfile::tempdir().expect("tempdir");
         let (_sender, receiver) = watch::channel(false);
         let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
@@ -1815,11 +1905,12 @@ mod tests {
             .await
             .expect("spool");
         let atomic = atomic_spec(directory.path(), "demo");
+        let demo = ExecutionIdentity { mirror: "demo".into() };
         let mut record = SpoolRecord::accepted("run-atomic".into(), 1, "hash".into(), atomic.clone(), now());
         record.publication.as_mut().expect("publication state").phase = spool::PublicationPhase::ReadyToCommit;
         let path = state_path(&agent.config.storage.spool_dir, &record.run_id, record.attempt);
         write(&path, &record).await.expect("recovery record");
-        assert!(agent.publication_admission(&atomic).await.is_err());
+        assert!(agent.publication_admission(Some(&demo), &atomic).await.is_err());
 
         record.publication.as_mut().expect("publication state").phase = spool::PublicationPhase::AbandonedFenced;
         record.terminal(
@@ -1830,31 +1921,39 @@ mod tests {
             now(),
         );
         write(&path, &record).await.expect("durable fence");
-        assert!(agent.publication_admission(&atomic).await.is_err());
+        assert!(agent.publication_admission(Some(&demo), &atomic).await.is_err());
 
-        let published = atomic
-            .publication
-            .as_ref()
-            .expect("publication spec")
-            .published_dir
-            .clone();
         let mut direct = spec(&agent.config.storage.mirror_root, "/bin/true", Vec::new(), 10);
-        direct.target_dir = published;
-        assert!(agent.publication_admission(&direct).await.is_err());
+        direct.target_dir = agent
+            .config
+            .storage
+            .mirror_root
+            .join("changed-target")
+            .to_string_lossy()
+            .into_owned();
+        assert!(agent.publication_admission(Some(&demo), &direct).await.is_err());
+
+        let unrelated = ExecutionIdentity {
+            mirror: "unrelated".into(),
+        };
+        assert!(
+            agent
+                .publication_admission(Some(&unrelated), &direct)
+                .await
+                .expect("unrelated Direct admission")
+                .is_some()
+        );
 
         direct.target_dir = agent
             .config
             .storage
             .mirror_root
-            .join("unrelated")
+            .join("after-move-back")
             .to_string_lossy()
             .into_owned();
         assert!(
-            agent
-                .publication_admission(&direct)
-                .await
-                .expect("unrelated Direct admission")
-                .is_none()
+            agent.publication_admission(Some(&demo), &direct).await.is_err(),
+            "moving away and later back to this Node must not bypass its durable Mirror fence"
         );
     }
 
@@ -2299,6 +2398,95 @@ mod tests {
 
     async fn mock_event() -> StatusCode {
         StatusCode::OK
+    }
+
+    #[derive(Clone, Default)]
+    struct ReconcileState {
+        events: Arc<Mutex<Vec<EventRequest>>>,
+    }
+
+    async fn capture_event(
+        State(state): State<ReconcileState>,
+        Json(event): Json<EventRequest>,
+    ) -> Json<EventResponse> {
+        let sequence = event.event_sequence;
+        state.events.lock().await.push(event);
+        Json(EventResponse {
+            accepted_event_sequence: sequence,
+        })
+    }
+
+    async fn seed_visible_publication(root: &Path, server_url: String) -> (Config, std::path::PathBuf) {
+        let (_sender, receiver) = watch::channel(false);
+        let agent = test_agent(root, receiver, server_url);
+        let config = agent.config.clone();
+        drop(agent);
+        fs::create_dir_all(&config.storage.spool_dir).await.expect("spool");
+        fs::write(&config.server.token_file, "token\n").await.expect("token");
+        let run_id = "01M40000000000000000000000";
+        let path = state_path(&config.storage.spool_dir, run_id, 1);
+        let mut record = SpoolRecord::accepted(
+            run_id.into(),
+            1,
+            "sha256:abandon".into(),
+            atomic_spec(root, "demo"),
+            now(),
+        );
+        record.publication.as_mut().expect("publication").phase = spool::PublicationPhase::VisiblePendingDurability;
+        write(&path, &record).await.expect("visible publication");
+        (config, path)
+    }
+
+    #[tokio::test]
+    async fn abandon_immediately_reconciles_terminal_failure_and_retains_fence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = ReconcileState::default();
+        let app = Router::new()
+            .route(
+                "/api/v1alpha1/agent/attempts/{run}/{attempt}/events",
+                post(capture_event),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("server") });
+        let (config, path) = seed_visible_publication(directory.path(), url).await;
+
+        let result = abandon_publication(&config, "demo", "01M40000000000000000000000", 1, "sha256:abandon", true)
+            .await
+            .expect("abandon");
+
+        assert_eq!(result.reconciliation, AbandonReconciliation::Reconciled);
+        let events = state.events.lock().await;
+        assert_eq!(
+            events.iter().map(|event| event.state).collect::<Vec<_>>(),
+            vec![AttemptState::Accepted, AttemptState::Failed]
+        );
+        drop(events);
+        let record = read(&path).await.expect("retained fence");
+        assert_eq!(
+            record.publication.expect("publication").phase,
+            spool::PublicationPhase::AbandonedFenced
+        );
+        assert_eq!(record.acknowledged_sequence, record.sequence);
+    }
+
+    #[tokio::test]
+    async fn abandon_reports_pending_when_server_is_unreachable_and_retains_fence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (config, path) = seed_visible_publication(directory.path(), "http://127.0.0.1:1".into()).await;
+
+        let result = abandon_publication(&config, "demo", "01M40000000000000000000000", 1, "sha256:abandon", true)
+            .await
+            .expect("local abandon succeeds");
+
+        assert!(matches!(result.reconciliation, AbandonReconciliation::Pending(ref error) if !error.is_empty()));
+        let record = read(&path).await.expect("retained pending fence");
+        assert_eq!(
+            record.publication.expect("publication").phase,
+            spool::PublicationPhase::AbandonedFenced
+        );
+        assert_eq!(record.acknowledged_sequence, 0);
     }
     async fn mock_log(State(state): State<MockState>, headers: HeaderMap, body: Bytes) -> (StatusCode, HeaderMap) {
         if body.is_empty() && headers.get("x-lmt-log-complete").and_then(|v| v.to_str().ok()) == Some("true") {

@@ -155,6 +155,12 @@ hash. If durability can never be completed, the explicit risk-acknowledged
 `publication abandon` operation records a durable full-writer fence before it
 reports failure. It never rolls the published tree back.
 
+After that durable write, the command immediately attempts to reconcile the
+terminal failure with Server. Success is reported while explicitly retaining
+the fence. If Server cannot be reached or rejects the event, the command reports
+`Server reconciliation pending`; the durable fence remains for normal Agent
+reconciliation and is never cleared by this failure.
+
 `publication fence-clear` is separate and succeeds only after terminal/log
 acknowledgement and stable local namespace checks. Until then the fence blocks
 all LMT writers for that Mirror on the Node, including Direct mode.

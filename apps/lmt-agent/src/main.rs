@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use lmt_agent::{
-    Agent, PublicationStatus, abandon_publication, clear_publication_fence,
+    AbandonReconciliation, Agent, PublicationStatus, abandon_publication, clear_publication_fence,
     config::{Config, Logging, LoggingFormat},
     preflight_publication, publication_doctor, publication_status, reset_spool, retry_publication_durability,
 };
@@ -142,7 +142,7 @@ async fn run_publication_command(config: &Config, command: PublicationCommand) -
             identity,
             acknowledge_visible_publication_risk,
         } => {
-            let status = abandon_publication(
+            let result = abandon_publication(
                 config,
                 &identity.mirror,
                 &identity.run,
@@ -151,8 +151,17 @@ async fn run_publication_command(config: &Config, command: PublicationCommand) -
                 acknowledge_visible_publication_risk,
             )
             .await?;
-            print_status(&status);
-            println!("durable local writer fence retained; restart Agent to reconcile terminal failure");
+            print_status(&result.status);
+            match result.reconciliation {
+                AbandonReconciliation::Reconciled => {
+                    println!("Server terminal failure reconciled; durable local writer fence retained");
+                }
+                AbandonReconciliation::Pending(error) => {
+                    println!(
+                        "Server reconciliation pending ({error}); durable local writer fence retained for daemon retry"
+                    );
+                }
+            }
         }
         PublicationCommand::FenceClear(identity) => {
             clear_publication_fence(

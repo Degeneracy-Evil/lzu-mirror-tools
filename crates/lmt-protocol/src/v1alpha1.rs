@@ -4,6 +4,7 @@ use lmt_core::{AttemptState, BundleFile, FailureKind, ProcessRunSpec, RunState, 
 use serde::{Deserialize, Serialize};
 
 pub const ATOMIC_EXCHANGE_V1: &str = "atomic_exchange_v1";
+pub const EXECUTION_IDENTITY_V1: &str = "execution_identity_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -378,6 +379,8 @@ pub enum AgentAction {
         run_id: String,
         attempt: u32,
         spec_hash: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_identity: Option<ExecutionIdentity>,
         spec: ProcessRunSpec,
     },
     CancelAttempt {
@@ -385,6 +388,12 @@ pub enum AgentAction {
         attempt: u32,
         spec_hash: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionIdentity {
+    pub mirror: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -431,6 +440,7 @@ mod tests {
                 run_id: "01K00000000000000000000000".into(),
                 attempt: 1,
                 spec_hash: "sha256:abc".into(),
+                execution_identity: None,
                 spec: ProcessRunSpec {
                     runner: "process".into(),
                     program: "/bin/true".into(),
@@ -446,6 +456,23 @@ mod tests {
         let json = serde_json::to_value(message).expect("serialize");
         assert_eq!(json["actions"][0]["type"], "start_attempt");
         assert_eq!(json["actions"][0]["attempt"], 1);
+        assert!(json["actions"][0].get("execution_identity").is_none());
+    }
+
+    #[test]
+    fn m4_execution_identity_is_explicit_and_strict() {
+        let identity = ExecutionIdentity {
+            mirror: "example".into(),
+        };
+        let json = serde_json::to_value(&identity).expect("serialize identity");
+        assert_eq!(json, serde_json::json!({"mirror": "example"}));
+        assert!(
+            serde_json::from_value::<ExecutionIdentity>(serde_json::json!({
+                "mirror": "example",
+                "unknown": true
+            }))
+            .is_err()
+        );
     }
 
     #[test]

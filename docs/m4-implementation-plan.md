@@ -75,10 +75,14 @@ Protocol:
   root observation;
 - M4 Server accepts frozen M3 poll bodies;
 - M4 Agent advertises `atomic_exchange_v1`;
+- M4 Agent advertises `execution_identity_v1` independently of Atomic
+  filesystem capability;
 - ProcessRunSpec gains an optional publication extension;
 - Direct serialization omits the field entirely, never serializes
   `"publication": null`;
 - Atomic spec is sent only to an Agent advertising the capability;
+- StartAttempt gains an optional Mirror execution identity sent only to an
+  Agent advertising `execution_identity_v1`; it is omitted for M3 Agents;
 - publication fields participate in spec hash.
 
 For Atomic mode, process `target_dir` is the fresh candidate. Add

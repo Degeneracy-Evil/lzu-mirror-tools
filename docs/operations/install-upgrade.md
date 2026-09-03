@@ -29,6 +29,17 @@ The installer creates the service account, state/log/backup directories,
 systemd unit, initial TOML, and an operator token only when each is absent. It
 does not overwrite existing configuration, tokens, or database state.
 
+Every install and upgrade preserves the shared traversal boundary and
+service-specific file protection:
+
+~~~text
+/etc/lmt/          root:root      0755
+server.toml        root:lmt       0640
+operator.token     root:lmt       0640
+agent.toml         root:lmt-agent 0640
+agent.token        root:lmt-agent 0640
+~~~
+
 ## Agent installation
 
 Issue a Node credential with the operator CLI and store the one-time value in a

@@ -878,6 +878,12 @@ M4 Agent advertises publication capability explicitly.
 M4 Server dispatches atomic work only to Agents advertising the required
 capability.
 
+M4 Agent also advertises execution-identity support explicitly. M4 Server adds
+the logical Mirror identity to StartAttempt only for Agents advertising that
+support. The identity is independent of Atomic publication fields and target
+paths, and Direct ProcessRunSpec remains unchanged. M3 Agents receive the
+frozen legacy StartAttempt shape.
+
 For Direct Mirrors dispatched to M3 Agents, M4 Server serializes the legacy
 ProcessRunSpec shape exactly. An optional publication extension must be omitted,
 not serialized as `null`.

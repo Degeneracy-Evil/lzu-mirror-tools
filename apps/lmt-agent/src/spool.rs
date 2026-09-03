@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use lmt_core::{AttemptState, FailureKind, ProcessRunSpec};
+use lmt_protocol::v1alpha1::ExecutionIdentity;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -84,6 +85,8 @@ pub struct SpoolRecord {
     pub run_id: String,
     pub attempt: u32,
     pub spec_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity: Option<ExecutionIdentity>,
     pub spec: Option<ProcessRunSpec>,
     #[serde(default)]
     pub cancel_requested: bool,
@@ -103,7 +106,19 @@ pub struct SpoolRecord {
 }
 
 impl SpoolRecord {
+    #[cfg(test)]
     pub fn accepted(run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec, now: String) -> Self {
+        Self::accepted_with_identity(run_id, attempt, spec_hash, None, spec, now)
+    }
+
+    pub fn accepted_with_identity(
+        run_id: String,
+        attempt: u32,
+        spec_hash: String,
+        execution_identity: Option<ExecutionIdentity>,
+        spec: ProcessRunSpec,
+        now: String,
+    ) -> Self {
         let publication = spec.publication.as_ref().map(|publication| PublicationState {
             phase: PublicationPhase::Executing,
             mirror: publication.mirror.clone(),
@@ -127,6 +142,7 @@ impl SpoolRecord {
             run_id,
             attempt,
             spec_hash,
+            execution_identity,
             spec: Some(spec),
             cancel_requested: false,
             state: AttemptState::Accepted,
@@ -149,6 +165,7 @@ impl SpoolRecord {
             run_id,
             attempt,
             spec_hash,
+            execution_identity: None,
             spec: None,
             cancel_requested: true,
             state: AttemptState::Cancelled,
@@ -298,10 +315,12 @@ mod tests {
         );
         let mut value = serde_json::to_value(&record).expect("serialize direct record");
         assert!(value.get("publication").is_none());
+        assert!(value.get("execution_identity").is_none());
         value.as_object_mut().expect("record object").remove("publication");
 
         let decoded: SpoolRecord = serde_json::from_value(value).expect("decode M3 record");
         assert_eq!(decoded.publication, None);
+        assert_eq!(decoded.execution_identity, None);
         assert!(
             serde_json::to_value(decoded)
                 .expect("re-encode M3 record")

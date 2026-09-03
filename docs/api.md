@@ -336,6 +336,12 @@ Every start action carries:
 - spec hash;
 - immutable resolved RunSpec.
 
+For an Agent advertising `execution_identity_v1`, a start action also carries
+`execution_identity: { "mirror": "..." }`. This envelope identity lets the
+Agent enforce a durable Mirror fence even when a later Direct generation uses a
+different target. The optional field is omitted for M3 Agents; Direct
+`ProcessRunSpec` itself remains exactly M3-shaped.
+
 ## 16. Attempt events
 
 ```text

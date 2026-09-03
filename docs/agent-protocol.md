@@ -474,6 +474,8 @@ This complements, but does not replace, the Server-side durable Agent binding.
 
 An M4 Agent poll may include:
 
+- `capabilities`, including `execution_identity_v1` for M4 StartAttempt
+  execution identity;
 - `capabilities`, including `atomic_exchange_v1` only after the real local
   filesystem preflight succeeds;
 - `publication_root` as the configured private-root observation;
@@ -487,6 +489,14 @@ admission-block reason, and counts of local recovery/fence records.
 M4 Server accepts M3 poll bodies that omit all M4 fields. Direct dispatch remains
 available to those Agents. Atomic dispatch still requires the explicit
 `atomic_exchange_v1` capability; health fields never grant execution authority.
+
+When an Agent advertises `execution_identity_v1`, every StartAttempt includes
+`execution_identity.mirror`. The Agent persists this logical identity beside
+the Attempt and uses it for full-writer fence admission independently of target
+path or publication mode. The field is omitted for Agents that do not advertise
+the capability, so M4 Server to M3 Agent StartAttempt and Direct RunSpec bytes
+retain the frozen M3 shape. Capability support is never inferred from an Agent
+version string.
 
 The health snapshot is operational observation, not authoritative Run state or
 a durable action queue. Server aggregation de-duplicates repeated polls and

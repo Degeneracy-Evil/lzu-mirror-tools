@@ -1594,6 +1594,10 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
         .await?;
     s.metrics.polls.fetch_add(1, Ordering::Relaxed);
     s.notify.notify_waiters();
+    let supports_execution_identity = r
+        .capabilities
+        .iter()
+        .any(|capability| capability == EXECUTION_IDENTITY_V1);
     if let Some(a) = services::next_action_for_agent(
         &s.store,
         &node,
@@ -1604,7 +1608,7 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
     )
     .await?
     {
-        return Ok(action(a).into_response());
+        return Ok(action(a, supports_execution_identity).into_response());
     }
     let _ = tokio::time::timeout(s.poll_wait, s.notify.notified()).await;
     if let Some(a) = services::next_action_for_agent(
@@ -1617,22 +1621,24 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
     )
     .await?
     {
-        return Ok(action(a).into_response());
+        return Ok(action(a, supports_execution_identity).into_response());
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
-fn action(a: lmt_store::PollAction) -> Json<PollResponse> {
+fn action(a: lmt_store::PollAction, supports_execution_identity: bool) -> Json<PollResponse> {
     Json(PollResponse {
         actions: vec![match a {
             lmt_store::PollAction::StartAttempt {
                 run_id,
                 attempt_no,
+                mirror_name,
                 spec_hash,
                 spec,
             } => AgentAction::StartAttempt {
                 run_id,
                 attempt: attempt_no,
                 spec_hash,
+                execution_identity: supports_execution_identity.then_some(ExecutionIdentity { mirror: mirror_name }),
                 spec,
             },
             lmt_store::PollAction::CancelAttempt {
@@ -2125,10 +2131,49 @@ impl IntoResponse for Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lmt_core::{BundleFile, RunState};
+    use lmt_core::{BundleFile, ProcessRunSpec, RunState};
     use std::sync::atomic::AtomicI64;
 
     struct FakeClock(AtomicI64);
+
+    fn direct_poll_action() -> lmt_store::PollAction {
+        lmt_store::PollAction::StartAttempt {
+            run_id: "01M30000000000000000000003".into(),
+            attempt_no: 1,
+            mirror_name: "example".into(),
+            spec_hash: "sha256:m3-direct-fixture".into(),
+            spec: ProcessRunSpec {
+                runner: "process".into(),
+                program: "/usr/bin/rsync".into(),
+                args: vec![
+                    "-aH".into(),
+                    "--delete".into(),
+                    "rsync://example.invalid/archive/".into(),
+                    "/srv/mirrors/example".into(),
+                ],
+                cwd: None,
+                timeout_seconds: 21_600,
+                mirror_root: "/srv/mirrors".into(),
+                target_dir: "/srv/mirrors/example".into(),
+                publication: None,
+            },
+        }
+    }
+
+    #[test]
+    fn start_attempt_identity_is_capability_gated_for_m3_agents() {
+        let legacy_response = action(direct_poll_action(), false).0;
+        assert_eq!(
+            serde_json::to_string(&legacy_response).expect("legacy action bytes"),
+            include_str!("../../../crates/lmt-protocol/tests/fixtures/m3/poll-response.json").trim_end()
+        );
+        let legacy = serde_json::to_value(legacy_response).expect("legacy action");
+        assert!(legacy["actions"][0].get("execution_identity").is_none());
+
+        let m4 = serde_json::to_value(action(direct_poll_action(), true).0).expect("M4 action");
+        assert_eq!(m4["actions"][0]["execution_identity"]["mirror"], "example");
+        assert!(m4["actions"][0]["spec"].get("publication").is_none());
+    }
 
     #[test]
     fn production_server_example_has_explicit_valid_logging_and_secret_files() {

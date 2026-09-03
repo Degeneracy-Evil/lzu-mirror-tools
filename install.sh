@@ -88,6 +88,27 @@ install_units() {
     install -m 0644 "$SCRIPT_DIR/packaging/systemd/lmt-agent.service" "$(target /etc/systemd/system/lmt-agent.service)"
 }
 
+install_shared_config_dir() {
+    install -d -m 0755 "$(target /etc/lmt)"
+    if [ -z "$INSTALL_ROOT" ]; then
+        chown root:root /etc/lmt
+        chmod 0755 /etc/lmt
+    fi
+}
+
+enforce_config_permissions() {
+    for NAME in server.toml operator.token; do
+        FILE=$(target "/etc/lmt/$NAME")
+        [ ! -e "$FILE" ] || chmod 0640 "$FILE"
+        [ -n "$INSTALL_ROOT" ] || [ ! -e "$FILE" ] || chown root:lmt "$FILE"
+    done
+    for NAME in agent.toml agent.token; do
+        FILE=$(target "/etc/lmt/$NAME")
+        [ ! -e "$FILE" ] || chmod 0640 "$FILE"
+        [ -n "$INSTALL_ROOT" ] || [ ! -e "$FILE" ] || chown root:lmt-agent "$FILE"
+    done
+}
+
 install_server() {
     require_binary lmt-server
     require_binary lmt
@@ -95,7 +116,7 @@ install_server() {
     install -d -m 0755 "$(target /usr/bin)"
     install -m 0755 "$BINARY_DIR/lmt-server" "$(target /usr/bin/lmt-server)"
     install -m 0755 "$BINARY_DIR/lmt" "$(target /usr/bin/lmt)"
-    install -d -m 0750 "$(target /etc/lmt)" "$(target /var/lib/lmt)" \
+    install -d -m 0750 "$(target /var/lib/lmt)" \
         "$(target /var/lib/lmt/logs)" "$(target /var/lib/lmt/backups)"
     TOKEN=$(target /etc/lmt/operator.token)
     if [ ! -e "$TOKEN" ]; then
@@ -191,7 +212,6 @@ install_agent() {
     fi
     install -d -m 0755 "$(target /usr/bin)"
     install -m 0755 "$BINARY_DIR/lmt-agent" "$(target /usr/bin/lmt-agent)"
-    install -d -m 0750 "$(target /etc/lmt)"
     install -d -m 0700 "$(target /var/lib/lmt-agent)" "$(target /var/lib/lmt-agent/spool)"
     install -d -m 0755 "$(target "$MIRROR_ROOT")"
     [ -z "$PUBLICATION_ROOT" ] || install -d -m 0700 "$(target "$PUBLICATION_ROOT")"
@@ -244,6 +264,7 @@ EOF
 
 install_accounts
 install_units
+install_shared_config_dir
 case "$ROLE" in
     server) install_server ;;
     agent) install_agent ;;
@@ -253,6 +274,7 @@ case "$ROLE" in
         [ -e "$(target /etc/lmt/agent.toml)" ] && { require_binary lmt-agent; install -m 0755 "$BINARY_DIR/lmt-agent" "$(target /usr/bin/lmt-agent)"; }
         ;;
 esac
+enforce_config_permissions
 
 if [ -z "$INSTALL_ROOT" ] && [ "$START_SERVICES" -eq 1 ]; then
     systemctl daemon-reload
