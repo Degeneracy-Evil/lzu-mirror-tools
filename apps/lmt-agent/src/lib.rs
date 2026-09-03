@@ -343,7 +343,7 @@ impl Agent {
         Ok(())
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         self.recover().await;
         let reconciler = self.clone();
         let reconciliation = tokio::spawn(async move {
@@ -373,14 +373,21 @@ impl Agent {
                     .map(|root| root.to_string_lossy().into_owned()),
             };
             let token = self.token();
-            match self
+            let response = tokio::select! {
+                biased;
+                changed = self.shutdown.changed() => {
+                    let _ = changed;
+                    break;
+                }
+                response = self
                 .client
                 .post(format!("{}/api/v1alpha1/agent/poll", self.config.server.url))
                 .bearer_auth(token)
                 .json(&request)
                 .send()
-                .await
-            {
+                => response,
+            };
+            match response {
                 Ok(response) if response.status() == StatusCode::NO_CONTENT => {
                     self.control_plane_synchronized.store(true, AtomicOrdering::Release);
                 }
@@ -405,7 +412,14 @@ impl Agent {
                 Ok(response) => tracing::warn!(status=%response.status(), "poll rejected"),
                 Err(error) => tracing::warn!(%error, "poll failed"),
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::select! {
+                biased;
+                changed = self.shutdown.changed() => {
+                    let _ = changed;
+                    break;
+                }
+                () = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
         }
         reconciliation.abort();
         Ok(())
@@ -1033,6 +1047,49 @@ mod tests {
         );
         assert_eq!(atomic.storage.publication_max_private_generations, Some(4));
         assert_eq!(atomic.storage.publication_reserve_bytes, Some(10_737_418_240));
+    }
+
+    #[tokio::test]
+    async fn idle_agent_shutdown_cancels_an_outstanding_poll_promptly() {
+        #[derive(Clone)]
+        struct IdlePollState(Arc<tokio::sync::Notify>);
+
+        async fn hanging_poll(State(state): State<IdlePollState>) -> StatusCode {
+            state.0.notify_one();
+            std::future::pending().await
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let server_entered = entered.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/v1alpha1/agent/poll", post(hanging_poll))
+                    .with_state(IdlePollState(server_entered)),
+            )
+            .await
+            .expect("server");
+        });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (shutdown, receiver) = watch::channel(false);
+        let agent = test_agent(directory.path(), receiver, format!("http://{address}"));
+        fs::create_dir_all(&agent.config.storage.spool_dir)
+            .await
+            .expect("spool");
+        let running = tokio::spawn(agent.run());
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("Agent entered long poll");
+        shutdown.send(true).expect("shutdown");
+        tokio::time::timeout(Duration::from_millis(250), running)
+            .await
+            .expect("prompt Agent shutdown")
+            .expect("Agent task")
+            .expect("Agent result");
+        server.abort();
     }
 
     #[tokio::test]
