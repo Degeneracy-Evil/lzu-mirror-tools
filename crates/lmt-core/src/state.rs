@@ -69,6 +69,7 @@ pub enum FailureKind {
     Interrupted,
     Rejected,
     InvalidResult,
+    PublicationDurability,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]

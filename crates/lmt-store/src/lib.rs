@@ -2039,6 +2039,7 @@ const fn failure_kind_str(kind: FailureKind) -> &'static str {
         FailureKind::Interrupted => "interrupted",
         FailureKind::Rejected => "rejected",
         FailureKind::InvalidResult => "invalid_result",
+        FailureKind::PublicationDurability => "publication_durability",
     }
 }
 

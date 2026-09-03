@@ -17,7 +17,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use config::Config;
-use lmt_core::{AttemptState, FailureKind, NodeName, ProcessRunSpec};
+use lmt_core::{AttemptNo, AttemptState, FailureKind, MirrorName, NodeName, ProcessRunSpec, RunId};
 use lmt_protocol::v1alpha1::{AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse};
 use nix::sys::statvfs::statvfs;
 use reqwest::{Client, StatusCode};
@@ -32,6 +32,164 @@ use spool::{SpoolRecord, log_path, read, retire, state_path, write};
 
 const INSTALLATION_ID_FILE: &str = "agent-id";
 const ATOMIC_EXCHANGE_V1: &str = lmt_protocol::v1alpha1::ATOMIC_EXCHANGE_V1;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PublicationStatus {
+    pub mirror: String,
+    pub run_id: String,
+    pub attempt: u32,
+    pub spec_hash: String,
+    pub phase: String,
+    pub attempt_state: AttemptState,
+    pub acknowledged_sequence: u64,
+    pub event_sequence: u64,
+}
+
+pub async fn publication_status(config: &Config, mirror: &str) -> anyhow::Result<Vec<PublicationStatus>> {
+    MirrorName::new(mirror)?;
+    fs::create_dir_all(&config.storage.spool_dir).await?;
+    let _process_lock = process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))?;
+    let mut status = Vec::new();
+    for path in spool_paths(&config.storage.spool_dir).await? {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let record = read(&path)
+            .await
+            .with_context(|| format!("cannot read publication spool {}", path.display()))?;
+        let Some(publication) = record
+            .publication
+            .as_ref()
+            .filter(|publication| publication.mirror == mirror)
+        else {
+            continue;
+        };
+        status.push(PublicationStatus {
+            mirror: publication.mirror.clone(),
+            run_id: record.run_id,
+            attempt: record.attempt,
+            spec_hash: record.spec_hash,
+            phase: publication.phase.as_str().into(),
+            attempt_state: record.state,
+            acknowledged_sequence: record.acknowledged_sequence,
+            event_sequence: record.sequence,
+        });
+    }
+    status.sort_by(|left, right| (&left.run_id, left.attempt).cmp(&(&right.run_id, right.attempt)));
+    Ok(status)
+}
+
+pub async fn retry_publication_durability(
+    config: &Config,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+) -> anyhow::Result<PublicationStatus> {
+    validate_publication_identity(mirror, run_id, attempt)?;
+    let _process_lock = maintenance_lock(config).await?;
+    publication_preflight(config).await?;
+    let path = state_path(&config.storage.spool_dir, run_id, attempt);
+    let record = publication::retry_durability(
+        &path,
+        mirror,
+        run_id,
+        attempt,
+        spec_hash,
+        &publication::MirrorLocks::default(),
+    )
+    .await?;
+    status_from_record(record)
+}
+
+pub async fn abandon_publication(
+    config: &Config,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+    acknowledged_visible_risk: bool,
+) -> anyhow::Result<PublicationStatus> {
+    if !acknowledged_visible_risk {
+        bail!("publication abandon requires --acknowledge-visible-publication-risk");
+    }
+    validate_publication_identity(mirror, run_id, attempt)?;
+    let _process_lock = maintenance_lock(config).await?;
+    let path = state_path(&config.storage.spool_dir, run_id, attempt);
+    let record = publication::abandon(
+        &path,
+        mirror,
+        run_id,
+        attempt,
+        spec_hash,
+        &publication::MirrorLocks::default(),
+    )
+    .await?;
+    status_from_record(record)
+}
+
+pub async fn clear_publication_fence(
+    config: &Config,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+) -> anyhow::Result<()> {
+    validate_publication_identity(mirror, run_id, attempt)?;
+    let _process_lock = maintenance_lock(config).await?;
+    publication_preflight(config).await?;
+    let path = state_path(&config.storage.spool_dir, run_id, attempt);
+    publication::clear_fence(
+        &path,
+        &config.storage.spool_dir,
+        mirror,
+        run_id,
+        attempt,
+        spec_hash,
+        &publication::MirrorLocks::default(),
+    )
+    .await
+}
+
+async fn maintenance_lock(config: &Config) -> anyhow::Result<process_lock::ProcessLock> {
+    fs::create_dir_all(&config.storage.spool_dir).await?;
+    process_lock::ProcessLock::acquire(&config.storage.spool_dir.join("lmt-agent.lock"))
+}
+
+async fn publication_preflight(config: &Config) -> anyhow::Result<()> {
+    let mirror_root = config.storage.mirror_root.clone();
+    let publication_root = config
+        .storage
+        .publication_root
+        .clone()
+        .context("publication_root is not configured")?;
+    tokio::task::spawn_blocking(move || publication_fs::preflight(&mirror_root, &publication_root)).await??;
+    Ok(())
+}
+
+fn validate_publication_identity(mirror: &str, run_id: &str, attempt: u32) -> anyhow::Result<()> {
+    MirrorName::new(mirror)?;
+    let parsed = run_id.parse::<RunId>()?;
+    if parsed.to_string() != run_id {
+        bail!("Run ID is not canonical");
+    }
+    AttemptNo::new(attempt)?;
+    Ok(())
+}
+
+fn status_from_record(record: SpoolRecord) -> anyhow::Result<PublicationStatus> {
+    let publication = record.publication.as_ref().context("publication state missing")?;
+    Ok(PublicationStatus {
+        mirror: publication.mirror.clone(),
+        run_id: record.run_id,
+        attempt: record.attempt,
+        spec_hash: record.spec_hash,
+        phase: publication.phase.as_str().into(),
+        attempt_state: record.state,
+        acknowledged_sequence: record.acknowledged_sequence,
+        event_sequence: record.sequence,
+    })
+}
 
 pub async fn reset_spool(config: &Config, acknowledged: bool) -> anyhow::Result<u64> {
     if !acknowledged {

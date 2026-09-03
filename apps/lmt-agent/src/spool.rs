@@ -20,6 +20,18 @@ pub enum PublicationPhase {
 }
 
 impl PublicationPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Executing => "executing",
+            Self::PreparingExchange => "preparing_exchange",
+            Self::ReadyToCommit => "ready_to_commit",
+            Self::PreVisibilityRecovery => "pre_visibility_recovery",
+            Self::VisiblePendingDurability => "visible_pending_durability",
+            Self::CommittedPendingReport => "committed_pending_report",
+            Self::AbandonedFenced => "abandoned_fenced",
+        }
+    }
+
     pub const fn is_protected(self) -> bool {
         !matches!(self, Self::Executing)
     }

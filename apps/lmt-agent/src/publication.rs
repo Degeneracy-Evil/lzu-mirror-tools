@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
     now, publication_fs,
-    spool::{PublicationPhase, PublicationState, SpoolRecord, write},
+    spool::{PublicationPhase, PublicationState, SpoolRecord, read, retire, write},
 };
 
 #[derive(Clone, Default)]
@@ -235,6 +235,134 @@ pub async fn prepare_candidate(record: &SpoolRecord, locks: &MirrorLocks) -> any
         Ok(())
     })
     .await??;
+    Ok(())
+}
+
+pub async fn retry_durability(
+    path: &Path,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+    locks: &MirrorLocks,
+) -> anyhow::Result<SpoolRecord> {
+    let _guard = locks.acquire(mirror).await;
+    let mut record = read(path).await?;
+    validate_exact(&record, mirror, run_id, attempt, spec_hash)?;
+    if record.publication.as_ref().context("publication state missing")?.phase
+        != PublicationPhase::VisiblePendingDurability
+    {
+        bail!("retry-durability requires visible_pending_durability");
+    }
+    finish_visible(path, &mut record).await?;
+    Ok(record)
+}
+
+pub async fn abandon(
+    path: &Path,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+    locks: &MirrorLocks,
+) -> anyhow::Result<SpoolRecord> {
+    let _guard = locks.acquire(mirror).await;
+    let mut record = read(path).await?;
+    validate_exact(&record, mirror, run_id, attempt, spec_hash)?;
+    if record.publication.as_ref().context("publication state missing")?.phase
+        != PublicationPhase::VisiblePendingDurability
+    {
+        bail!("abandon requires visible_pending_durability");
+    }
+    let mut fenced = record.clone();
+    fenced.publication.as_mut().context("publication state missing")?.phase = PublicationPhase::AbandonedFenced;
+    fenced.terminal(
+        AttemptState::Failed,
+        None,
+        Some(FailureKind::PublicationDurability),
+        Some("operator abandoned publication after visibility; local writer fence remains".into()),
+        now(),
+    );
+    write(path, &fenced)
+        .await
+        .context("persist abandoned_fenced before terminal report")?;
+    record = fenced;
+    Ok(record)
+}
+
+pub async fn clear_fence(
+    path: &Path,
+    spool_dir: &Path,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+    locks: &MirrorLocks,
+) -> anyhow::Result<()> {
+    let _guard = locks.acquire(mirror).await;
+    let record = read(path).await?;
+    validate_exact(&record, mirror, run_id, attempt, spec_hash)?;
+    let state = record.publication.as_ref().context("publication state missing")?;
+    if state.phase != PublicationPhase::AbandonedFenced {
+        bail!("fence-clear requires abandoned_fenced");
+    }
+    if record.acknowledged_sequence < record.sequence || !record.log_complete_acknowledged {
+        bail!("fence-clear requires acknowledged terminal event and complete log");
+    }
+    verify_visible_namespace(state)?;
+    let mut entries = tokio::fs::read_dir(spool_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let other_path = entry.path();
+        if other_path == path || other_path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let other = read(&other_path)
+            .await
+            .with_context(|| format!("cannot prove fence-clear safe from {}", other_path.display()))?;
+        if other.requires_publication_recovery()
+            && other
+                .publication
+                .as_ref()
+                .is_some_and(|publication| publication.mirror == mirror)
+        {
+            bail!(
+                "fence-clear blocked by recoverable publication Attempt {}",
+                other.run_id
+            );
+        }
+    }
+    retire(path).await.context("retire cleared publication fence")
+}
+
+fn validate_exact(
+    record: &SpoolRecord,
+    mirror: &str,
+    run_id: &str,
+    attempt: u32,
+    spec_hash: &str,
+) -> anyhow::Result<()> {
+    let record_mirror = &record.publication.as_ref().context("publication state missing")?.mirror;
+    if record_mirror != mirror || record.run_id != run_id || record.attempt != attempt || record.spec_hash != spec_hash
+    {
+        bail!("publication operation identity does not exactly match durable spool evidence");
+    }
+    Ok(())
+}
+
+fn verify_visible_namespace(state: &PublicationState) -> anyhow::Result<()> {
+    let candidate = state.candidate_identity.context("fence lacks candidate identity")?;
+    if publication_fs::identity_if_exists(Path::new(&state.published_dir))? != Some(candidate) {
+        bail!("fenced candidate identity is not at the published path");
+    }
+    match state.published_identity {
+        Some(previous) if publication_fs::identity_if_exists(Path::new(&state.exchange_dir))? != Some(previous) => {
+            bail!("stable previous identity does not match the exchange slot");
+        }
+        None if publication_fs::identity_if_exists(Path::new(&state.exchange_dir))?.is_some() => {
+            bail!("first-publication fence has an unexpected exchange generation");
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -1097,6 +1225,12 @@ mod tests {
         commit(&initial_path, &mut initial, &locks)
             .await
             .expect("initial publication");
+        initial.acknowledged_sequence = initial.sequence;
+        initial.log_complete_acknowledged = true;
+        write(&initial_path, &initial)
+            .await
+            .expect("acknowledged initial publication");
+        retire(&initial_path).await.expect("retired initial publication");
         let (path, mut record) = atomic_record(directory.path(), "run-new").await;
         prepare(&path, &mut record).await.expect("ready before restart");
         let publication = record.publication.as_ref().expect("publication state").clone();
@@ -1122,6 +1256,118 @@ mod tests {
         assert_eq!(
             publication_fs::identity(Path::new(&publication.published_dir)).expect("unchanged published"),
             published_before
+        );
+    }
+
+    #[tokio::test]
+    async fn abandon_and_fence_clear_require_exact_identity_ack_and_stable_namespace() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let locks = MirrorLocks::default();
+        let (initial_path, mut initial) = atomic_record(directory.path(), "run-old").await;
+        commit(&initial_path, &mut initial, &locks)
+            .await
+            .expect("initial publication");
+        initial.acknowledged_sequence = initial.sequence;
+        initial.log_complete_acknowledged = true;
+        write(&initial_path, &initial)
+            .await
+            .expect("acknowledged initial publication");
+        retire(&initial_path).await.expect("retired initial publication");
+        let (path, mut record) = atomic_record(directory.path(), "run-new").await;
+        prepare(&path, &mut record).await.expect("ready publication");
+        let publication = record.publication.as_ref().expect("publication state").clone();
+        exchange_paths(
+            PathBuf::from(&publication.exchange_dir),
+            PathBuf::from(&publication.published_dir),
+        )
+        .await
+        .expect("visible publication");
+        record.publication.as_mut().expect("publication state").phase = PublicationPhase::VisiblePendingDurability;
+        write(&path, &record).await.expect("visible pending spool");
+
+        assert!(
+            abandon(&path, "demo", "run-new", 1, "wrong-hash", &locks)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            read(&path)
+                .await
+                .expect("unchanged exact evidence")
+                .publication
+                .expect("publication state")
+                .phase,
+            PublicationPhase::VisiblePendingDurability
+        );
+        let mut fenced = abandon(&path, "demo", "run-new", 1, "hash-run-new", &locks)
+            .await
+            .expect("exact abandon");
+        assert_eq!(fenced.state, AttemptState::Failed);
+        assert_eq!(fenced.failure_kind, Some(FailureKind::PublicationDurability));
+        assert_eq!(
+            fenced.publication.as_ref().expect("publication state").phase,
+            PublicationPhase::AbandonedFenced
+        );
+        assert!(
+            clear_fence(
+                &path,
+                &directory.path().join("spool"),
+                "demo",
+                "run-new",
+                1,
+                "hash-run-new",
+                &locks
+            )
+            .await
+            .is_err(),
+            "unacknowledged fence was cleared"
+        );
+        fenced.acknowledged_sequence = fenced.sequence;
+        fenced.log_complete_acknowledged = true;
+        write(&path, &fenced).await.expect("acknowledged fence");
+        clear_fence(
+            &path,
+            &directory.path().join("spool"),
+            "demo",
+            "run-new",
+            1,
+            "hash-run-new",
+            &locks,
+        )
+        .await
+        .expect("safe exact fence clear");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn exact_retry_durability_finishes_same_visible_attempt_without_republishing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let locks = MirrorLocks::default();
+        let (path, mut record) = atomic_record(directory.path(), "run-new").await;
+        prepare(&path, &mut record).await.expect("ready publication");
+        let publication = record.publication.as_ref().expect("publication state").clone();
+        rename_noreplace(
+            PathBuf::from(&publication.exchange_dir),
+            PathBuf::from(&publication.published_dir),
+        )
+        .await
+        .expect("first visibility commit");
+        let visible_identity =
+            publication_fs::identity(Path::new(&publication.published_dir)).expect("visible identity");
+        record.publication.as_mut().expect("publication state").phase = PublicationPhase::VisiblePendingDurability;
+        write(&path, &record).await.expect("visible pending spool");
+
+        let retried = retry_durability(&path, "demo", "run-new", 1, "hash-run-new", &locks)
+            .await
+            .expect("retry same durability operation");
+        assert_eq!(retried.state, AttemptState::Succeeded);
+        assert_eq!(
+            retried.publication.expect("publication state").phase,
+            PublicationPhase::CommittedPendingReport
+        );
+        assert_eq!(
+            publication_fs::identity(Path::new(&publication.published_dir)).expect("same visible identity"),
+            visible_identity
         );
     }
 }
