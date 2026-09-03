@@ -1273,6 +1273,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_and_downgrade_reset_refuse_every_protected_publication_phase() {
+        for phase in [
+            spool::PublicationPhase::PreparingExchange,
+            spool::PublicationPhase::ReadyToCommit,
+            spool::PublicationPhase::PreVisibilityRecovery,
+            spool::PublicationPhase::VisiblePendingDurability,
+            spool::PublicationPhase::CommittedPendingReport,
+            spool::PublicationPhase::AbandonedFenced,
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let (_sender, receiver) = watch::channel(false);
+            let agent = test_agent(directory.path(), receiver, "http://127.0.0.1:1".into());
+            let config = agent.config.clone();
+            drop(agent);
+            fs::create_dir_all(&config.storage.spool_dir).await.expect("spool");
+            let path = state_path(&config.storage.spool_dir, "run-atomic", 1);
+            let mut record = SpoolRecord::accepted(
+                "run-atomic".into(),
+                1,
+                "hash".into(),
+                atomic_spec(directory.path(), "demo"),
+                now(),
+            );
+            record.publication.as_mut().expect("publication state").phase = phase;
+            write(&path, &record).await.expect("protected evidence");
+
+            assert!(reset_spool(&config, true).await.is_err(), "reset accepted {phase:?}");
+            assert!(
+                fs::try_exists(path).await.expect("state existence"),
+                "reset deleted {phase:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn atomic_recovery_and_durable_fence_block_admission_including_direct_writer() {
         let directory = tempfile::tempdir().expect("tempdir");
         let (_sender, receiver) = watch::channel(false);
