@@ -27,7 +27,7 @@ enum Command {
         acknowledge_control_plane_restore: bool,
     },
 }
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     let a = Args::parse();
     let source = fs::read_to_string(&a.config)

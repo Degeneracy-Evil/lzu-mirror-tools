@@ -56,7 +56,7 @@ struct PublicationIdentity {
     spec_hash: String,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let config: Config = toml::from_str(&fs::read_to_string(args.config).await?)?;
