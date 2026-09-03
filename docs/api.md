@@ -579,3 +579,28 @@ This endpoint does not create Mirror ownership or mark the Node online.
 The first successfully authenticated Agent poll later establishes observed state and the durable Agent installation binding.
 
 Unauthenticated Agent self-registration remains forbidden.
+
+## 34. M4 publication status and diagnostics
+
+Node entries in the existing status response may include
+`atomic_publication_capable` and `publication_health`. Both are omitted when no
+M4 publication-health observation exists, preserving the accepted M3 response
+shape for legacy Agents.
+
+The existing metrics endpoint exposes low-cardinality publication aggregates:
+
+- capable Agent count;
+- publication commit success/failure totals;
+- visibility-to-durability duration total/sample count;
+- preflight rejection and GC failure totals;
+- per-Node publication free bytes, GC backlog, degraded/fence/recovery state,
+  and admission-block reason.
+
+Run IDs, Attempt numbers, spec hashes, and filesystem paths are never metric
+labels. The Server doctor adds stable `publication.capability` and
+`publication.health` checks based on the latest authenticated Agent polls.
+
+Filesystem and protected-spool checks that require local Agent access are
+available through the offline `lmt-agent doctor` command. It acquires the normal
+Agent single-instance lock and performs the real disposable filesystem probe;
+it does not mutate control-plane or publication business state.

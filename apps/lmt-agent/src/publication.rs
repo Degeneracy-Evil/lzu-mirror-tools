@@ -43,6 +43,11 @@ pub struct AdmissionReport {
     pub publication_free_bytes: u64,
 }
 
+pub enum CommitOutcome {
+    Published(std::time::Duration),
+    Aborted,
+}
+
 struct OwnedGenerationEntry {
     cleanup_path: PathBuf,
     contains_generation: bool,
@@ -254,7 +259,7 @@ pub async fn retry_durability(
     {
         bail!("retry-durability requires visible_pending_durability");
     }
-    finish_visible(path, &mut record).await?;
+    finish_visible(path, &mut record, None).await?;
     Ok(record)
 }
 
@@ -366,7 +371,7 @@ fn verify_visible_namespace(state: &PublicationState) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn commit(path: &Path, record: &mut SpoolRecord, locks: &MirrorLocks) -> anyhow::Result<()> {
+pub async fn commit(path: &Path, record: &mut SpoolRecord, locks: &MirrorLocks) -> anyhow::Result<CommitOutcome> {
     let mirror = record
         .publication
         .as_ref()
@@ -398,7 +403,7 @@ pub async fn recover(path: &Path, record: &mut SpoolRecord, locks: &MirrorLocks)
                 )
                 .await;
             }
-            commit_ready(path, record).await
+            commit_ready(path, record).await.map(|_| ())
         }
         Some(PublicationPhase::ReadyToCommit) => recover_ready(path, record).await,
         Some(PublicationPhase::PreVisibilityRecovery) => {
@@ -415,7 +420,7 @@ pub async fn recover(path: &Path, record: &mut SpoolRecord, locks: &MirrorLocks)
                 .unwrap_or_else(|| "publication private namespace recovered after an earlier failure".into());
             restore_then_terminal(path, record, terminal_state, failure_kind, message).await
         }
-        Some(PublicationPhase::VisiblePendingDurability) => finish_visible(path, record).await,
+        Some(PublicationPhase::VisiblePendingDurability) => finish_visible(path, record, None).await.map(|_| ()),
         Some(PublicationPhase::CommittedPendingReport) => ensure_committed_terminal(path, record).await,
         Some(PublicationPhase::Executing | PublicationPhase::AbandonedFenced) | None => Ok(()),
     }
@@ -465,7 +470,7 @@ pub async fn recover_before_control_plane(
             )
             .await
         }
-        Some(PublicationPhase::VisiblePendingDurability) => finish_visible(path, record).await,
+        Some(PublicationPhase::VisiblePendingDurability) => finish_visible(path, record, None).await.map(|_| ()),
         Some(PublicationPhase::CommittedPendingReport) => ensure_committed_terminal(path, record).await,
         Some(PublicationPhase::Executing | PublicationPhase::ReadyToCommit | PublicationPhase::AbandonedFenced)
         | None => Ok(()),
@@ -603,7 +608,7 @@ async fn prepare_namespace(path: &Path, record: &mut SpoolRecord) -> anyhow::Res
     Ok(())
 }
 
-async fn commit_ready(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {
+async fn commit_ready(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<CommitOutcome> {
     let state = record
         .publication
         .as_ref()
@@ -620,7 +625,8 @@ async fn commit_ready(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<(
             None,
             "cancelled before visibility".into(),
         )
-        .await;
+        .await
+        .map(|()| CommitOutcome::Aborted);
     }
     if let Err(error) = verify_ready(&state) {
         return restore_then_terminal(
@@ -630,16 +636,21 @@ async fn commit_ready(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<(
             Some(FailureKind::InvalidResult),
             error.to_string(),
         )
-        .await;
+        .await
+        .map(|()| CommitOutcome::Aborted);
     }
     let exchange = PathBuf::from(&state.exchange_dir);
     let published = PathBuf::from(&state.published_dir);
+    let visibility_started = tokio::time::Instant::now();
     if state.published_identity.is_some() {
         exchange_paths(exchange.clone(), published.clone()).await?;
     } else {
         rename_noreplace(exchange.clone(), published.clone()).await?;
     }
-    finish_visible(path, record).await
+    finish_visible(path, record, Some(visibility_started))
+        .await?
+        .context("visibility duration missing after local commit")
+        .map(CommitOutcome::Published)
 }
 
 async fn recover_ready(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {
@@ -654,10 +665,10 @@ async fn recover_ready(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<
     let published = publication_fs::identity_if_exists(Path::new(&state.published_dir))?;
     let exchange = publication_fs::identity_if_exists(Path::new(&state.exchange_dir))?;
     if published == Some(candidate) {
-        return finish_visible(path, record).await;
+        return finish_visible(path, record, None).await.map(|_| ());
     }
     if exchange == Some(candidate) && published == state.published_identity {
-        return commit_ready(path, record).await;
+        return commit_ready(path, record).await.map(|_| ());
     }
     restore_then_terminal(
         path,
@@ -691,7 +702,11 @@ fn verify_ready(state: &PublicationState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn finish_visible(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {
+async fn finish_visible(
+    path: &Path,
+    record: &mut SpoolRecord,
+    visibility_started: Option<tokio::time::Instant>,
+) -> anyhow::Result<Option<std::time::Duration>> {
     let state = record
         .publication
         .as_ref()
@@ -716,6 +731,7 @@ async fn finish_visible(path: &Path, record: &mut SpoolRecord) -> anyhow::Result
         }
         return Err(error).context("publication visible but directory durability is pending");
     }
+    let visibility_to_durability = visibility_started.map(|started| started.elapsed());
     let mut committed = record.clone();
     committed
         .publication
@@ -727,7 +743,7 @@ async fn finish_visible(path: &Path, record: &mut SpoolRecord) -> anyhow::Result
         .await
         .context("persist committed_pending_report before success")?;
     *record = committed;
-    Ok(())
+    Ok(visibility_to_durability)
 }
 
 async fn ensure_committed_terminal(path: &Path, record: &mut SpoolRecord) -> anyhow::Result<()> {

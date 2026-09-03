@@ -20,7 +20,7 @@ use tokio::{
 };
 
 use crate::{
-    now,
+    PublicationTelemetry, now,
     publication::{self, MirrorLocks},
     spool::{SpoolRecord, read, write},
 };
@@ -39,6 +39,7 @@ pub async fn execute(
     mut cancel: watch::Receiver<bool>,
     spool_lock: Arc<Mutex<()>>,
     publication_locks: MirrorLocks,
+    publication_telemetry: Arc<PublicationTelemetry>,
 ) {
     let Some(spec) = record.spec.as_ref() else {
         return;
@@ -107,29 +108,42 @@ pub async fn execute(
     if let Ok(latest) = read(path).await {
         record.cancel_requested |= latest.cancel_requested;
     }
-    finalize(path, record, outcome, &publication_locks).await;
+    finalize(path, record, outcome, &publication_locks, &publication_telemetry).await;
 }
 
-async fn finalize(path: &Path, record: &mut SpoolRecord, outcome: Outcome, publication_locks: &MirrorLocks) {
+async fn finalize(
+    path: &Path,
+    record: &mut SpoolRecord,
+    outcome: Outcome,
+    publication_locks: &MirrorLocks,
+    publication_telemetry: &PublicationTelemetry,
+) {
     match outcome {
         _ if record.cancel_requested => record.terminal(AttemptState::Cancelled, None, None, None, now()),
         Outcome::Process(Ok(status)) if status.success() && record.publication.is_some() => {
-            if let Err(error) = publication::commit(path, record, publication_locks).await {
-                tracing::error!(%error, run_id=%record.run_id, attempt=record.attempt, "Atomic publication commit deferred");
-                if record
-                    .publication
-                    .as_ref()
-                    .is_some_and(|state| state.phase == crate::spool::PublicationPhase::Executing)
-                {
-                    record.terminal(
-                        AttemptState::Failed,
-                        status.code(),
-                        Some(FailureKind::InvalidResult),
-                        Some(error.to_string()),
-                        now(),
-                    );
-                    let _ = write(path, record).await;
+            match publication::commit(path, record, publication_locks).await {
+                Err(error) => {
+                    publication_telemetry.commit(false, Duration::ZERO);
+                    tracing::error!(%error, run_id=%record.run_id, attempt=record.attempt, "Atomic publication commit deferred");
+                    if record
+                        .publication
+                        .as_ref()
+                        .is_some_and(|state| state.phase == crate::spool::PublicationPhase::Executing)
+                    {
+                        record.terminal(
+                            AttemptState::Failed,
+                            status.code(),
+                            Some(FailureKind::InvalidResult),
+                            Some(error.to_string()),
+                            now(),
+                        );
+                        let _ = write(path, record).await;
+                    }
                 }
+                Ok(publication::CommitOutcome::Published(visibility_to_durability)) => {
+                    publication_telemetry.commit(true, visibility_to_durability);
+                }
+                Ok(publication::CommitOutcome::Aborted) => {}
             }
         }
         Outcome::Process(Ok(status)) if status.success() => {

@@ -9,8 +9,8 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool as SyncFlag, Ordering as AtomicOrdering},
+        Arc, Mutex as StdMutex, RwLock,
+        atomic::{AtomicBool, AtomicBool as SyncFlag, AtomicU32, AtomicU64, Ordering as AtomicOrdering},
     },
     time::Duration,
 };
@@ -18,7 +18,10 @@ use std::{
 use anyhow::{Context, bail};
 use config::Config;
 use lmt_core::{AttemptNo, AttemptState, FailureKind, MirrorName, NodeName, ProcessRunSpec, RunId};
-use lmt_protocol::v1alpha1::{AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse};
+use lmt_protocol::v1alpha1::{
+    AgentAction, Capacity, EventRequest, OwnedAttempt, PollRequest, PollResponse, PublicationAdmissionBlockReason,
+    PublicationHealth,
+};
 use nix::sys::statvfs::statvfs;
 use reqwest::{Client, StatusCode};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -43,6 +46,157 @@ pub struct PublicationStatus {
     pub attempt_state: AttemptState,
     pub acknowledged_sequence: u64,
     pub event_sequence: u64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PublicationDoctorCheck {
+    pub id: &'static str,
+    pub healthy: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PublicationDoctorReport {
+    pub healthy: bool,
+    pub checks: Vec<PublicationDoctorCheck>,
+}
+
+fn publication_doctor_check(id: &'static str, healthy: bool, message: impl Into<String>) -> PublicationDoctorCheck {
+    PublicationDoctorCheck {
+        id,
+        healthy,
+        message: message.into(),
+    }
+}
+
+fn publication_doctor_report(checks: Vec<PublicationDoctorCheck>) -> PublicationDoctorReport {
+    PublicationDoctorReport {
+        healthy: checks.iter().all(|check| check.healthy),
+        checks,
+    }
+}
+
+struct PublicationSpoolHealth {
+    readable: bool,
+    invalid_targets: u32,
+    fenced_records: u32,
+    recovery_records: u32,
+}
+
+async fn inspect_publication_spool(spool_dir: &Path) -> PublicationSpoolHealth {
+    let mut health = PublicationSpoolHealth {
+        readable: true,
+        invalid_targets: 0,
+        fenced_records: 0,
+        recovery_records: 0,
+    };
+    let Ok(paths) = spool_paths(spool_dir).await else {
+        health.readable = false;
+        return health;
+    };
+    for path in paths
+        .into_iter()
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+    {
+        let Ok(record) = read(&path).await else {
+            health.readable = false;
+            continue;
+        };
+        let Some(publication) = record.publication else {
+            continue;
+        };
+        if publication_fs::validate_published_target(Path::new(&publication.published_dir)).is_err() {
+            health.invalid_targets = health.invalid_targets.saturating_add(1);
+        }
+        match publication.phase {
+            spool::PublicationPhase::AbandonedFenced => {
+                health.fenced_records = health.fenced_records.saturating_add(1);
+            }
+            phase if phase.requires_namespace_recovery() => {
+                health.recovery_records = health.recovery_records.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    health
+}
+
+#[derive(Default)]
+pub(crate) struct PublicationTelemetry {
+    commits_succeeded: AtomicU64,
+    commits_failed: AtomicU64,
+    visibility_milliseconds: AtomicU64,
+    visibility_samples: AtomicU64,
+    preflight_rejections: AtomicU64,
+    gc_failures: AtomicU64,
+    gc_backlog: AtomicU32,
+    preflight_ok: AtomicBool,
+    admission_block: StdMutex<Option<PublicationAdmissionBlockReason>>,
+}
+
+impl PublicationTelemetry {
+    fn preflight(&self, accepted: bool) {
+        self.preflight_ok.store(accepted, AtomicOrdering::Relaxed);
+        if !accepted {
+            self.preflight_rejections.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    pub(crate) fn commit(&self, succeeded: bool, elapsed: Duration) {
+        if succeeded {
+            self.commits_succeeded.fetch_add(1, AtomicOrdering::Relaxed);
+            self.visibility_milliseconds.fetch_add(
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                AtomicOrdering::Relaxed,
+            );
+            self.visibility_samples.fetch_add(1, AtomicOrdering::Relaxed);
+        } else {
+            self.commits_failed.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn admission_passed(&self) {
+        self.gc_backlog.store(0, AtomicOrdering::Relaxed);
+        *self
+            .admission_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    fn admission_blocked(&self, reason: PublicationAdmissionBlockReason, gc_failure: bool, backlog: Option<u32>) {
+        if gc_failure {
+            self.gc_failures.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        if let Some(backlog) = backlog {
+            self.gc_backlog.store(backlog, AtomicOrdering::Relaxed);
+        }
+        *self
+            .admission_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+}
+
+fn classify_admission_failure(
+    message: &str,
+    max_private_generations: u32,
+) -> (PublicationAdmissionBlockReason, bool, Option<u32>) {
+    let reason = if message.contains("generation bound") {
+        PublicationAdmissionBlockReason::GenerationBound
+    } else if message.contains("free-space reserve") {
+        PublicationAdmissionBlockReason::FreeSpaceReserve
+    } else if message.contains("remove unprotected") {
+        PublicationAdmissionBlockReason::GcFailure
+    } else {
+        PublicationAdmissionBlockReason::InvalidLocalState
+    };
+    let gc_failure = matches!(&reason, PublicationAdmissionBlockReason::GcFailure);
+    let backlog = match &reason {
+        PublicationAdmissionBlockReason::GenerationBound => Some(max_private_generations),
+        PublicationAdmissionBlockReason::GcFailure => Some(1),
+        _ => None,
+    };
+    (reason, gc_failure, backlog)
 }
 
 pub async fn publication_status(config: &Config, mirror: &str) -> anyhow::Result<Vec<PublicationStatus>> {
@@ -77,6 +231,107 @@ pub async fn publication_status(config: &Config, mirror: &str) -> anyhow::Result
     }
     status.sort_by(|left, right| (&left.run_id, left.attempt).cmp(&(&right.run_id, right.attempt)));
     Ok(status)
+}
+
+pub async fn publication_doctor(config: &Config) -> anyhow::Result<PublicationDoctorReport> {
+    let _process_lock = maintenance_lock(config).await?;
+    let mut checks = Vec::new();
+    let Some(publication_root) = config.storage.publication_root.clone() else {
+        let complete = config.storage.publication_max_private_generations.is_none()
+            && config.storage.publication_reserve_bytes.is_none();
+        checks.push(publication_doctor_check(
+            "publication.config",
+            complete,
+            if complete {
+                "Atomic publication is not configured; Agent supports Direct Mirrors only"
+            } else {
+                "publication_root, publication_max_private_generations, and publication_reserve_bytes must be configured together"
+            },
+        ));
+        return Ok(publication_doctor_report(checks));
+    };
+    let Some(max_private_generations) = config
+        .storage
+        .publication_max_private_generations
+        .filter(|value| *value > 0)
+    else {
+        checks.push(publication_doctor_check(
+            "publication.config",
+            false,
+            "publication_max_private_generations must be configured and positive",
+        ));
+        return Ok(publication_doctor_report(checks));
+    };
+    let Some(reserve_bytes) = config.storage.publication_reserve_bytes else {
+        checks.push(publication_doctor_check(
+            "publication.config",
+            false,
+            "publication_reserve_bytes must be configured with publication_root",
+        ));
+        return Ok(publication_doctor_report(checks));
+    };
+    checks.push(publication_doctor_check(
+        "publication.config",
+        true,
+        format!(
+            "Atomic publication configured with private-generation bound {max_private_generations} and reserve {reserve_bytes} bytes"
+        ),
+    ));
+
+    let mirror_root = config.storage.mirror_root.clone();
+    let preflight_root = publication_root.clone();
+    let preflight = tokio::task::spawn_blocking(move || publication_fs::preflight(&mirror_root, &preflight_root)).await;
+    let (filesystem_healthy, filesystem_message) = match preflight {
+        Ok(Ok(())) => (true, "same-filesystem writable roots and rename probes passed".into()),
+        Ok(Err(error)) => (false, error.to_string()),
+        Err(error) => (false, format!("publication preflight task failed: {error}")),
+    };
+    checks.push(publication_doctor_check(
+        "publication.filesystem",
+        filesystem_healthy,
+        filesystem_message,
+    ));
+
+    let spool = inspect_publication_spool(&config.storage.spool_dir).await;
+    checks.push(publication_doctor_check(
+        "publication.targets",
+        spool.readable && spool.invalid_targets == 0,
+        format!(
+            "{} invalid published target(s); spool readable={}",
+            spool.invalid_targets, spool.readable
+        ),
+    ));
+    checks.push(publication_doctor_check(
+        "publication.recovery",
+        spool.fenced_records == 0 && spool.recovery_records == 0,
+        format!(
+            "{} fence record(s), {} recovery record(s)",
+            spool.fenced_records, spool.recovery_records
+        ),
+    ));
+
+    let available = {
+        let root = publication_root.clone();
+        tokio::task::spawn_blocking(move || available_bytes(&root)).await
+    };
+    let (admission_healthy, admission_message) = match available {
+        Ok(Ok(bytes)) if bytes >= reserve_bytes => (
+            spool.readable && spool.invalid_targets == 0 && spool.fenced_records == 0 && spool.recovery_records == 0,
+            format!("{bytes} publication bytes available; reserve is {reserve_bytes}"),
+        ),
+        Ok(Ok(bytes)) => (
+            false,
+            format!("{bytes} publication bytes available; below reserve {reserve_bytes}"),
+        ),
+        Ok(Err(error)) => (false, format!("publication capacity measurement failed: {error}")),
+        Err(error) => (false, format!("publication capacity task failed: {error}")),
+    };
+    checks.push(publication_doctor_check(
+        "publication.admission",
+        admission_healthy,
+        admission_message,
+    ));
+    Ok(publication_doctor_report(checks))
 }
 
 pub async fn retry_publication_durability(
@@ -238,6 +493,7 @@ pub struct Agent {
     active: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
     acceptance: Arc<Mutex<()>>,
     publication_locks: publication::MirrorLocks,
+    publication_telemetry: Arc<PublicationTelemetry>,
     control_plane_synchronized: Arc<SyncFlag>,
     shutdown: watch::Receiver<bool>,
 }
@@ -312,7 +568,8 @@ impl Agent {
             bail!("Agent token file is empty");
         }
         let instance = load_or_create_installation_id(&config.storage.spool_dir).await?;
-        let capabilities = publication_capabilities(&config).await;
+        let publication_telemetry = Arc::new(PublicationTelemetry::default());
+        let capabilities = publication_capabilities(&config, &publication_telemetry).await;
         Ok(Self {
             config,
             token: Arc::new(RwLock::new(token)),
@@ -324,6 +581,7 @@ impl Agent {
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
             publication_locks: publication::MirrorLocks::default(),
+            publication_telemetry,
             control_plane_synchronized: Arc::new(SyncFlag::new(false)),
             shutdown,
         })
@@ -371,6 +629,7 @@ impl Agent {
                     .publication_root
                     .as_ref()
                     .map(|root| root.to_string_lossy().into_owned()),
+                publication_health: self.publication_health().await,
             };
             let token = self.token();
             let response = tokio::select! {
@@ -448,6 +707,95 @@ impl Agent {
         }
     }
 
+    async fn publication_health(&self) -> Option<PublicationHealth> {
+        let publication_root = self.config.storage.publication_root.clone()?;
+        let measurement_path = publication_root.clone();
+        let publication_root_free_bytes = match tokio::task::spawn_blocking(move || available_bytes(&measurement_path))
+            .await
+        {
+            Ok(Ok(bytes)) => Some(bytes),
+            Ok(Err(error)) => {
+                tracing::warn!(path=%publication_root.display(), %error, "failed to measure publication-root available bytes");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(path=%publication_root.display(), %error, "publication-root capacity measurement task failed");
+                None
+            }
+        };
+        let mut fenced_records = 0_u32;
+        let mut recovery_records = 0_u32;
+        let mut inspection_failed = false;
+        match spool_paths(&self.config.storage.spool_dir).await {
+            Ok(paths) => {
+                for path in paths
+                    .into_iter()
+                    .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+                {
+                    match read(&path).await {
+                        Ok(record) => match record.publication.as_ref().map(|state| state.phase) {
+                            Some(spool::PublicationPhase::AbandonedFenced) => {
+                                fenced_records = fenced_records.saturating_add(1);
+                            }
+                            Some(phase) if phase.requires_namespace_recovery() => {
+                                recovery_records = recovery_records.saturating_add(1);
+                            }
+                            _ => {}
+                        },
+                        Err(error) => {
+                            inspection_failed = true;
+                            tracing::warn!(path=%path.display(), %error, "cannot inspect publication spool health");
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                inspection_failed = true;
+                tracing::warn!(%error, "cannot scan publication spool health");
+            }
+        }
+        let mut admission_block_reason = self
+            .publication_telemetry
+            .admission_block
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if inspection_failed {
+            admission_block_reason = Some(PublicationAdmissionBlockReason::InvalidLocalState);
+        }
+        let preflight_ok = self.publication_telemetry.preflight_ok.load(AtomicOrdering::Relaxed);
+        Some(PublicationHealth {
+            commits_succeeded_total: self
+                .publication_telemetry
+                .commits_succeeded
+                .load(AtomicOrdering::Relaxed),
+            commits_failed_total: self.publication_telemetry.commits_failed.load(AtomicOrdering::Relaxed),
+            visibility_to_durability_milliseconds_total: self
+                .publication_telemetry
+                .visibility_milliseconds
+                .load(AtomicOrdering::Relaxed),
+            visibility_to_durability_samples_total: self
+                .publication_telemetry
+                .visibility_samples
+                .load(AtomicOrdering::Relaxed),
+            preflight_rejections_total: self
+                .publication_telemetry
+                .preflight_rejections
+                .load(AtomicOrdering::Relaxed),
+            gc_failures_total: self.publication_telemetry.gc_failures.load(AtomicOrdering::Relaxed),
+            publication_root_free_bytes,
+            gc_backlog_generations: self.publication_telemetry.gc_backlog.load(AtomicOrdering::Relaxed),
+            admission_block_reason: admission_block_reason.clone(),
+            fenced_records,
+            recovery_records,
+            degraded: !preflight_ok
+                || publication_root_free_bytes.is_none()
+                || admission_block_reason.is_some()
+                || fenced_records > 0
+                || recovery_records > 0,
+        })
+    }
+
     async fn accept(&self, run_id: String, attempt: u32, spec_hash: String, spec: ProcessRunSpec) {
         let acceptance = self.acceptance.lock().await;
         let key = format!("{run_id}-{attempt}");
@@ -515,6 +863,7 @@ impl Agent {
                 cancel_receiver,
                 agent.acceptance.clone(),
                 agent.publication_locks.clone(),
+                agent.publication_telemetry.clone(),
             )
             .await;
             tracing::info!(run_id=%record.run_id, sequence=record.sequence, "execution reached terminal reconciliation");
@@ -573,9 +922,13 @@ impl Agent {
                 continue;
             };
             if publication.phase == spool::PublicationPhase::AbandonedFenced {
+                self.publication_telemetry
+                    .admission_blocked(PublicationAdmissionBlockReason::Fence, false, None);
                 bail!("Mirror {mirror} has a durable local writer fence");
             }
             if atomic && publication.phase.requires_namespace_recovery() {
+                self.publication_telemetry
+                    .admission_blocked(PublicationAdmissionBlockReason::Recovery, false, None);
                 bail!("Mirror {mirror} has unresolved publication recovery");
             }
         }
@@ -596,7 +949,14 @@ impl Agent {
                 max_private_generations,
                 reserve_bytes,
             )
-            .await?;
+            .await
+            .inspect_err(|error| {
+                let message = error.to_string();
+                let (reason, gc_failure, backlog) = classify_admission_failure(&message, max_private_generations);
+                self.publication_telemetry
+                    .admission_blocked(reason, gc_failure, backlog);
+            })?;
+            self.publication_telemetry.admission_passed();
             tracing::debug!(
                 mirror,
                 removed_generations = report.removed_generations,
@@ -838,18 +1198,23 @@ impl Agent {
     }
 }
 
-async fn publication_capabilities(config: &Config) -> Vec<String> {
+async fn publication_capabilities(config: &Config, telemetry: &PublicationTelemetry) -> Vec<String> {
     let Some(publication_root) = config.storage.publication_root.clone() else {
         return vec![];
     };
     let mirror_root = config.storage.mirror_root.clone();
     match tokio::task::spawn_blocking(move || publication_fs::preflight(&mirror_root, &publication_root)).await {
-        Ok(Ok(())) => vec![ATOMIC_EXCHANGE_V1.into()],
+        Ok(Ok(())) => {
+            telemetry.preflight(true);
+            vec![ATOMIC_EXCHANGE_V1.into()]
+        }
         Ok(Err(error)) => {
+            telemetry.preflight(false);
             tracing::warn!(%error, "Atomic publication preflight failed; capability disabled");
             vec![]
         }
         Err(error) => {
+            telemetry.preflight(false);
             tracing::warn!(%error, "Atomic publication preflight task failed; capability disabled");
             vec![]
         }
@@ -973,6 +1338,7 @@ mod tests {
             active: Arc::new(Mutex::new(HashMap::new())),
             acceptance: Arc::new(Mutex::new(())),
             publication_locks: publication::MirrorLocks::default(),
+            publication_telemetry: Arc::new(PublicationTelemetry::default()),
             control_plane_synchronized: Arc::new(SyncFlag::new(false)),
             shutdown,
         }
@@ -1119,6 +1485,78 @@ mod tests {
         let failed_measurement = agent.capacity().await;
         assert_eq!(failed_measurement.mirror_root_free_bytes, None);
         assert_eq!(failed_measurement.active_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn publication_doctor_checks_real_filesystem_targets_recovery_and_admission() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mirror_root = directory.path().join("mirrors");
+        let publication_root = directory.path().join("publication");
+        let spool_dir = directory.path().join("spool");
+        for path in [&mirror_root, &publication_root, &spool_dir] {
+            fs::create_dir(path).await.expect("doctor directory");
+        }
+        let config = Config {
+            node: config::Node { name: "node-a".into() },
+            server: config::Server {
+                url: "http://127.0.0.1:1".into(),
+                token_file: directory.path().join("token"),
+            },
+            storage: config::Storage {
+                mirror_root: mirror_root.clone(),
+                spool_dir: spool_dir.clone(),
+                publication_root: Some(publication_root),
+                publication_max_private_generations: Some(4),
+                publication_reserve_bytes: Some(0),
+            },
+            execution: config::Execution { max_concurrent_runs: 1 },
+            runner: config::Runner {
+                process: config::ProcessPolicy { enabled: true },
+            },
+            logging: None,
+        };
+        let healthy = publication_doctor(&config).await.expect("healthy doctor");
+        assert!(healthy.healthy);
+        assert_eq!(
+            healthy.checks.iter().map(|check| check.id).collect::<Vec<_>>(),
+            [
+                "publication.config",
+                "publication.filesystem",
+                "publication.targets",
+                "publication.recovery",
+                "publication.admission",
+            ]
+        );
+
+        fs::write(mirror_root.join("demo"), b"not a directory")
+            .await
+            .expect("invalid published target");
+        let mut record = SpoolRecord::accepted(
+            "01K00000000000000000000007".into(),
+            1,
+            "hash-doctor".into(),
+            atomic_spec(directory.path(), "demo"),
+            now(),
+        );
+        record.publication.as_mut().expect("publication").phase = spool::PublicationPhase::ReadyToCommit;
+        write(&state_path(&spool_dir, &record.run_id, record.attempt), &record)
+            .await
+            .expect("recovery record");
+
+        let unhealthy = publication_doctor(&config).await.expect("unhealthy doctor report");
+        assert!(!unhealthy.healthy);
+        assert!(
+            unhealthy
+                .checks
+                .iter()
+                .any(|check| check.id == "publication.targets" && !check.healthy)
+        );
+        assert!(
+            unhealthy
+                .checks
+                .iter()
+                .any(|check| check.id == "publication.recovery" && !check.healthy)
+        );
     }
 
     #[tokio::test]
@@ -1608,6 +2046,7 @@ mod tests {
             cancel_receiver,
             Arc::new(Mutex::new(())),
             publication::MirrorLocks::default(),
+            Arc::new(PublicationTelemetry::default()),
         )
         .await;
         assert_eq!(record.state, AttemptState::TimedOut);
@@ -1656,6 +2095,7 @@ mod tests {
             cancel_receiver,
             Arc::new(Mutex::new(())),
             publication::MirrorLocks::default(),
+            Arc::new(PublicationTelemetry::default()),
         )
         .await;
 
@@ -1720,6 +2160,7 @@ mod tests {
             cancel_receiver,
             Arc::new(Mutex::new(())),
             publication::MirrorLocks::default(),
+            Arc::new(PublicationTelemetry::default()),
         )
         .await;
         assert_eq!(record.state, AttemptState::Succeeded);
@@ -1749,6 +2190,7 @@ mod tests {
             cancel_receiver,
             Arc::new(Mutex::new(())),
             publication::MirrorLocks::default(),
+            Arc::new(PublicationTelemetry::default()),
         )
         .await;
         assert_eq!(failed.state, AttemptState::Failed);
@@ -1813,6 +2255,7 @@ mod tests {
         write(&state, &record).await.expect("write Atomic state");
         let (_shutdown, shutdown_receiver) = watch::channel(false);
         let (_cancel, cancel_receiver) = watch::channel(false);
+        let telemetry = Arc::new(PublicationTelemetry::default());
         executor::execute(
             &state,
             &mut record,
@@ -1820,10 +2263,14 @@ mod tests {
             cancel_receiver,
             Arc::new(Mutex::new(())),
             publication::MirrorLocks::default(),
+            telemetry.clone(),
         )
         .await;
 
         assert_eq!(record.state, AttemptState::Succeeded);
+        assert_eq!(telemetry.commits_succeeded.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(telemetry.commits_failed.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(telemetry.visibility_samples.load(AtomicOrdering::Relaxed), 1);
         let publication = record.publication.as_ref().expect("publication state");
         assert!(!published.join("local-only").exists());
         assert_eq!(

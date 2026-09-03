@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use lmt_agent::{
     Agent, PublicationStatus, abandon_publication, clear_publication_fence,
     config::{Config, Logging, LoggingFormat},
-    preflight_publication, publication_status, reset_spool, retry_publication_durability,
+    preflight_publication, publication_doctor, publication_status, reset_spool, retry_publication_durability,
 };
 use tokio::{fs, sync::watch};
 
@@ -17,6 +17,7 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    Doctor,
     ResetSpool {
         #[arg(long)]
         acknowledge_control_plane_restore: bool,
@@ -62,6 +63,21 @@ async fn main() -> anyhow::Result<()> {
     let config: Config = toml::from_str(&fs::read_to_string(args.config).await?)?;
     initialize_logging(config.logging.as_ref())?;
     match args.command {
+        Some(Command::Doctor) => {
+            let report = publication_doctor(&config).await?;
+            for check in &report.checks {
+                println!(
+                    "{} {}: {}",
+                    if check.healthy { "ok" } else { "critical" },
+                    check.id,
+                    check.message
+                );
+            }
+            if !report.healthy {
+                anyhow::bail!("publication doctor found unhealthy conditions");
+            }
+            return Ok(());
+        }
         Some(Command::ResetSpool {
             acknowledge_control_plane_restore,
         }) => {

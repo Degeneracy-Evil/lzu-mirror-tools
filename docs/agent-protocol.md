@@ -469,3 +469,25 @@ If credential reload fails, the Agent keeps the previous credential and reports 
 The Agent must own an exclusive local state/spool lock before recovery and polling.
 
 This complements, but does not replace, the Server-side durable Agent binding.
+
+## 26. M4 publication capability and health observation
+
+An M4 Agent poll may include:
+
+- `capabilities`, including `atomic_exchange_v1` only after the real local
+  filesystem preflight succeeds;
+- `publication_root` as the configured private-root observation;
+- `publication_health` as an optional bounded snapshot.
+
+`publication_health` contains process-lifetime commit success/failure counters,
+visibility-to-durability timing totals/samples, preflight rejection and GC
+failure counters, publication-root available bytes, bounded GC backlog,
+admission-block reason, and counts of local recovery/fence records.
+
+M4 Server accepts M3 poll bodies that omit all M4 fields. Direct dispatch remains
+available to those Agents. Atomic dispatch still requires the explicit
+`atomic_exchange_v1` capability; health fields never grant execution authority.
+
+The health snapshot is operational observation, not authoritative Run state or
+a durable action queue. Server aggregation de-duplicates repeated polls and
+uses the Agent boot identity to recognize process-counter resets.

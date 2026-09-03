@@ -84,6 +84,10 @@ pub struct NodeStatusView {
     pub active_runs: u32,
     pub max_concurrent_runs: u32,
     pub mirror_root_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atomic_publication_capable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_health: Option<PublicationHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -313,6 +317,34 @@ pub struct Capacity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationAdmissionBlockReason {
+    Fence,
+    Recovery,
+    GenerationBound,
+    FreeSpaceReserve,
+    GcFailure,
+    InvalidLocalState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationHealth {
+    pub commits_succeeded_total: u64,
+    pub commits_failed_total: u64,
+    pub visibility_to_durability_milliseconds_total: u64,
+    pub visibility_to_durability_samples_total: u64,
+    pub preflight_rejections_total: u64,
+    pub gc_failures_total: u64,
+    pub publication_root_free_bytes: Option<u64>,
+    pub gc_backlog_generations: u32,
+    pub admission_block_reason: Option<PublicationAdmissionBlockReason>,
+    pub fenced_records: u32,
+    pub recovery_records: u32,
+    pub degraded: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct OwnedAttempt {
     pub run_id: String,
@@ -335,6 +367,8 @@ pub struct PollRequest {
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_health: Option<PublicationHealth>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -444,5 +478,35 @@ mod tests {
     fn unknown_poll_fields_are_rejected() {
         let json = r#"{"protocol_version":"v1alpha1","agent_version":"x","agent_instance_id":"i","poll_sequence":1,"running":[],"capacity":{"mirror_root_free_bytes":null,"active_runs":0,"max_concurrent_runs":1},"mirror_root":"/x","node":"spoof"}"#;
         assert!(serde_json::from_str::<PollRequest>(json).is_err());
+    }
+
+    #[test]
+    fn publication_health_is_optional_and_strict() {
+        let legacy = r#"{"protocol_version":"v1alpha1","agent_version":"x","agent_instance_id":"i","agent_boot_id":"b","poll_sequence":1,"running":[],"capacity":{"mirror_root_free_bytes":null,"active_runs":0,"max_concurrent_runs":1},"mirror_root":"/x"}"#;
+        let request: PollRequest = serde_json::from_str(legacy).expect("legacy poll");
+        assert_eq!(request.publication_health, None);
+        assert!(
+            !serde_json::to_string(&request)
+                .expect("serialize legacy poll")
+                .contains("publication_health")
+        );
+
+        let mut invalid: serde_json::Value = serde_json::from_str(legacy).expect("poll JSON");
+        invalid["publication_health"] = serde_json::json!({
+            "commits_succeeded_total": 0,
+            "commits_failed_total": 0,
+            "visibility_to_durability_milliseconds_total": 0,
+            "visibility_to_durability_samples_total": 0,
+            "preflight_rejections_total": 0,
+            "gc_failures_total": 0,
+            "publication_root_free_bytes": 1,
+            "gc_backlog_generations": 0,
+            "admission_block_reason": null,
+            "fenced_records": 0,
+            "recovery_records": 0,
+            "degraded": false,
+            "unknown": true,
+        });
+        assert!(serde_json::from_value::<PollRequest>(invalid).is_err());
     }
 }

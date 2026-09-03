@@ -118,6 +118,7 @@ pub struct AppState {
     notify: Arc<Notify>,
     log_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     metrics: Arc<AppMetrics>,
+    publication_observations: Arc<Mutex<HashMap<String, PublicationObservation>>>,
     poll_wait: Duration,
     clock: Arc<dyn Clock>,
     run_log_policy: Option<RunLogPolicy>,
@@ -171,6 +172,92 @@ struct AppMetrics {
     backup_failures: AtomicU64,
     auth_failures: AtomicU64,
 }
+
+#[derive(Clone)]
+struct PublicationObservation {
+    agent_instance_id: String,
+    agent_boot_id: String,
+    atomic_capable: bool,
+    last: PublicationHealth,
+    cumulative: PublicationHealth,
+}
+
+impl PublicationObservation {
+    fn new(agent_instance_id: String, agent_boot_id: String, atomic_capable: bool, health: PublicationHealth) -> Self {
+        Self {
+            agent_instance_id,
+            agent_boot_id,
+            atomic_capable,
+            last: health.clone(),
+            cumulative: health,
+        }
+    }
+
+    fn update(
+        &mut self,
+        agent_instance_id: &str,
+        agent_boot_id: &str,
+        atomic_capable: bool,
+        health: PublicationHealth,
+    ) {
+        let reset = self.agent_instance_id != agent_instance_id || self.agent_boot_id != agent_boot_id;
+        self.cumulative.commits_succeeded_total = self.cumulative.commits_succeeded_total.saturating_add(
+            counter_delta(health.commits_succeeded_total, self.last.commits_succeeded_total, reset),
+        );
+        self.cumulative.commits_failed_total = self.cumulative.commits_failed_total.saturating_add(counter_delta(
+            health.commits_failed_total,
+            self.last.commits_failed_total,
+            reset,
+        ));
+        self.cumulative.visibility_to_durability_milliseconds_total = self
+            .cumulative
+            .visibility_to_durability_milliseconds_total
+            .saturating_add(counter_delta(
+                health.visibility_to_durability_milliseconds_total,
+                self.last.visibility_to_durability_milliseconds_total,
+                reset,
+            ));
+        self.cumulative.visibility_to_durability_samples_total = self
+            .cumulative
+            .visibility_to_durability_samples_total
+            .saturating_add(counter_delta(
+                health.visibility_to_durability_samples_total,
+                self.last.visibility_to_durability_samples_total,
+                reset,
+            ));
+        self.cumulative.preflight_rejections_total =
+            self.cumulative.preflight_rejections_total.saturating_add(counter_delta(
+                health.preflight_rejections_total,
+                self.last.preflight_rejections_total,
+                reset,
+            ));
+        self.cumulative.gc_failures_total = self.cumulative.gc_failures_total.saturating_add(counter_delta(
+            health.gc_failures_total,
+            self.last.gc_failures_total,
+            reset,
+        ));
+        self.cumulative.publication_root_free_bytes = health.publication_root_free_bytes;
+        self.cumulative.gc_backlog_generations = health.gc_backlog_generations;
+        self.cumulative
+            .admission_block_reason
+            .clone_from(&health.admission_block_reason);
+        self.cumulative.fenced_records = health.fenced_records;
+        self.cumulative.recovery_records = health.recovery_records;
+        self.cumulative.degraded = health.degraded;
+        agent_instance_id.clone_into(&mut self.agent_instance_id);
+        agent_boot_id.clone_into(&mut self.agent_boot_id);
+        self.atomic_capable = atomic_capable;
+        self.last = health;
+    }
+}
+
+const fn counter_delta(current: u64, previous: u64, reset: bool) -> u64 {
+    if reset || current < previous {
+        current
+    } else {
+        current - previous
+    }
+}
 impl AppState {
     pub fn new(store: Store, log_dir: PathBuf, token: String, offline_after: Duration) -> Self {
         Self {
@@ -182,6 +269,7 @@ impl AppState {
             notify: Arc::new(Notify::new()),
             log_locks: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(AppMetrics::default()),
+            publication_observations: Arc::new(Mutex::new(HashMap::new())),
             poll_wait: Duration::from_secs(20),
             clock: Arc::new(SystemClock),
             run_log_policy: None,
@@ -601,8 +689,118 @@ lmt_agent_polls_total {}\nlmt_attempt_events_total {}\nlmt_log_uploaded_bytes_to
         state.metrics.auth_failures.load(Ordering::Relaxed)
     )
     .expect("String write");
+    let publication_observations = state
+        .publication_observations
+        .lock()
+        .await
+        .iter()
+        .map(|(node, observation)| (node.clone(), observation.clone()))
+        .collect::<Vec<_>>();
+    append_publication_metrics(&mut body, &publication_observations);
     append_entity_metrics(&mut body, mirrors, nodes, now, state.offline_after);
     Ok(([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response())
+}
+
+fn append_publication_metrics(body: &mut String, observations: &[(String, PublicationObservation)]) {
+    use std::fmt::Write as _;
+
+    let capable = observations
+        .iter()
+        .filter(|(_, observation)| observation.atomic_capable)
+        .count();
+    let sum = |field: fn(&PublicationHealth) -> u64| {
+        observations
+            .iter()
+            .map(|(_, observation)| field(&observation.cumulative))
+            .fold(0_u64, u64::saturating_add)
+    };
+    writeln!(body, "lmt_agents_atomic_publication_capable {capable}").expect("String write");
+    writeln!(
+        body,
+        "lmt_publication_commits_total{{outcome=\"succeeded\"}} {}",
+        sum(|health| health.commits_succeeded_total)
+    )
+    .expect("String write");
+    writeln!(
+        body,
+        "lmt_publication_commits_total{{outcome=\"failed\"}} {}",
+        sum(|health| health.commits_failed_total)
+    )
+    .expect("String write");
+    writeln!(
+        body,
+        "lmt_publication_visibility_to_durability_milliseconds_total {}",
+        sum(|health| health.visibility_to_durability_milliseconds_total)
+    )
+    .expect("String write");
+    writeln!(
+        body,
+        "lmt_publication_visibility_to_durability_samples_total {}",
+        sum(|health| health.visibility_to_durability_samples_total)
+    )
+    .expect("String write");
+    writeln!(
+        body,
+        "lmt_publication_preflight_rejections_total {}",
+        sum(|health| health.preflight_rejections_total)
+    )
+    .expect("String write");
+    writeln!(
+        body,
+        "lmt_publication_gc_failures_total {}",
+        sum(|health| health.gc_failures_total)
+    )
+    .expect("String write");
+    for (node, observation) in observations {
+        let node = prometheus_label(node);
+        let health = &observation.cumulative;
+        if let Some(bytes) = health.publication_root_free_bytes {
+            writeln!(body, "lmt_agent_publication_root_free_bytes{{node=\"{node}\"}} {bytes}").expect("String write");
+        }
+        writeln!(
+            body,
+            "lmt_agent_publication_gc_backlog_generations{{node=\"{node}\"}} {}",
+            health.gc_backlog_generations
+        )
+        .expect("String write");
+        writeln!(
+            body,
+            "lmt_agent_publication_degraded{{node=\"{node}\"}} {}",
+            u8::from(health.degraded)
+        )
+        .expect("String write");
+        writeln!(
+            body,
+            "lmt_agent_publication_fenced_records{{node=\"{node}\"}} {}",
+            health.fenced_records
+        )
+        .expect("String write");
+        writeln!(
+            body,
+            "lmt_agent_publication_recovery_records{{node=\"{node}\"}} {}",
+            health.recovery_records
+        )
+        .expect("String write");
+        if let Some(reason) = &health.admission_block_reason {
+            writeln!(
+                body,
+                "lmt_agent_publication_admission_blocked{{node=\"{node}\",reason=\"{}\"}} 1",
+                publication_admission_reason(reason)
+            )
+            .expect("String write");
+        }
+    }
+}
+
+const fn publication_admission_reason(reason: &PublicationAdmissionBlockReason) -> &'static str {
+    match reason {
+        PublicationAdmissionBlockReason::Fence => "fence",
+        PublicationAdmissionBlockReason::Recovery => "recovery",
+        PublicationAdmissionBlockReason::GenerationBound => "generation_bound",
+        PublicationAdmissionBlockReason::FreeSpaceReserve => "free_space_reserve",
+        PublicationAdmissionBlockReason::GcFailure => "gc_failure",
+        PublicationAdmissionBlockReason::InvalidLocalState => "invalid_local_state",
+    }
 }
 
 fn append_entity_metrics(
@@ -1079,21 +1277,27 @@ async fn operational_status(state: &AppState) -> Result<StatusResponse, Failure>
         .collect();
     let now = state.now_ms();
     let offline_after = i64::try_from(state.offline_after.as_millis()).unwrap_or(i64::MAX);
+    let publication_observations = state.publication_observations.lock().await.clone();
     let nodes = state
         .store
         .list_nodes()
         .await?
         .into_iter()
-        .map(|node| NodeStatusView {
-            name: node.name,
-            online: node
-                .last_seen_at_ms
-                .is_some_and(|seen| now.saturating_sub(seen) <= offline_after),
-            bound: node.bound_agent_id.is_some(),
-            last_seen_at_ms: node.last_seen_at_ms,
-            active_runs: node.active_runs,
-            max_concurrent_runs: node.max_concurrent_runs,
-            mirror_root_free_bytes: node.mirror_root_free_bytes,
+        .map(|node| {
+            let publication = publication_observations.get(&node.name);
+            NodeStatusView {
+                name: node.name,
+                online: node
+                    .last_seen_at_ms
+                    .is_some_and(|seen| now.saturating_sub(seen) <= offline_after),
+                bound: node.bound_agent_id.is_some(),
+                last_seen_at_ms: node.last_seen_at_ms,
+                active_runs: node.active_runs,
+                max_concurrent_runs: node.max_concurrent_runs,
+                mirror_root_free_bytes: node.mirror_root_free_bytes,
+                atomic_publication_capable: publication.map(|observation| observation.atomic_capable),
+                publication_health: publication.map(|observation| observation.cumulative.clone()),
+            }
         })
         .collect();
     let (schema_version, _) = state.store.database_diagnostics().await?;
@@ -1123,6 +1327,56 @@ fn doctor_check(id: &str, status: DoctorCheckStatus, message: impl Into<String>)
         status,
         message: message.into(),
     }
+}
+
+fn publication_doctor_checks(status: &StatusResponse) -> Vec<DoctorCheck> {
+    let publication_nodes = status
+        .nodes
+        .iter()
+        .filter(|node| node.publication_health.is_some())
+        .count();
+    let incapable = status
+        .nodes
+        .iter()
+        .filter(|node| node.publication_health.is_some() && node.atomic_publication_capable != Some(true))
+        .count();
+    let degraded = status
+        .nodes
+        .iter()
+        .filter(|node| node.publication_health.as_ref().is_some_and(|health| health.degraded))
+        .count();
+    let fenced = status
+        .nodes
+        .iter()
+        .filter_map(|node| node.publication_health.as_ref())
+        .fold(0_u32, |total, health| total.saturating_add(health.fenced_records));
+    let recovery = status
+        .nodes
+        .iter()
+        .filter_map(|node| node.publication_health.as_ref())
+        .fold(0_u32, |total, health| total.saturating_add(health.recovery_records));
+    vec![
+        doctor_check(
+            "publication.capability",
+            if incapable == 0 {
+                DoctorCheckStatus::Ok
+            } else {
+                DoctorCheckStatus::Critical
+            },
+            format!("{publication_nodes} publication-configured Agent(s), {incapable} without atomic_exchange_v1"),
+        ),
+        doctor_check(
+            "publication.health",
+            if fenced > 0 || recovery > 0 {
+                DoctorCheckStatus::Critical
+            } else if degraded > 0 {
+                DoctorCheckStatus::Warning
+            } else {
+                DoctorCheckStatus::Ok
+            },
+            format!("{degraded} degraded Agent(s), {fenced} fence record(s), {recovery} recovery record(s)"),
+        ),
+    ]
 }
 
 fn filesystem_check(id: &str, path: &Path) -> DoctorCheck {
@@ -1202,6 +1456,7 @@ async fn doctor_operational_checks(s: &AppState, status: &StatusResponse) -> Res
         },
         format!("{unbound} unbound Node(s)"),
     ));
+    checks.extend(publication_doctor_checks(status));
     checks.push(doctor_check(
         "mirrors.due",
         if status.mirrors_due == 0 {
@@ -1314,6 +1569,25 @@ async fn poll(State(s): State<AppState>, h: HeaderMap, Json(r): Json<PollRequest
             observed_at_ms: s.now_ms(),
         })
         .await?;
+    if let Some(health) = r.publication_health.clone() {
+        let atomic_capable = r.capabilities.iter().any(|capability| capability == ATOMIC_EXCHANGE_V1);
+        let mut observations = s.publication_observations.lock().await;
+        observations
+            .entry(node.clone())
+            .and_modify(|observation| {
+                observation.update(&r.agent_instance_id, &r.agent_boot_id, atomic_capable, health.clone());
+            })
+            .or_insert_with(|| {
+                PublicationObservation::new(
+                    r.agent_instance_id.clone(),
+                    r.agent_boot_id.clone(),
+                    atomic_capable,
+                    health,
+                )
+            });
+    } else {
+        s.publication_observations.lock().await.remove(&node);
+    }
     let _ = s
         .store
         .mark_credential_used(&node, &credential.credential_id, s.now_ms())
@@ -2185,6 +2459,7 @@ mod tests {
             mirror_root: "/srv/mirrors".into(),
             capabilities: vec![],
             publication_root: None,
+            publication_health: None,
         };
         let unauthenticated = poll(State(state.clone()), HeaderMap::new(), Json(request.clone()))
             .await
@@ -2561,6 +2836,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_observations_are_idempotent_boot_aware_and_visible_to_doctor() {
+        let mut first = publication_health_fixture();
+        first.commits_succeeded_total = 5;
+        let mut observation = PublicationObservation::new("agent-a".into(), "boot-a".into(), true, first.clone());
+        observation.update("agent-a", "boot-a", true, first.clone());
+        assert_eq!(observation.cumulative.commits_succeeded_total, 5);
+
+        let mut advanced = first;
+        advanced.commits_succeeded_total = 8;
+        observation.update("agent-a", "boot-a", true, advanced);
+        assert_eq!(observation.cumulative.commits_succeeded_total, 8);
+
+        let mut restarted = publication_health_fixture();
+        restarted.commits_succeeded_total = 2;
+        restarted.recovery_records = 1;
+        restarted.degraded = true;
+        observation.update("agent-a", "boot-b", true, restarted);
+        assert_eq!(observation.cumulative.commits_succeeded_total, 10);
+
+        let mut metrics = String::new();
+        append_publication_metrics(&mut metrics, &[("node-a".into(), observation.clone())]);
+        assert!(metrics.contains("lmt_agents_atomic_publication_capable 1"));
+        assert!(metrics.contains("lmt_publication_commits_total{outcome=\"succeeded\"} 10"));
+        assert!(metrics.contains("lmt_agent_publication_recovery_records{node=\"node-a\"} 1"));
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = state_for_doctor(&directory.path().join("lmt.db"), directory.path().join("logs")).await;
+        let status = StatusResponse {
+            version: "test".into(),
+            schema_version: 4,
+            config_revision: 0,
+            runs_pending: 0,
+            runs_running: 0,
+            mirrors_due: 0,
+            run_logs_stored_bytes: 0,
+            mirrors: Vec::new(),
+            nodes: vec![NodeStatusView {
+                name: "node-a".into(),
+                online: true,
+                bound: true,
+                last_seen_at_ms: Some(1),
+                active_runs: 0,
+                max_concurrent_runs: 1,
+                mirror_root_free_bytes: Some(1),
+                atomic_publication_capable: Some(true),
+                publication_health: Some(observation.cumulative),
+            }],
+        };
+        let checks = doctor_operational_checks(&state, &status).await.expect("doctor checks");
+        assert!(
+            checks
+                .iter()
+                .any(|check| { check.id == "publication.health" && check.status == DoctorCheckStatus::Critical })
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_online_backup_is_rejected_as_busy() {
         let directory = tempfile::tempdir().expect("tempdir");
         let database = directory.path().join("lmt.db");
@@ -2607,5 +2939,22 @@ mod tests {
     async fn state_for_doctor(database: &Path, logs: PathBuf) -> AppState {
         let store = Store::open(database).await.expect("doctor store");
         AppState::new(store, logs, "operator".into(), Duration::from_secs(90))
+    }
+
+    fn publication_health_fixture() -> PublicationHealth {
+        PublicationHealth {
+            commits_succeeded_total: 0,
+            commits_failed_total: 0,
+            visibility_to_durability_milliseconds_total: 0,
+            visibility_to_durability_samples_total: 0,
+            preflight_rejections_total: 0,
+            gc_failures_total: 0,
+            publication_root_free_bytes: Some(1_000),
+            gc_backlog_generations: 0,
+            admission_block_reason: None,
+            fenced_records: 0,
+            recovery_records: 0,
+            degraded: false,
+        }
     }
 }
