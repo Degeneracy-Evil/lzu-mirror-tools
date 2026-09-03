@@ -70,3 +70,5 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 - [M4 Design](m4-design.md) — post-trial publication, deployment, and runtime-hardening design.
 - [M4 Publication Architecture](m4-publication-design.md) — frozen atomic publication contract.
 - [M4 Implementation Plan](m4-implementation-plan.md) — implementation order, compatibility profile, recovery/GC gates, installer, and runtime polish.
+
+- [Post-M4 Production Rollout and v1 Stabilization](v1-rollout-plan.md) — active release/production phase; M5 remains evidence-driven.

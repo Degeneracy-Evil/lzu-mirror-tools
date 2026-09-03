@@ -6,7 +6,7 @@ The project is being designed and maintained for long-term community use, initia
 
 ## Status
 
-**Current phase: M4 accepted; ready as the next production baseline.**
+**Current phase: M4 accepted; v0.9 release-candidate and production rollout/stabilization.**
 
 The accepted M1 implementation baseline is `e2c27dbdc573dc374c94902255265adc81b2ae10`. See the [M1 acceptance review](docs/reviews/m1-review-round2-2026-08-30.md).
 
@@ -28,6 +28,8 @@ M4 compatibility, prompt Agent shutdown, bounded daemon runtimes, and
 publication diagnostics. M4 does not introduce M5 orchestration features.
 
 M4 is accepted at implementation baseline `7eaeaff92f17e3184543bdf32e50d99881f7d70d`. See the [M4 second review](docs/reviews/m4-review-round2-2026-09-03.md).
+
+The active post-M4 phase is [Production Rollout and v1 Stabilization](docs/v1-rollout-plan.md). No M5 feature implementation is authorized.
 
 ## What LMT does
 

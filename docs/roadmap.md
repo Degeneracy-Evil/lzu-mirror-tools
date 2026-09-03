@@ -160,6 +160,23 @@ Scope:
 
 A small read-only status frontend may be built here or as a separate project. It is not a blocker for the core release.
 
+## Post-M4 - Production rollout and v1 stabilization
+
+Status: **active**.
+
+Authoritative plan: `docs/v1-rollout-plan.md`.
+
+Goal:
+
+> turn the accepted M4 implementation into a real production baseline and a
+> stable public release contract without adding speculative features.
+
+This phase includes the v0.9 release candidate, real LZU Mirror-by-Mirror
+rollout, stable API/version review, explicit security/threat-model review,
+platform support matrix, and final v1 release preparation.
+
+It is not M5.
+
 ## M5 - Optional extensions driven by real deployments
 
 Only implement these if real requirements justify them:

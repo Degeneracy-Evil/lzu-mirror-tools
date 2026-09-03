@@ -26,6 +26,7 @@ Before making implementation changes, read at minimum:
 18. `docs/m4-design.md`
 19. `docs/m4-publication-design.md`
 20. `docs/m4-implementation-plan.md`
+21. `docs/v1-rollout-plan.md`
 
 M1/M2/M3 are accepted baselines. For M4 publication semantics,
 **`docs/m4-publication-design.md` is authoritative**. For implementation order
@@ -39,19 +40,19 @@ Implement the current milestone only.
 
 M1, M2, and M3 are accepted implementation baselines.
 
-**M4 is the current implementation target.** The publication architecture is
-frozen in `docs/m4-publication-design.md`; implementation must follow
-`docs/m4-implementation-plan.md`.
+**M4 is accepted. There is currently no authorized M5 implementation target.**
+The active work is production rollout and v1 stabilization under
+`docs/v1-rollout-plan.md`. M4 publication semantics remain frozen in
+`docs/m4-publication-design.md`.
 
-M4 work must:
+Post-M4 stabilization work must:
 
-- preserve all accepted M1/M2/M3 behavior and fault tests;
-- implement only the frozen M4 publication, installer/upgrade, Agent shutdown,
-  bounded-runtime, compatibility, and release-hardening scope;
-- not weaken publication write-ahead, fence, GC protected-set, or transactional
-  Move invariants for implementation convenience;
-- keep Direct mode backward-compatible through the supported M4 Server + M3
-  Agent rolling-upgrade window.
+- preserve the accepted M4 baseline and all M1-M4 regression gates;
+- limit code changes to production blockers, release/version/API compatibility,
+  security hardening justified by review, packaging, or documentation;
+- not weaken publication write-ahead, fence, GC protected-set, transactional
+  Move, or M3->M4 rolling-upgrade invariants;
+- avoid new product resources/features until a later accepted M5 design exists.
 
 Do not implement deferred M5 features such as:
 
@@ -166,7 +167,7 @@ Do not allow design documents and implementation to intentionally drift.
 
 ## 9. Development workflow
 
-M3 is complete and accepted. M4 is now the active milestone. Work through `docs/m4-implementation-plan.md` in order; do not skip release gates or start M5 work opportunistically.
+M1-M4 are complete and accepted. The active phase is `docs/v1-rollout-plan.md`. Do not start M5 or expand M4 opportunistically; production evidence must precede any new milestone design.
 
 Work in small vertical slices and logical commits.
 
