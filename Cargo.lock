@@ -929,7 +929,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lmt-agent"
-version = "0.1.0-alpha.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "lmt-cli"
-version = "0.1.0-alpha.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "lmt-core"
-version = "0.1.0-alpha.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "lmt-protocol"
-version = "0.1.0-alpha.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "lmt-core",
  "serde",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "lmt-server"
-version = "0.1.0-alpha.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1026,7 +1026,7 @@ dependencies = [
 
 [[package]]
 name = "lmt-store"
-version = "0.1.0-alpha.1"
+version = "0.9.0-rc.1"
 dependencies = [
  "hex",
  "lmt-core",
