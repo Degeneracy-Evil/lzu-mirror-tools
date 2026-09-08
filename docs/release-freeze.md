@@ -203,7 +203,7 @@ artifact filename:
 artifact SHA-256:
 GitHub pre-release URL/status:
 worktree status:
-```
+~~~
 
 Also state explicitly whether any source, protocol, database, installer,
 packaging, workflow, dependency, or feature behavior changed. The expected
