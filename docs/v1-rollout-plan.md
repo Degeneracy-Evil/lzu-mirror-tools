@@ -2,6 +2,8 @@
 
 Status: **active release phase; no M5 feature development authorized**.
 
+Release-freeze execution contract: [Release Freeze and v0.9.0-rc.1 Cut](release-freeze.md).
+
 Accepted M4 implementation baseline:
 
 ~~~text
@@ -14,14 +16,18 @@ the public release contract. This is deliberately not a new feature milestone.
 
 ## 1. Release-candidate boundary
 
-Before real production rollout:
+Before real production rollout, cut `v0.9.0-rc.1` exactly according to
+`docs/release-freeze.md`. That document is authoritative for the freeze
+transaction, permitted release-only changes, abort conditions, tag ordering, and
+required evidence report.
+
+The essential boundary remains:
 
 1. change the project version from the historical `0.1.0-alpha.1` development
    value to `0.9.0-rc.1`;
-2. build the deterministic release archive from the accepted code baseline plus
-   current documentation;
-3. record the Git commit and SHA-256 together;
-4. tag the exact release commit;
+2. build the release archive from the exact successful release commit;
+3. record the Git commit and artifact SHA-256 together;
+4. tag the exact release commit only after CI for that SHA succeeds;
 5. make no feature changes in the RC cut.
 
 The earlier alpha artifact is not the production deployment artifact because M4

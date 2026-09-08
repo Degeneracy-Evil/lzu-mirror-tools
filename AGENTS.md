@@ -27,12 +27,17 @@ Before making implementation changes, read at minimum:
 19. `docs/m4-publication-design.md`
 20. `docs/m4-implementation-plan.md`
 21. `docs/v1-rollout-plan.md`
+22. `docs/release-freeze.md`
 
 M1/M2/M3 are accepted baselines. For M4 publication semantics,
 **`docs/m4-publication-design.md` is authoritative**. For implementation order
 and remaining M4 choices, follow **`docs/m4-implementation-plan.md`**. If an
 older generic document conflicts with an accepted newer decision, do not guess:
 preserve the newer accepted contract and update the narrower stale document.
+
+For the `v0.9.0-rc.1` release cut, **`docs/release-freeze.md` is authoritative**
+on permitted release-only changes, abort conditions, tag ordering, and the final
+evidence report.
 
 ## 2. Scope
 
@@ -53,6 +58,11 @@ Post-M4 stabilization work must:
 - not weaken publication write-ahead, fence, GC protected-set, transactional
   Move, or M3->M4 rolling-upgrade invariants;
 - avoid new product resources/features until a later accepted M5 design exists.
+
+The `v0.9.0-rc.1` freeze is narrower than ordinary stabilization work. During the
+RC cut, do not make functional source changes merely to improve or clean up the
+release. Follow `docs/release-freeze.md` and stop if the cut reveals a blocker
+that requires behavior changes.
 
 Do not implement deferred M5 features such as:
 
@@ -168,6 +178,11 @@ Do not allow design documents and implementation to intentionally drift.
 ## 9. Development workflow
 
 M1-M4 are complete and accepted. The active phase is `docs/v1-rollout-plan.md`. Do not start M5 or expand M4 opportunistically; production evidence must precede any new milestone design.
+
+For the first release candidate, execute `docs/release-freeze.md` as a closed
+release transaction. A failure that requires functional changes ends that RC-cut
+attempt and returns the repository to stabilization review; it does not widen the
+release task.
 
 Work in small vertical slices and logical commits.
 

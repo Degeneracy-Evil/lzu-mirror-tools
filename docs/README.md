@@ -20,11 +20,17 @@ Recommended reading order:
 16. [Development Roadmap](roadmap.md) — implementation milestones.
 17. [Code Review Guide](code-review.md) — invariants to enforce during review.
 18. [Architecture Decisions](decisions.md) — accepted decisions and remaining questions.
-19. [M4 Design](m4-design.md) — current production-architecture/release-hardening milestone.
+19. [M4 Design](m4-design.md) — accepted production-architecture/release-hardening milestone.
 20. [M4 Publication Architecture](m4-publication-design.md) — frozen atomic-publication contract.
-21. [M4 Implementation Plan](m4-implementation-plan.md) — ordered M4 development plan and release gates.
+21. [M4 Implementation Plan](m4-implementation-plan.md) — completed M4 development plan and release gates.
+22. [Post-M4 Production Rollout and v1 Stabilization](v1-rollout-plan.md) — active release/production phase.
+23. [Release Freeze and v0.9.0-rc.1 Cut](release-freeze.md) — authoritative RC freeze execution contract.
 
-For the current milestone, `m4-design.md`, the frozen `m4-publication-design.md`, and `m4-implementation-plan.md` are authoritative for M4 behavior. Accepted M1/M2/M3 contracts remain regression baselines unless an explicit newer Architecture Decision changes them.
+M1-M4 are accepted regression baselines. The active phase is production rollout
+and v1 stabilization under `v1-rollout-plan.md`. For the first release-candidate
+cut, `release-freeze.md` is authoritative. M4 publication semantics remain
+frozen in `m4-publication-design.md`; M5 is not authorized without new production
+evidence and a separately accepted design.
 
 The documentation is intentionally detailed. LMT is a long-lived infrastructure project, so behavior should be designed and testable before implementation complexity accumulates.
 
@@ -36,7 +42,6 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
 - [M2 Code Review — 2026-08-31](reviews/m2-review-2026-08-31.md) — blocking review of implementation commit `68d56837454f5902d97fe012508b32e282556df0`; M2 hardening required before acceptance.
 
 - [M2 Code Review Round 2 — 2026-08-31](reviews/m2-review-round2-2026-08-31.md) — acceptance review of hardening commit `7ad3886c1c11d011ae6fd76df2fa6ecc1b87bdaf`; M2 accepted.
-
 
 ## M3 production-trial operations
 
@@ -54,6 +59,9 @@ The documentation is intentionally detailed. LMT is a long-lived infrastructure 
   recovery/fence workflow.
 - [Installation and Upgrade](operations/install-upgrade.md) - release archive,
   idempotent local installer, Server-first rollout, and restore-based downgrade.
+- [Release Freeze and v0.9.0-rc.1 Cut](release-freeze.md) - exact release-only
+  mutation boundary, gates, artifact/tag ordering, abort conditions, and final
+  evidence report.
 
 - [M3 Code Review — 2026-09-01](reviews/m3-review-2026-09-01.md) — blocking review of implementation candidate `73d90897733a1a2e98aa655c3dda0f562ed33d33`; focused hardening required before production-trial acceptance.
 
